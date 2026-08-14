@@ -42,6 +42,7 @@ import asyncio
 import json
 import os
 import subprocess
+import urllib.error
 import urllib.request
 
 # Paths whose last-touching commit defines the desired runner-config rev.
@@ -74,7 +75,8 @@ def github_api(pat: str, repo: str, path: str, *, method: str = "GET") -> dict:
         headers={"Authorization": f"Bearer {pat}"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+        body = response.read()
+        return json.loads(body) if body else {}
 
 
 def desired_rev() -> str:
@@ -115,6 +117,34 @@ def member_online(runners: list[dict], pool: str, member: int) -> bool:
         runner["name"].startswith(prefix) and runner["status"] == "online"
         for runner in runners
     )
+
+
+def deregister_member(
+    pat: str, repo: str, runners: list[dict], pool: str, member: int
+) -> bool:
+    """Delete pool member N's runner registrations; False when one is busy.
+
+    GitHub refuses to delete a BUSY runner's registration (HTTP 422), which
+    makes this the atomic guard against rolling a VM out from under a job:
+    the busy check alone races, because a member can pick up a job between
+    the scan's runners snapshot and the delete (observed live: two jobs
+    died step-less when their member rolled seconds after passing the busy
+    check). Deregistering first turns GitHub itself into the lock - only a
+    member with zero registrations left is safe to delete.
+    """
+    prefix = f"{pool}-r{member}-"
+    for runner in runners:
+        if not runner["name"].startswith(prefix):
+            continue
+        try:
+            github_api(pat, repo, f"/actions/runners/{runner['id']}", method="DELETE")
+        except urllib.error.HTTPError as error:
+            if error.code == 422:  # busy: picked up a job since the scan
+                return False
+            if error.code == 404:  # already gone
+                continue
+            raise
+    return True
 
 
 def member_busy(runners: list[dict], pool: str, member: int) -> bool:
@@ -224,6 +254,12 @@ async def reconcile(ix) -> int:
             print(f"{name}: create FAILED ({e}); reconciling again next run")
 
     async def replace(member: int, name: str) -> None:
+        # Deregister BEFORE deleting the VM: a busy registration (422)
+        # means the member picked up a job since the scan - skip it this
+        # round rather than kill the job. No budget is spent on a skip.
+        if not deregister_member(pat, repo, runners, pool, member):
+            print(f"{name}: picked up a job mid-scan -> deferred")
+            return
         await ix.machines().connect(vms[name]).delete()
         await make(member, name)
 

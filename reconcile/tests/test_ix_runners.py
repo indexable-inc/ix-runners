@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -87,12 +88,25 @@ class FakeSecrets:
 class FakeIx:
     """Scripted ix SDK client; records every effectful call."""
 
-    def __init__(self, *, vms, revs, online, markers, busy=frozenset(), broken=False):
+    def __init__(
+        self,
+        *,
+        vms,
+        revs,
+        online,
+        markers,
+        busy=frozenset(),
+        busy_at_delete=frozenset(),
+        broken=False,
+    ):
         self.vms = vms  # existing VM names
         self.revs = revs  # name -> baked config rev (missing = unreachable)
         self.online = online  # pool member numbers with an online runner
         self.markers = markers  # names carrying the two-strike marker
         self.busy = busy  # pool member numbers with a runner mid-job
+        # members that pick up a job AFTER the scan snapshot: idle in the
+        # runners listing, but GitHub 422s the registration delete.
+        self.busy_at_delete = busy_at_delete
         self.broken = broken  # every ix new fails (bad template rev)
         self.calls = []
 
@@ -112,6 +126,7 @@ class FakeIx:
         if path.startswith("/actions/runners?"):
             runners = [
                 {
+                    "id": 1000 + member,
                     "name": f"baml-r{member}-1",
                     "status": "online",
                     "busy": member in self.busy,
@@ -121,6 +136,12 @@ class FakeIx:
             return {"runners": runners}
         if path == "/actions/runners/registration-token":
             return {"token": "REGTOKEN"}
+        if method == "DELETE" and path.startswith("/actions/runners/"):
+            runner_id = int(path.rsplit("/", 1)[1])
+            member = runner_id - 1000
+            if member in self.busy_at_delete:
+                raise urllib.error.HTTPError(path, 422, "busy", None, None)
+            return {}
         raise AssertionError(f"unexpected API path {path}")
 
 
@@ -164,6 +185,35 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.reconcile_with(ix), 1)
         self.assertIn(("baml-runner-1", ("delete",)), ix.calls)
         self.assertNotIn(("baml-runner-2", ("delete",)), ix.calls)
+
+    async def test_replace_deregisters_registrations_before_vm_delete(self):
+        # The registration delete is the atomic guard (GitHub 422s a busy
+        # runner); it must come before the VM is destroyed.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-1": OLD_REV, "baml-runner-2": REV},
+            online={1, 2},
+            markers=set(),
+        )
+        self.assertEqual(await self.reconcile_with(ix), 1)
+        dereg = ix.calls.index((None, ("DELETE", "/actions/runners/1001")))
+        vm_delete = ix.calls.index(("baml-runner-1", ("delete",)))
+        self.assertLess(dereg, vm_delete)
+
+    async def test_mid_scan_job_pickup_defers_the_replace(self):
+        # Member 1 reads idle in the scan snapshot but picks up a job before
+        # the delete: GitHub 422s the deregister, the member is skipped with
+        # no budget spent, and the other stale member still converges.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-1": OLD_REV, "baml-runner-2": OLD_REV},
+            online={1, 2},
+            markers=set(),
+            busy_at_delete={1},
+        )
+        self.assertEqual(await self.reconcile_with(ix), 1)
+        self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
+        self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
 
     async def test_unreachable_member_is_replaced(self):
         ix = FakeIx(
