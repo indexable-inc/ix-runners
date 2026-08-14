@@ -1,0 +1,53 @@
+name: ix runner pool reconcile
+description: >
+  Converge a self-hosted ix runner pool to this repository's runner config:
+  create missing members, repair offline ones, replace stale or dead ones.
+  Run on GITHUB-HOSTED runners only - a runner VM must never see IX_TOKEN.
+
+inputs:
+  ix-token:
+    description: ix API token the runner VMs bill to
+    required: true
+  runner-pat:
+    description: >
+      Fine-grained PAT, Administration rw on this repo. Never leaves the
+      hosted runner: it mints short-lived (1 h) registration tokens and
+      reads runner status; VMs only ever receive a registration token.
+    required: true
+  region:
+    description: ix region the pool lives in
+    default: us-west-1
+  pool-size:
+    description: Number of pool VMs (must match the flake's mkPool size)
+    default: "8"
+  max-replacements:
+    description: >
+      Per-run cap on creations+replacements. A bad config rev stalls loudly
+      after N boots instead of thrashing the pool; a config roll converges
+      across runs like a rolling update. Raise for first bootstrap.
+    default: "2"
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+
+    # Needed for exactly one verb: `ix new` (first-boot template builds need
+    # the ix-sdk 0.7.0 client, not yet on PyPI - issue #3). This step
+    # disappears when the reconcile's pinned ix-sdk bumps to 0.7.0.
+    - name: Install ix CLI
+      shell: bash
+      run: |
+        curl -fsSL https://ix.dev/install.sh | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Reconcile runner pool
+      shell: bash
+      env:
+        IX_TOKEN: ${{ inputs.ix-token }}
+        RUNNER_PAT: ${{ inputs.runner-pat }}
+        IX_REGION: ${{ inputs.region }}
+        POOL_SIZE: ${{ inputs.pool-size }}
+        MAX_REPLACEMENTS: ${{ inputs.max-replacements }}
+      run: ${{ github.action_path }}/reconcile/ix-runners
