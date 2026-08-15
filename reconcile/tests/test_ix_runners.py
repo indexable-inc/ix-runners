@@ -19,6 +19,7 @@ from reconcile.ix_runners import (
     member_online,
     member_runners,
     reconcile,
+    require_hosted_runner,
 )
 
 REV = "a" * 40
@@ -777,6 +778,42 @@ class MemberMatchTest(unittest.TestCase):
             {"name": "baml-r2-1", "status": "online"},
         ]
         self.assertEqual(len(member_runners(runners, "baml", 1)), 2)
+
+
+class HostedRunnerTest(unittest.TestCase):
+    """The hosted-only invariant is the whole trust model: this control plane
+    holds IX_TOKEN and a repo-admin PAT and manages the machines a
+    self-hosted runner would be."""
+
+    def test_a_self_hosted_runner_is_refused(self):
+        out = io.StringIO()
+        with (
+            mock.patch.dict("os.environ", {"RUNNER_ENVIRONMENT": "self-hosted"}, clear=True),
+            contextlib.redirect_stdout(out),
+        ):
+            with self.assertRaises(SystemExit):
+                require_hosted_runner()
+        self.assertIn("::error::", out.getvalue())
+
+    def test_an_absent_runner_environment_is_refused(self):
+        # Fail closed: a runner that reports nothing is not a hosted one.
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(SystemExit):
+                require_hosted_runner()
+
+    def test_a_hosted_runner_is_allowed(self):
+        with mock.patch.dict(
+            "os.environ", {"RUNNER_ENVIRONMENT": "github-hosted"}, clear=True
+        ):
+            require_hosted_runner()
+
+    def test_ghes_can_opt_out_explicitly(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"RUNNER_ENVIRONMENT": "self-hosted", "IX_RUNNERS_ALLOW_NON_HOSTED": "1"},
+            clear=True,
+        ):
+            require_hosted_runner()
 
 
 class ExtraMembersTest(unittest.TestCase):

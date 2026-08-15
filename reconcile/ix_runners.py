@@ -1,7 +1,8 @@
 """Reconcile the self-hosted ix runner pool to this repo's runner config.
 
 Runs from CI on GITHUB-HOSTED runners only (never self-hosted: a runner VM
-must never see IX_TOKEN). Secrets: IX_TOKEN (the ix account the VMs bill
+must never see IX_TOKEN) - refused at startup, see require_hosted_runner.
+Secrets: IX_TOKEN (the ix account the VMs bill
 to), RUNNER_PAT (fine-grained, "administration" repo rw). The PAT never
 leaves that runner: it mints SHORT-LIVED (1 h) registration tokens and
 reads runner status; a VM only ever receives a registration token, which
@@ -595,8 +596,33 @@ async def reconcile(ix: Any) -> int:
     return replaced
 
 
+def require_hosted_runner() -> None:
+    """Refuse to run anywhere but a GitHub-hosted runner.
+
+    The docstring, the README and the action all say hosted-only; this is
+    what makes it true. Nothing else does.
+    """
+    # GHES and ARC report their own RUNNER_ENVIRONMENT ("self-hosted"), so
+    # their operators opt out here, having read the paragraph above.
+    if os.environ.get("IX_RUNNERS_ALLOW_NON_HOSTED") == "1":
+        return
+    if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+        log_error(
+            "refusing to run: RUNNER_ENVIRONMENT is"
+            f" {os.environ.get('RUNNER_ENVIRONMENT') or 'unset'!r}, not"
+            " 'github-hosted'. This is the control plane for the runner pool:"
+            " it holds IX_TOKEN and a repo-admin PAT, and it manages the very"
+            " machines a self-hosted runner would be, so running it on one"
+            " hands both secrets to the thing they exist to control. Set"
+            " runs-on: ubuntu-latest. On GHES/ARC, set"
+            " IX_RUNNERS_ALLOW_NON_HOSTED=1 to accept that risk explicitly."
+        )
+        raise SystemExit(1)
+
+
 def main() -> None:
-    """Entry point: require the secrets, then converge."""
+    """Entry point: require a hosted runner and the secrets, then converge."""
+    require_hosted_runner()
     for required in ("IX_TOKEN", "RUNNER_PAT", "GITHUB_REPOSITORY"):
         if not os.environ.get(required):
             raise SystemExit(f"{required} is required")
