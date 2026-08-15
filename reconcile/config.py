@@ -14,7 +14,9 @@ separately so no accident can print them.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import pathlib
 import subprocess
 
 from .report import log_error
@@ -78,6 +80,88 @@ def attr_prefix() -> str:
 SCALE_DOWN_EVENTS = (None, "", "schedule", "workflow_dispatch")
 
 
+# The pool spec's whole vocabulary. Anything else in the file is a typo, and
+# a typo that silently defaults is a pool quietly running someone else's
+# numbers - `mniWarm` would read as "autoscaling off" and cost real money.
+# Same reasoning as a deny-unknown-fields deserializer.
+SPEC_KEYS = {
+    "pool-name": str,
+    "region": str,
+    "attr-prefix": str,
+    "runner-label": str,
+    "pool-size": int,
+    "min-warm": int,
+    "max-online": int,
+    "scale-headroom": int,
+    "idle-grace-seconds": int,
+    "max-stops": int,
+    "max-replacements": int,
+    "concurrency": int,
+}
+
+# Where the spec lives unless the action is told otherwise. Under nix/ on
+# purpose: that directory is already one of CONFIG_PATHS, so a change to the
+# pool's shape rolls the fleet the same way any other config change does.
+DEFAULT_SPEC_PATH = "nix/ix-pool.json"
+
+
+def load_spec(path: str) -> dict[str, object]:
+    """Read the pool spec, refusing anything it does not understand."""
+    file = pathlib.Path(path)
+    if not file.is_file():
+        log_error(
+            f"no pool spec at {path}. This file is the pool's definition and"
+            " both sides read it - the flake builds the members from it and"
+            " this reconcile manages them from it. A minimal one is"
+            ' {"pool-name": "<name>", "region": "<region>", "pool-size": 8}.'
+        )
+        raise SystemExit(1)
+    try:
+        spec = json.loads(file.read_text())
+    except (OSError, ValueError) as error:
+        log_error(f"{path} could not be read as JSON: {error}")
+        raise SystemExit(1) from error
+    if not isinstance(spec, dict):
+        log_error(f"{path} must contain a JSON object, not a {type(spec).__name__}")
+        raise SystemExit(1)
+
+    problems = []
+    for key, value in spec.items():
+        want = SPEC_KEYS.get(key)
+        if want is None:
+            near = [known for known in SPEC_KEYS if known.replace("-", "") == str(key).replace("-", "").lower()]
+            hint = f" (did you mean {near[0]!r}?)" if near else ""
+            problems.append(f"unknown key {key!r}{hint}")
+        # bool is an int subclass, and `"pool-size": true` is not a size.
+        elif want is int and (isinstance(value, bool) or not isinstance(value, int)):
+            problems.append(f"{key!r} must be a whole number, got {value!r}")
+        elif want is str and not isinstance(value, str):
+            problems.append(f"{key!r} must be a string, got {value!r}")
+    if problems:
+        for problem in problems:
+            log_error(f"{path}: {problem}")
+        log_error(f"{path}: known keys are {', '.join(sorted(SPEC_KEYS))}")
+        raise SystemExit(1)
+    return spec
+
+
+def spec_from_env() -> dict[str, object]:
+    """The same shape, assembled from the environment.
+
+    Every value the action used to pass as its own input. Kept because the
+    ambient half of the configuration (which repo, which run, which event)
+    can only come from the environment anyway, and because it lets the test
+    suite drive a Config without writing a file for every case. Production
+    reads the spec file; this is what fills the gaps around it.
+    """
+    spec: dict[str, object] = {}
+    for key, want in SPEC_KEYS.items():
+        raw = os.environ.get(key.upper().replace("-", "_"))
+        if raw:
+            spec[key] = int(raw) if want is int else raw
+    return spec
+
+
 def _int(name: str, default: int) -> int:
     return int(os.environ.get(name) or default)
 
@@ -129,30 +213,56 @@ class Config:
         return f"{self.pool}-runner-{member}"
 
     @classmethod
-    def from_env(cls) -> "Config":
-        """Read the whole knob surface, then validate it as a whole.
+    def load(cls) -> "Config":
+        """The one entry point: the spec file when there is one, else env.
+
+        IX_POOL_SPEC is set by the composite action and points at the
+        repo's pool spec. Without it - which in practice means the test
+        suite - the same shape is assembled from the environment, so there
+        is exactly ONE implementation of every default and every rule
+        below, whichever way the values arrived.
+        """
+        path = os.environ.get("IX_POOL_SPEC")
+        return cls.from_spec(load_spec(path) if path else spec_from_env())
+
+    @classmethod
+    def from_spec(cls, spec: dict[str, object]) -> "Config":
+        """Fill in the defaults, then validate the whole thing at once.
 
         Validation is one pass at the end because the rules are RELATIONS -
         a min_warm is only wrong relative to a max_online and a pool_size -
         and checking a relation while its other side is still unread is how
         a validator ends up disagreeing with itself.
         """
-        pool = pool_name()
-        pool_size = _int("POOL_SIZE", 8)
-        # MIN_WARM defaults to the whole pool: unset, every member stays on
+
+        def number(key: str, default: int) -> int:
+            value = spec.get(key)
+            return default if value is None else int(value)  # type: ignore[arg-type]
+
+        def text(key: str, default: str) -> str:
+            value = spec.get(key)
+            return default if value is None else str(value)
+
+        pool = text("pool-name", pool_name())
+        # POOL_SIZE x `slots` runner daemons each = the concurrent job budget.
+        # The flake's mkPool reads this SAME key, which is what stopped the
+        # two from drifting: a larger pool here used to ask for flake attrs
+        # that did not exist, and every run was red until someone noticed.
+        pool_size = number("pool-size", 8)
+        # min-warm defaults to the whole pool: unset, every member stays on
         # and this is exactly the pre-autoscaling reconcile.
-        min_warm = _int("MIN_WARM", pool_size)
-        max_online = _int("MAX_ONLINE", pool_size)
+        min_warm = number("min-warm", pool_size)
+        max_online = number("max-online", pool_size)
         refusals: list[str] = []
 
         if not 0 <= min_warm <= max_online <= pool_size:
             refusals.append(
-                f"MIN_WARM={min_warm}, MAX_ONLINE={max_online} and"
-                f" POOL_SIZE={pool_size} must satisfy"
-                " 0 <= MIN_WARM <= MAX_ONLINE <= POOL_SIZE"
+                f"min-warm={min_warm}, max-online={max_online} and"
+                f" pool-size={pool_size} must satisfy"
+                " 0 <= min-warm <= max-online <= pool-size"
             )
 
-        runner_label = os.environ.get("RUNNER_LABEL") or ""
+        runner_label = text("runner-label", "")
         # The workflow's own token, which needs `actions: read` and nothing
         # else. Falling back to the PAT would work only if someone had
         # granted it the Actions permission, and the whole point is that it
@@ -161,9 +271,9 @@ class Config:
         if not refusals and min_warm < max_online:
             if not runner_label:
                 refusals.append(
-                    "RUNNER_LABEL is unset, so there is no demand signal. Set"
-                    " it to the label your jobs target (one of"
-                    " `services.ix-runner.labels`). It is what a bootstrap"
+                    "runner-label is unset, so there is no demand signal. Set"
+                    " it in the pool spec to the label your jobs target (one"
+                    " of `services.ix-runner.labels`). It is what a bootstrap"
                     " pool matches jobs against before any runner has"
                     " registered a label set of its own; without it a pool"
                     " with nothing registered can serve no job it can see."
@@ -177,7 +287,7 @@ class Config:
 
         if refusals:
             # Off means the WHOLE pool stays on. Leaving a hand-set
-            # MAX_ONLINE in place would keep stopping machines while the run
+            # max-online in place would keep stopping machines while the run
             # announced that scaling was off.
             for why in refusals:
                 log_error(f"autoscaling is off for this run: {why}")
@@ -186,29 +296,28 @@ class Config:
         return cls(
             repo=os.environ["GITHUB_REPOSITORY"],
             pool=pool,
-            attr_prefix=attr_prefix(),
-            region=os.environ.get("IX_REGION") or "us-west-1",
+            attr_prefix=text("attr-prefix", "ci-runner"),
+            region=text("region", os.environ.get("IX_REGION") or "us-west-1"),
             secret_name=os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token",
             pool_size=pool_size,
-            max_replacements=_int("MAX_REPLACEMENTS", 2),
-            concurrency=_int("CONCURRENCY", 4),
+            max_replacements=number("max-replacements", 2),
+            concurrency=number("concurrency", 4),
             min_warm=min_warm,
             max_online=max_online,
-            headroom=_int("SCALE_HEADROOM", 2),
+            headroom=number("scale-headroom", 2),
             # Seconds, not ticks: idle time is derived from GitHub's own job
             # timestamps, so it is a real duration and does not depend on
             # how often this runs. A tick counter meant the grace silently
             # changed length whenever the cron did.
-            idle_grace=float(os.environ.get("IDLE_GRACE_SECONDS") or 600),
+            idle_grace=float(number("idle-grace-seconds", 600)),
             # Only stops are capped. Being SHORT of capacity is the state
             # with a queue behind it, so a start is never rationed; being
             # long of it costs money, which can wait for the next tick.
-            max_stops=_int("MAX_STOPS", 4),
+            max_stops=number("max-stops", 4),
             runner_label=runner_label,
-            # Which trigger this is. Only a scheduled tick may switch
-            # machines OFF: an event tick fires when a run is REQUESTED,
-            # before its jobs reach the queue, so it sees an idle pool at
-            # the exact moment a wave is landing.
+            # Which trigger this is. NOT a spec key: the trigger already
+            # says, and an operator pinning it in a file would be pinning it
+            # for the cron too. TICK_MODE exists for tests.
             tick_mode=(
                 os.environ.get("TICK_MODE")
                 or (

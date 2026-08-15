@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import datetime
 import email.message
 import enum
@@ -11,8 +12,8 @@ import json
 import os
 import pathlib
 import sys
-import subprocess
 import tempfile
+import subprocess
 import threading
 import time
 import unittest
@@ -20,7 +21,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-from reconcile.config import Config, desired_rev
+from reconcile.config import SPEC_KEYS, Config, desired_rev
 from reconcile.github import (
     MAX_DEMAND_RUNS,
     OPENER,
@@ -1906,7 +1907,7 @@ class ConfigTest(unittest.TestCase):
 
     def load(self, env):
         with mock.patch.dict("os.environ", env, clear=True):
-            return Config.from_env()
+            return Config.load()
 
     def test_defaults_leave_autoscaling_off(self):
         # min_warm defaults to the pool size, so the floor meets the ceiling
@@ -1939,7 +1940,7 @@ class ConfigTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             config = self.load(AUTO_ENV | {"MIN_WARM": "4", "MAX_ONLINE": "2"})
         self.assertEqual(len(config.refusals), 1)
-        self.assertIn("MIN_WARM", config.refusals[0])
+        self.assertIn("min-warm", config.refusals[0])
 
     def test_the_tick_mode_follows_the_trigger(self):
         for event, mode in [
@@ -1960,6 +1961,116 @@ class ConfigTest(unittest.TestCase):
         rendered = repr(config)
         self.assertNotIn(ENV["RUNNER_PAT"], rendered)
         self.assertNotIn(ENV["IX_TOKEN"], rendered)
+
+
+class PoolSpecTest(unittest.TestCase):
+    """One file defines the pool, and it is read strictly."""
+
+    def write(self, body):
+        path = pathlib.Path(tempfile.mkdtemp()) / "ix-pool.json"
+        path.write_text(body if isinstance(body, str) else json.dumps(body))
+        return str(path)
+
+    def load(self, body, env=None):
+        path = self.write(body)
+        out = io.StringIO()
+        with (
+            mock.patch.dict(
+                "os.environ",
+                dict(ENV, IX_POOL_SPEC=path,
+                     GITHUB_TOKEN="ghs_workflow_token", **(env or {})),
+                clear=True,
+            ),
+            contextlib.redirect_stdout(out),
+        ):
+            try:
+                return Config.load(), out.getvalue()
+            except SystemExit:
+                return None, out.getvalue()
+
+    def test_the_spec_supplies_the_pool(self):
+        config, _ = self.load(
+            {"pool-name": "demo", "region": "us-east-1", "pool-size": 12,
+             "min-warm": 3, "runner-label": "ix"}
+        )
+        self.assertEqual(config.pool, "demo")
+        self.assertEqual(config.region, "us-east-1")
+        self.assertEqual((config.pool_size, config.min_warm), (12, 3))
+        self.assertTrue(config.autoscaling)
+
+    def test_every_key_is_optional(self):
+        # The file's PRESENCE declares that this repo has a pool; the values
+        # all default in one place, so a minimal spec is a valid spec.
+        config, _ = self.load({})
+        self.assertEqual(config.pool_size, 8)
+        self.assertFalse(config.autoscaling)
+
+    def test_an_unknown_key_is_refused_not_ignored(self):
+        # A typo that silently defaults is a pool quietly running someone
+        # else's numbers: `mniWarm` would read as "autoscaling off" forever,
+        # and the only symptom is the bill.
+        config, out = self.load({"pool-size": 8, "mni-warm": 2})
+        self.assertIsNone(config)
+        self.assertIn("unknown key 'mni-warm'", out)
+
+    def test_a_near_miss_names_the_key_it_meant(self):
+        config, out = self.load({"minwarm": 2})
+        self.assertIsNone(config)
+        self.assertIn("did you mean 'min-warm'", out)
+
+    def test_a_wrong_type_is_refused(self):
+        config, out = self.load({"pool-size": "eight"})
+        self.assertIsNone(config)
+        self.assertIn("must be a whole number", out)
+
+    def test_a_boolean_is_not_a_number(self):
+        # bool subclasses int, so an isinstance check alone waves this
+        # through and the pool gets a size of True.
+        config, out = self.load({"pool-size": True})
+        self.assertIsNone(config)
+        self.assertIn("must be a whole number", out)
+
+    def test_malformed_json_is_refused_with_the_path(self):
+        config, out = self.load("{not json")
+        self.assertIsNone(config)
+        self.assertIn("could not be read as JSON", out)
+
+    def test_a_missing_spec_says_what_to_write(self):
+        out = io.StringIO()
+        with (
+            mock.patch.dict(
+                "os.environ", dict(ENV, IX_POOL_SPEC="/nonexistent/ix-pool.json"), clear=True
+            ),
+            contextlib.redirect_stdout(out),
+        ):
+            with self.assertRaises(SystemExit):
+                Config.load()
+        self.assertIn("no pool spec at /nonexistent/ix-pool.json", out.getvalue())
+        self.assertIn("pool-name", out.getvalue())
+
+    def test_the_spec_and_the_environment_agree_on_defaults(self):
+        # Both entry points go through from_spec, so there is exactly one
+        # implementation of every default and every rule. If they ever
+        # diverge, a pool behaves differently in CI than under test.
+        spec_config, _ = self.load({"pool-size": 6, "min-warm": 2, "runner-label": "ix"})
+        with mock.patch.dict(
+            "os.environ",
+            dict(ENV, POOL_SIZE="6", MIN_WARM="2", RUNNER_LABEL="ix",
+                 GITHUB_TOKEN="ghs_workflow_token"),
+            clear=True,
+        ):
+            env_config = Config.load()
+        self.assertEqual(
+            dataclasses.astuple(spec_config), dataclasses.astuple(env_config)
+        )
+
+    def test_the_tick_mode_is_not_a_spec_key(self):
+        # The trigger already says. Pinning it in a file would pin it for the
+        # cron too, which is how a pool stops ever scaling down.
+        self.assertNotIn("tick-mode", SPEC_KEYS)
+        config, out = self.load({"tick-mode": "scheduled"})
+        self.assertIsNone(config)
+        self.assertIn("unknown key 'tick-mode'", out)
 
 
 class EntrypointTest(unittest.TestCase):
