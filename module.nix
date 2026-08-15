@@ -16,6 +16,10 @@
 # stateless runners; do not make these runners ephemeral. Foreign
 # dynamically-linked FHS binaries (mise, rustup toolchains, prebuilt node,
 # cargo-binstall downloads) run unmodified via nix-ld + envfs.
+#
+# Each slot is its own UNIX user, so co-tenant slots cannot read each other's
+# runner credentials or caches. Consumer policy must therefore reference $HOME
+# rather than any fixed home path.
 {
   config,
   lib,
@@ -40,6 +44,12 @@ let
   runnerNames = map (i: "${cfg.poolName}-r${idx}-${toString i}") (range 1 cfg.slots);
   runnerUnits = map (name: "github-runner-${name}") runnerNames;
 
+  # One UNIX user per slot, named after the slot. A shared uid would make the
+  # per-slot HOME/TMPDIR cosmetic: any job could read a co-tenant slot's
+  # runner .credentials (and re-register that runner elsewhere), its steps'
+  # /proc/<pid>/environ, and its at-rest ~/.npmrc, ~/.docker, ~/.cargo.
+  # Warm caches stay per-slot either way, so nothing is lost by splitting.
+  #
   # Per-slot, off the workDir the upstream unit wipes on every start.
   homeOf = name: "/var/lib/ix-runner-home/${name}";
   tmpOf = name: "/var/lib/ix-runner-tmp/${name}";
@@ -240,8 +250,9 @@ in
       workDir = "/var/lib/ix-runner-work/${name}";
       extraLabels = cfg.labels;
       extraPackages = extraUserland ++ cfg.extraPackages;
-      user = "ci-runner";
-      group = "ci-runner";
+      # One user per slot, not one shared uid - see the users.users block.
+      user = name;
+      group = name;
       extraEnvironment = {
         # Upstream defaults HOME to workDir, which it wipes on every start;
         # a warm toolchain/registry cache needs a directory nothing clears.
@@ -253,8 +264,9 @@ in
       // nixLdEnvironment
       // cfg.jobEnvironment;
       serviceOverrides = {
-        # ProtectHome=true masks /home entirely, and tooling that resolves ~
-        # from passwd rather than $HOME lands in /home/ci-runner.
+        # ProtectHome=true masks /home entirely; this slot's home is its
+        # passwd home under /var/lib, and tooling that resolves ~ from passwd
+        # rather than $HOME must reach the same directory.
         ProtectHome = mkForce false;
         # ProtectSystem=strict: this slot's HOME and TMPDIR must stay
         # writable (upstream already BindPaths= its workDir).
@@ -272,8 +284,9 @@ in
         # Hosted runners give jobs 65536; the systemd default is 1024.
         LimitNOFILE = 1048576;
         # One runaway job must not exhaust system PIDs and take the
-        # co-tenant slots with it. LimitNPROC is per-UID and every slot runs
-        # as ci-runner, so it cannot bound a single slot - TasksMax can.
+        # co-tenant slots with it. TasksMax bounds the slot's cgroup whatever
+        # uid the tasks end up under (containers, setuid helpers), which
+        # per-UID LimitNPROC cannot.
         TasksMax = 65536;
         LimitNPROC = "infinity";
         # Turns the cpu controller ON for the slice, so busy slots get fair
@@ -300,14 +313,18 @@ in
       "ix-runner/rev".text = cfg.configRev;
     };
 
-    users.users.ci-runner = {
+    # One user and group per slot: the slot boundary is a uid boundary, so a
+    # job cannot read a co-tenant slot's credentials, environ, or caches.
+    # passwd home == $HOME, so tooling that resolves ~ from passwd agrees
+    # with the unit environment.
+    users.users = genAttrs runnerNames (name: {
       isSystemUser = true;
-      group = "ci-runner";
-      home = "/home/ci-runner";
+      group = name;
+      home = homeOf name;
       createHome = true;
       shell = pkgs.bashInteractive;
-    };
-    users.groups.ci-runner = { };
+    });
+    users.groups = genAttrs runnerNames (_: { });
 
     systemd.tmpfiles.rules = [
       # 0700 root: the reconcile's strike marker lives here, and job code
@@ -316,13 +333,15 @@ in
       "d /var/lib/ix-runner-home 0755 root root -"
       "d /var/lib/ix-runner-tmp 0755 root root -"
     ]
-    ++ map (name: "d /var/lib/ix-runner-work/${name} 0750 ci-runner ci-runner -") runnerNames
+    # Owned by the slot's own user, so 0750/0700 is a real boundary between
+    # slots rather than decoration over one shared uid.
+    ++ map (name: "d /var/lib/ix-runner-work/${name} 0750 ${name} ${name} -") runnerNames
     # Caches, so never aged out.
-    ++ map (name: "d ${homeOf name} 0700 ci-runner ci-runner -") runnerNames
-    # Per-slot rather than one shared 1777 dir: every slot runs as the same
-    # UID, so the sticky bit bought nothing, while per-slot dirs make a
+    ++ map (name: "d ${homeOf name} 0700 ${name} ${name} -") runnerNames
+    # Per-slot rather than one shared 1777 dir: a shared temp is a cross-slot
+    # channel that the sticky bit does not close, while per-slot dirs make a
     # job's own cleanup step safe and bound what one leaking job fills.
-    ++ map (name: "d ${tmpOf name} 0700 ci-runner ci-runner 1d") runnerNames
+    ++ map (name: "d ${tmpOf name} 0700 ${name} ${name} 1d") runnerNames
     # The runner's _diag logs (LogsDirectory=) are never rotated and this VM
     # is long-lived. The dirs themselves are systemd's; only age the contents.
     ++ map (name: "e /var/log/github-runner/${name} - - - 30d") runnerNames;
@@ -502,8 +521,8 @@ in
         "flakes"
       ];
       # trusted-users is root-equivalent (it can point the daemon at any
-      # substituter or import any path). Job code runs as ci-runner on a
-      # machine that outlives the job, so it must not have it.
+      # substituter or import any path). Job code runs as its own per-slot
+      # user on a machine that outlives the job, so it must not have it.
       trusted-users = [ "root" ];
     };
   };
