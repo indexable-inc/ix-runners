@@ -26,6 +26,13 @@ inputs:
       after N boots instead of thrashing the pool; a config roll converges
       across runs like a rolling update. Raise for first bootstrap.
     default: "2"
+  concurrency:
+    description: >
+      Creations/replacements executed at once. Guest boots dominate a
+      roll's wall clock and overlap safely; each concurrent first boot of a
+      new rev is also a concurrent template build, so keep this within the
+      region's build appetite.
+    default: "4"
 
 runs:
   using: composite
@@ -41,4 +48,5 @@ runs:
         IX_REGION: ${{ inputs.region }}
         POOL_SIZE: ${{ inputs.pool-size }}
         MAX_REPLACEMENTS: ${{ inputs.max-replacements }}
+        CONCURRENCY: ${{ inputs.concurrency }}
       run: ${{ github.action_path }}/reconcile/ix-runners
