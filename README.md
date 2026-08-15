@@ -66,6 +66,11 @@ on:
 
 permissions:
   contents: read
+  # Only needed once you turn autoscaling on: it is how the demand signal
+  # reads the job queue. Without it the queue read is refused, the run warns,
+  # and the pool stays fully on - so a pool that never scales down is the
+  # first thing to check here.
+  actions: read
 
 # One reconcile at a time, and never cancel one mid-create: a cancelled run
 # can leave a VM created but not yet registered.
@@ -120,7 +125,15 @@ the ix SDK; templates compile server-side on first boot and cache by rev.
   job one retry. A member that is busy at every single scan defers its own
   replacement indefinitely; past 30 days the run says so and asks you to
   drain it by hand, rather than killing a job to make a point.
-- Offline: restarted once, replaced if still offline next run.
+- Offline: restarted once, replaced if still offline next run. A member
+  started in the last few minutes is left alone instead - it reports
+  `Running` from the moment it comes up, so "no runner yet" is what a
+  healthy boot looks like.
+- Reported failed by the platform: replaced at once, without waiting out the
+  boot grace. The grace exists because a young machine's *silence* proves
+  nothing; a machine saying it is dead is not silent.
+- Stopped: left alone, and never probed. Its power state is read off the
+  machine row, so a parked member is never mistaken for a dead one.
 - Above `pool-size`: deregistered and deleted. Shrinking the pool would
   otherwise leave orphans billing and taking jobs.
 - Empty pool: the per-run replacement cap self-raises to `pool-size`, so a
@@ -133,6 +146,64 @@ the ix SDK; templates compile server-side on first boot and cache by rev.
 Failures are per member. One member's failure is logged as an Actions error,
 spends its budget, and the run continues; the job summary carries a table of
 what happened to each member.
+
+## Autoscaling
+
+The member set never moves. `pool-size` machines exist, they are named and
+built from your config, and the only thing autoscaling changes is which of
+them are switched on. There is no scheduler here, nothing elastic, and
+nothing that looks like Kubernetes: a stopped machine keeps its disk, so it
+keeps its runner registration credentials and re-registers by itself on
+boot, and while it is off it bills storage and nothing else.
+
+Demand is GitHub's own queue - the jobs, queued or running, whose `runs-on`
+includes `runner-label`. Each reconcile computes:
+
+```
+desired_online = clamp(ceil(jobs / slots) + scale-headroom,
+                       min-warm, max-online)
+```
+
+Below that number, stopped members are started - always before creating
+anything, because a start is a boot and a create is a template build. Above
+it, idle members are stopped, highest index first, so the warm core is
+always the same low-numbered machines and their caches stay hot. Nothing
+busy is ever stopped: the decide pass skips it, and the execute pass re-reads
+that member's registrations moments before pulling the power. That window is
+narrowed, not closed, which is the same trade the replace path makes.
+
+`min-warm` defaults to `pool-size`, so **autoscaling is off until you dial
+it down**, and an unconfigured pool behaves exactly as it did before and
+never even reads the queue. Turning it on:
+
+```yaml
+with:
+  pool-size: 32
+  min-warm: 3           # always-on floor: a small wave starts instantly
+  scale-headroom: 2     # keep 2 spare above current demand
+  max-online: 32
+  runner-label: ix      # the demand signal; must be one of your labels
+```
+
+Two things carry the latency. `min-warm` means the front of a wave never
+waits for a boot at all, and the GitHub queue absorbs the rest: a job that
+finds no free runner waits, which is what a queue is for. A `workflow_run`
+trigger on the reconcile turns a wave into a wake-up, so the pool is already
+starting while the first jobs run - worst case is one boot, once per wave,
+not once per job.
+
+Reading the queue needs `permissions: actions: read` on the reconcile job
+and the workflow's own `GITHUB_TOKEN`. The admin PAT is deliberately not
+used for it: minting registration tokens and deleting runners is one job,
+and reading a job list is another. If the read fails, the run says so and
+keeps every member on - no view of the queue is never a reason to park the
+pool.
+
+Knobs, all optional: `min-warm`, `max-online`, `scale-headroom`,
+`runner-label`, `idle-grace-ticks` (consecutive idle scans before a stop,
+counted on the VM so it survives across runs), `max-power-actions` (per-run
+cap on starts and stops, so a wrong decision converges slowly rather than
+moving the fleet at once).
 
 ## Security model
 
