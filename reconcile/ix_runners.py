@@ -118,7 +118,7 @@ async def reconcile(ix: Any) -> int:
     # runner emits. flush so the directive lands before anything it must cover.
     print(f"::add-mask::{pat}", flush=True)
     demand_token = os.environ.get("GITHUB_TOKEN") or ""
-    config = Config.from_env()
+    config = Config.load()
     # A refused knob is a red run, but not a dead one: the values are already
     # the safe reading, so the pool still gets healed.
     failures = len(config.refusals)

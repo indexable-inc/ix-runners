@@ -18,7 +18,26 @@ Runners are persistent, not ephemeral
    permissions have no `administration` scope, so it structurally cannot mint
    runner registration tokens.
 
-2. Wire the pool into your `flake.nix`:
+2. Describe the pool once, in `nix/ix-pool.json`:
+
+   ```json
+   {
+     "pool-name": "myrepo",
+     "region": "us-east-1",
+     "pool-size": 8
+   }
+   ```
+
+   Every key is optional and defaults in one place; the file's presence is
+   what declares that this repo has a pool. It lives under `nix/` because
+   that directory already defines the runner config rev, so changing the
+   pool's shape rolls the fleet like any other config change.
+
+   Unknown keys are an error, not a default. A typo that silently defaults
+   is a pool quietly running someone else's numbers - `mniWarm` would read
+   as "autoscaling off" and the only symptom is the bill.
+
+3. Wire it into your `flake.nix`:
 
    ```nix
    inputs.nixpkgs-ci.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -28,19 +47,56 @@ Runners are persistent, not ephemeral
    nixosConfigurations = ix-runners.lib.mkPool {
      nixpkgs = nixpkgs-ci;
      configRev = self.rev or null;
+     spec = nixpkgs.lib.importJSON ./nix/ix-pool.json;
      modules = [ ./nix/ci-runner.nix ];
    };
    ```
 
-3. Write your policy in `nix/ci-runner.nix`: `services.ix-runner` with your
-   repo URL, a pool name, and the packages your jobs expect on PATH.
+   The flake and the reconcile now read the same file, so the pool's size
+   cannot be two different numbers in two places. It used to be exactly
+   that, with a comment asking you to keep them equal; a larger size in the
+   workflow asked for flake attrs that did not exist and every run was red
+   until somebody noticed.
 
-   `services.ix-runner.poolName` MUST equal the action's `pool-name` input
-   (which defaults to your repository's name). 
-   The module derives runner daemon names from it and the reconcile matches on those names, so if they
-   disagree every member reads offline, gets repaired once, and is then replaced. 
+4. Write your policy in `nix/ci-runner.nix`: `services.ix-runner` with your
+   repo URL and the packages your jobs expect on PATH. The pool name comes
+   from the spec, so do not set `poolName` here as well.
 
-4. Add the workflow below and merge.
+5. Add the workflow below and merge.
+
+### The whole invocation
+
+```yaml
+- uses: indexable-inc/ix-runners@<rev>
+  with:
+    ix-token: ${{ secrets.IX_TOKEN }}
+    runner-pat: ${{ secrets.RUNNER_PAT }}
+```
+
+Two secrets. The pool's name, size, region and every autoscaling dial come
+from the spec file; `config-file` moves it off the default path if you must.
+There is deliberately no way to set a pool's size on the action.
+
+### The spec
+
+| key | default | |
+| --- | --- | --- |
+| `pool-name` | the repository's name | VM names `<pool>-runner-<N>`, runner names `<pool>-r<N>-<slot>` |
+| `region` | `us-west-1` | ix region the pool lives in |
+| `pool-size` | 8 | members, and the flake attrs `mkPool` generates |
+| `attr-prefix` | `ci-runner` | flake attribute prefix for members |
+| `max-replacements` | 2 | per-run cap on creations + replacements |
+| `concurrency` | 4 | creations/replacements executed at once |
+| `runner-label` | — | bootstrap demand match; required once `min-warm` < `max-online` |
+| `min-warm` | `pool-size` | always-on floor. **This is the autoscaling on/off switch** |
+| `max-online` | `pool-size` | ceiling on powered-on members |
+| `scale-headroom` | 2 | spare members kept above current demand |
+| `idle-grace-seconds` | 600 | idle time before a member is switched off |
+| `max-stops` | 4 | per-tick cap on stops; starts are uncapped |
+
+`mkPool` asserts at build time that `runner-label` is actually in
+`services.ix-runner.labels`. A label nothing advertises means the pool never
+wakes for a wave, and zero servable jobs looks exactly like zero jobs.
 
 [`action.yml`](./action.yml).
 
@@ -100,7 +156,6 @@ jobs:
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
           runner-pat: ${{ secrets.RUNNER_PAT }}
-          pool-size: "8"
 ```
 
 Then swap `runs-on:` to `[self-hosted, ix]` in your other workflows at your leisure.
@@ -231,15 +286,18 @@ consequences worth knowing:
 
 `min-warm` defaults to `pool-size`, so **autoscaling is off until you dial
 it down**, and an unconfigured pool behaves exactly as it did before and
-never even reads the queue. Turning it on:
+never even reads the queue. Turning it on is four keys in `nix/ix-pool.json`:
 
-```yaml
-with:
-  pool-size: 32
-  min-warm: 3           # always-on floor: a small wave starts instantly
-  scale-headroom: 2     # keep 2 spare above current demand
-  max-online: 32
-  runner-label: ix      # fallback match for a pool with nothing registered
+```json
+{
+  "pool-name": "myrepo",
+  "region": "us-east-1",
+  "pool-size": 32,
+  "runner-label": "ix",
+  "min-warm": 3,
+  "scale-headroom": 2,
+  "max-online": 32
+}
 ```
 
 Reading the queue needs `permissions: actions: read` and the workflow's own
@@ -251,9 +309,10 @@ Every tick prints one `DECISION` line - observed counts, the level they
 imply, and the actions taken - so a reader can reconstruct what happened
 without replaying the log.
 
-Remaining knobs, all optional: `idle-grace-seconds` (default 600),
-`max-stops` (per-tick cap, default 4; starts are uncapped), `tick-mode`
-(defaults from the triggering event).
+Remaining knobs, all optional and all in the same file: `idle-grace-seconds`
+(default 600) and `max-stops` (per-tick cap, default 4; starts are
+uncapped). Which ticks may scale down is NOT configurable - the trigger
+already says, and pinning it in a file would pin it for the cron too.
 
 ### Where this is going
 
