@@ -413,31 +413,31 @@ in
         lttng-ust
         libsecret
         # X11
-        xorg.libX11
-        xorg.libXext
-        xorg.libXcomposite
-        xorg.libXdamage
-        xorg.libXfixes
-        xorg.libXrandr
-        xorg.libXcursor
-        xorg.libXi
-        xorg.libXinerama
-        xorg.libXrender
-        xorg.libXScrnSaver
-        xorg.libXtst
-        xorg.libXt
-        xorg.libXmu
-        xorg.libXft
-        xorg.libSM
-        xorg.libICE
-        xorg.libxshmfence
-        xorg.libXxf86vm
-        xorg.libxcb
-        xorg.xcbutil
-        xorg.xcbutilwm
-        xorg.xcbutilimage
-        xorg.xcbutilkeysyms
-        xorg.xcbutilrenderutil
+        libx11
+        libxext
+        libxcomposite
+        libxdamage
+        libxfixes
+        libxrandr
+        libxcursor
+        libxi
+        libxinerama
+        libxrender
+        libxscrnsaver
+        libxtst
+        libxt
+        libxmu
+        libxft
+        libsm
+        libice
+        libxshmfence
+        libxxf86vm
+        libxcb
+        libxcb-util
+        libxcb-wm
+        libxcb-image
+        libxcb-keysyms
+        libxcb-render-util
         libxcb-cursor
         libxkbcommon
         # Graphics and rendering
