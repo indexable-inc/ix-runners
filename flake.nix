@@ -5,6 +5,7 @@
     { self }:
     {
       nixosModules.runner = import ./module.nix;
+      nixosModules.default = self.nixosModules.runner;
 
       lib = {
         # One flake attr per pool member (ci-runner-1..N) so hostnames and
@@ -38,7 +39,13 @@
                 };
                 modules = [
                   self.nixosModules.runner
-                  { services.ix-runner.configRev = configRev; }
+                  {
+                    # Named, so an option-definition conflict points here
+                    # instead of at an anonymous "<unknown-file>".
+                    _file = "ix-runners/flake.nix#mkPool";
+                    # mkDefault: the repo's own policy modules may pin a rev.
+                    services.ix-runner.configRev = nixpkgs.lib.mkDefault configRev;
+                  }
                 ]
                 ++ modules;
               };
