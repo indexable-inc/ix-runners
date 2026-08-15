@@ -14,13 +14,14 @@
         #   nixosConfigurations = ix-runners.lib.mkPool {
         #     nixpkgs = <a nixpkgs input>;
         #     configRev = self.rev or null;
+        #     spec = builtins.fromTOML (builtins.readFile ./nix/ix-pool.toml);
         #     modules = [ ./nix/ci-runner.nix ];   # the repo's policy
         #   };
         #
         # Use a FRESH nixpkgs (nixos-unstable): GitHub deprecates Actions
         # runner versions aggressively, and the runner package must stay
         # current or registered runners are refused.
-        # `spec` is the pool spec both sides read - the same nix/ix-pool.json
+        # `spec` is the pool spec both sides read - the same nix/ix-pool.toml
         # the reconcile is pointed at. Passing it is what keeps the flake and
         # the workflow from disagreeing about the pool's size, which used to
         # be two numbers in two files with a comment asking you to keep them
@@ -69,7 +70,7 @@
                       assertions = lib.optional (spec ? "runner-label") {
                         assertion = builtins.elem spec."runner-label" config.services.ix-runner.labels;
                         message = ''
-                          ix-pool.json sets runner-label "${spec."runner-label"}",
+                          ix-pool.toml sets runner-label "${spec."runner-label"}",
                           but services.ix-runner.labels is
                           [ ${builtins.concatStringsSep " " config.services.ix-runner.labels} ].
                           The reconcile matches queued jobs against that label

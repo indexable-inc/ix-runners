@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import subprocess
@@ -21,7 +22,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-from reconcile.config import SPEC_KEYS, Config, desired_rev
+from reconcile.config import DEFAULT_SPEC_PATH, SPEC_KEYS, Config, desired_rev
 from reconcile.github import (
     MAX_DEMAND_RUNS,
     OPENER,
@@ -1966,9 +1967,20 @@ class ConfigTest(unittest.TestCase):
 class PoolSpecTest(unittest.TestCase):
     """One file defines the pool, and it is read strictly."""
 
+    def toml(self, spec):
+        """A dict as TOML. There is no stdlib writer, and the tests read
+        better with dicts than with hand-written fragments."""
+
+        def value(v):
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            return str(v) if isinstance(v, int) else json.dumps(v)
+
+        return "\n".join(f"{k} = {value(v)}" for k, v in spec.items())
+
     def write(self, body):
-        path = pathlib.Path(tempfile.mkdtemp()) / "ix-pool.json"
-        path.write_text(body if isinstance(body, str) else json.dumps(body))
+        path = pathlib.Path(tempfile.mkdtemp()) / "ix-pool.toml"
+        path.write_text(body if isinstance(body, str) else self.toml(body))
         return str(path)
 
     def load(self, body, env=None):
@@ -2030,22 +2042,32 @@ class PoolSpecTest(unittest.TestCase):
         self.assertIsNone(config)
         self.assertIn("must be a whole number", out)
 
-    def test_malformed_json_is_refused_with_the_path(self):
-        config, out = self.load("{not json")
+    def test_malformed_toml_is_refused_with_the_path(self):
+        config, out = self.load("pool-size = = 8")
         self.assertIsNone(config)
-        self.assertIn("could not be read as JSON", out)
+        self.assertIn("could not be read as TOML", out)
+
+    def test_comments_are_just_comments(self):
+        # The whole reason for TOML over JSON: every key can say what it is,
+        # in the file the operator actually edits.
+        config, _ = self.load(
+            "# the pool's name; VM names derive from it\n"
+            'pool-name = "demo"\n'
+            "pool-size = 4  # members, and the flake attrs mkPool generates\n"
+        )
+        self.assertEqual((config.pool, config.pool_size), ("demo", 4))
 
     def test_a_missing_spec_says_what_to_write(self):
         out = io.StringIO()
         with (
             mock.patch.dict(
-                "os.environ", dict(ENV, IX_POOL_SPEC="/nonexistent/ix-pool.json"), clear=True
+                "os.environ", dict(ENV, IX_POOL_SPEC="/nonexistent/ix-pool.toml"), clear=True
             ),
             contextlib.redirect_stdout(out),
         ):
             with self.assertRaises(SystemExit):
                 Config.load()
-        self.assertIn("no pool spec at /nonexistent/ix-pool.json", out.getvalue())
+        self.assertIn("no pool spec at /nonexistent/ix-pool.toml", out.getvalue())
         self.assertIn("pool-name", out.getvalue())
 
     def test_the_spec_and_the_environment_agree_on_defaults(self):
@@ -2071,6 +2093,30 @@ class PoolSpecTest(unittest.TestCase):
         config, out = self.load({"tick-mode": "scheduled"})
         self.assertIsNone(config)
         self.assertIn("unknown key 'tick-mode'", out)
+
+
+class ActionSurfaceTest(unittest.TestCase):
+    """The action's declared surface and the script's own defaults are two
+    files that have to agree, which is the exact shape of problem the pool
+    spec exists to remove - so it should not reappear between them."""
+
+    def action(self):
+        root = pathlib.Path(__file__).resolve().parent.parent.parent
+        return (root / "action.yml").read_text()
+
+    def test_the_actions_default_spec_path_matches_the_scripts(self):
+        # Parsed with a regex rather than a YAML library on purpose: the
+        # suite runs with no third-party dependencies, which is what lets it
+        # gate a job that holds a repo-admin PAT.
+        block = re.search(r"\n  config-file:\n(?:.*\n)*?    default: (\S+)", self.action())
+        self.assertIsNotNone(block, "config-file input lost its default")
+        self.assertEqual(block.group(1), DEFAULT_SPEC_PATH)
+
+    def test_the_action_asks_for_only_two_secrets(self):
+        # The surface is the product here. A new required input is a change
+        # every consumer has to make, so it should be deliberate.
+        required = re.findall(r"\n  ([a-z-]+):\n(?:.*\n)*?    required: true", self.action())
+        self.assertEqual(sorted(required), ["ix-token", "runner-pat"])
 
 
 class EntrypointTest(unittest.TestCase):

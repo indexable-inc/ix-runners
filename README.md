@@ -18,18 +18,19 @@ The built-in `GITHUB_TOKEN` cannot stand in for the PAT: workflow permissions
 have no `administration` scope, so it structurally cannot mint runner
 registration tokens.
 
-**2. Describe the pool** in `nix/ix-pool.json`:
+**2. Describe the pool** in `nix/ix-pool.toml`:
 
-```json
-{
-  "pool-name": "myrepo",
-  "region": "us-east-1",
-  "pool-size": 8
-}
+```toml
+pool-name = "myrepo"
+region    = "us-east-1"
+pool-size = 8
 ```
 
 Every key is optional and defaults in one place; the file's presence is what
-declares that this repo has a pool. Unknown keys are an error, not a default.
+declares that this repo has a pool. Unknown keys are an error, not a default -
+a typo that silently defaults is a pool quietly running someone else's
+numbers. The [knobs](#knobs) table is the full list, and TOML means you can
+paste those one-liners in beside the keys.
 
 **3. Wire it into `flake.nix`:**
 
@@ -41,7 +42,7 @@ inputs.ix-runners.url = "github:indexable-inc/ix-runners/<rev>";
 nixosConfigurations = ix-runners.lib.mkPool {
   nixpkgs = nixpkgs-ci;
   configRev = self.rev or null;
-  spec = nixpkgs.lib.importJSON ./nix/ix-pool.json;
+  spec = builtins.fromTOML (builtins.readFile ./nix/ix-pool.toml);
   modules = [ ./nix/ci-runner.nix ];
 };
 ```
@@ -155,14 +156,22 @@ only real lock available, so a running job can never be stopped out from
 under. The cost is that waking a member mints a fresh registration token.
 
 `min-warm` defaults to `pool-size`, so **autoscaling is off until you dial it
-down**, and an unconfigured pool never even reads the queue.
+down**, and an unconfigured pool never even reads the queue. Turning it on:
+
+```toml
+pool-size      = 32
+runner-label   = "ix"   # must be one of services.ix-runner.labels
+min-warm       = 3      # always warm, so a small wave starts instantly
+scale-headroom = 2
+max-online     = 32
+```
 
 Reasoning, trade-offs and the failures behind each rule:
 [docs/design.md](docs/design.md).
 
 ## Knobs
 
-All of them live in `nix/ix-pool.json`. All optional.
+All of them live in `nix/ix-pool.toml`. All optional.
 
 | key | default | meaning |
 | --- | --- | --- |
