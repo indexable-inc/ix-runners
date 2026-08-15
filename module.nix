@@ -19,7 +19,8 @@
 #
 # Each slot is its own UNIX user, so co-tenant slots cannot read each other's
 # runner credentials or caches. Consumer policy must therefore reference $HOME
-# rather than any fixed home path.
+# rather than any fixed home path, and must not put these users in wheel,
+# docker, or nix trusted-users (asserted below).
 {
   config,
   lib,
@@ -29,6 +30,8 @@
 }:
 let
   inherit (lib)
+    any
+    elem
     genAttrs
     makeOverridable
     mkDefault
@@ -36,6 +39,7 @@ let
     mkForce
     mkIf
     mkOption
+    optional
     range
     types
     ;
@@ -53,6 +57,14 @@ let
   # Per-slot, off the workDir the upstream unit wipes on every start.
   homeOf = name: "/var/lib/ix-runner-home/${name}";
   tmpOf = name: "/var/lib/ix-runner-tmp/${name}";
+
+  # Consumer footguns that are silently root-equivalent on a machine running
+  # untrusted job code. Read from the FINAL config, so a policy module adding
+  # them anywhere fails the build rather than shipping quietly.
+  extraGroupsOf = name: config.users.users.${name}.extraGroups or [ ];
+  inGroup =
+    group: name:
+    elem name (config.users.groups.${group}.members or [ ]) || elem group (extraGroupsOf name);
 
   # Already on the upstream unit's PATH (bashInteractive coreutils git gnutar
   # gzip), so job steps get them without us re-listing them per runner.
@@ -233,7 +245,33 @@ in
           ending with an alphanumeric.
         '';
       }
-    ];
+    ]
+    ++ map (name: {
+      assertion = !(elem name config.nix.settings.trusted-users);
+      message = ''
+        The runner user "${name}" is in nix.settings.trusted-users. A trusted
+        user can point the nix daemon at any substituter and import any store
+        path into the system's store, which is root-equivalent - and this user
+        runs untrusted job code on a VM that outlives the job. Remove it from
+        trusted-users; jobs do not need it to run `nix build`.
+      '';
+    }) runnerNames
+    ++ map (name: {
+      assertion = !(inGroup "wheel" name);
+      message = ''
+        The runner user "${name}" is in the wheel group (via
+        users.groups.wheel.members or users.users."${name}".extraGroups).
+        wheel means sudo, so every job on this slot is root on the VM and can
+        read every other slot's runner credentials. Remove it.
+      '';
+    }) runnerNames;
+
+    warnings = optional (any (inGroup "docker") runnerNames) ''
+      A runner user is in the "docker" group. docker group membership is
+      root-equivalent on a machine that runs untrusted CI; the pool is then
+      only as safe as the workflow runs-on gating that keeps untrusted events
+      off it.
+    '';
 
     networking.hostName = mkDefault "${cfg.poolName}-runner-${idx}";
 
@@ -522,7 +560,8 @@ in
       ];
       # trusted-users is root-equivalent (it can point the daemon at any
       # substituter or import any path). Job code runs as its own per-slot
-      # user on a machine that outlives the job, so it must not have it.
+      # user on a machine that outlives the job, so it must not have it -
+      # asserted above, since a policy module could add it back.
       trusted-users = [ "root" ];
     };
   };
