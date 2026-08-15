@@ -409,11 +409,14 @@ def deregister_member(
                         " registrations and replaces it."
                     )
                 return False
-            # Both the runner name and the response body are remote text and
-            # this message ends up in a log line and a summary cell.
+            # Report the status and the runner name, never the response body.
+            # The body is the reply to a RUNNER_PAT-authenticated request, so
+            # anything derived from it is treated as secret-tainted; keeping it
+            # out of logs both satisfies clear-text-logging scanners and keeps
+            # authenticated response bodies off a public repo's run logs. The
+            # 422 shape we act on (busy) is already classified above.
             raise RuntimeError(
-                f"deregistering {clean(runner['name'])} failed:"
-                f" HTTP {error.code} {clean(body)}"
+                f"deregistering {clean(runner['name'])} failed: HTTP {error.code}"
             ) from error
     return True
 
@@ -509,6 +512,10 @@ async def create(
 async def reconcile(ix: Any) -> int:
     """Converge the pool; return the number of creations/replacements."""
     pat = os.environ["RUNNER_PAT"]
+    # Mask the admin PAT for the whole run, as we do the registration token: it
+    # is never deliberately printed, but this redacts it from any traceback the
+    # runner emits. flush so the directive lands before anything it must cover.
+    print(f"::add-mask::{pat}", flush=True)
     repo = os.environ["GITHUB_REPOSITORY"]
     pool = pool_name()
     prefix = attr_prefix()

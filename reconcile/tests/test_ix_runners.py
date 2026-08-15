@@ -339,7 +339,9 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             for args, kwargs in printed
             if args and str(args[0]).startswith("::add-mask::")
         ]
-        self.assertEqual(masks, [{"flush": True}])
+        # Two secrets are masked - the RUNNER_PAT at the top of the run and the
+        # registration token at mint - and every mask must be flushed.
+        self.assertEqual(masks, [{"flush": True}, {"flush": True}])
 
     async def test_attr_prefix_is_configurable(self):
         ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
@@ -1019,7 +1021,12 @@ class DeregisterTest(unittest.TestCase):
         with mock.patch("reconcile.ix_runners.github_api", api):
             with self.assertRaises(RuntimeError) as caught:
                 deregister_member("pat", "r", runners, "baml", 1)
-        self.assertIn("secondary rate limit", str(caught.exception))
+        # It raises (a failure, not a defer) and names the status and runner,
+        # but never the authenticated response body (clear-text-logging).
+        message = str(caught.exception)
+        self.assertIn("HTTP 422", message)
+        self.assertIn("baml-r1-1", message)
+        self.assertNotIn("secondary rate limit", message)
 
     def test_a_404_registration_is_already_gone(self):
         runners = self.slots(1, 2)
