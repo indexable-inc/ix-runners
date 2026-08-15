@@ -294,6 +294,12 @@ in
         xorg.libXfixes
         xorg.libXrandr
         xorg.libxcb
+        # Split out of mesa in current nixpkgs; chromium headless dies
+        # "libgbm.so.1: cannot open shared object file" without it (proven
+        # live: playwright browser tests failed 3x, and the downloaded
+        # chrome-headless-shell ran on-guest the moment libgbm was on the
+        # loader path).
+        libgbm
       ];
     };
     services.envfs.enable = true;
