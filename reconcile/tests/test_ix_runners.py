@@ -6,7 +6,10 @@ import email.message
 import http.server
 import io
 import json
+import os
+import pathlib
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -634,6 +637,54 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.reconcile_with(ix), 1)
         self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
         self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
+
+    async def test_a_newline_in_a_remote_string_cannot_forge_a_summary_row(self):
+        # Error text quotes remote strings (an ix failure_reason, a runner
+        # name someone else chose). The summary escaped pipes but not
+        # newlines, so one newline writes a row of the reader's choosing.
+        ix = FakeIx(
+            vms=set(),
+            revs={},
+            online=set(),
+            markers=set(),
+            create_error=FakeIxError("boom\n| baml-runner-9 | replace | ok |"),
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            path = os.path.join(scratch, "summary.md")
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                await self.reconcile_with(ix, env=dict(ENV, GITHUB_STEP_SUMMARY=path))
+            written = pathlib.Path(path).read_text()
+        # A leading blank, the header, the separator, and exactly one line per
+        # member. Any extra line is text that escaped its cell - pipe escaping
+        # alone still lets a newline break the row in two.
+        lines = written.splitlines()
+        self.assertEqual(len(lines), 5, written)
+        self.assertEqual(
+            [line.split(" | ")[0] for line in lines[3:]],
+            ["| baml-runner-1", "| baml-runner-2"],
+        )
+
+    async def test_a_newline_in_a_failure_reason_cannot_forge_a_log_line(self):
+        # `::` workflow commands parse at the start of a line, so a newline
+        # in remote text writes a command of its author's choosing.
+        ix = FakeIx(
+            vms={"baml-runner-1"},
+            revs={},
+            online=set(),
+            markers=set(),
+            info={"baml-runner-1": {"failure_reason": "dead\n::error::forged"}},
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            await self.reconcile_with(
+                ix, env=dict(ENV, POOL_SIZE="1", MAX_REPLACEMENTS="0")
+            )
+        self.assertNotIn("\n::error::forged", out.getvalue())
+        # Still reported, just not on a line of its own.
+        self.assertIn("forged", out.getvalue())
 
     async def test_one_hostile_member_does_not_cancel_the_other_probes(self):
         # A probe that raises anything but the three expected types used to

@@ -79,14 +79,26 @@ BOOT_GRACE = CREATE_TIMEOUT
 DEREGISTER_PAUSE = 1.0
 
 
+# A newline in a log line opens a fresh line, where `::` workflow commands
+# parse and where a summary table takes another row. Plenty of what we print
+# is chosen remotely: a runner's name, an ix failure_reason or status, an
+# error message quoting either.
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(value: Any) -> str:
+    """One line, safe to print: a remote string cannot forge output."""
+    return CONTROL_CHARACTERS.sub(" ", str(value))
+
+
 def log_error(message: str) -> None:
     """An Actions error annotation - surfaced on the run, not buried in logs."""
-    print(f"::error::{message}")
+    print(f"::error::{clean(message)}")
 
 
 def log_warning(message: str) -> None:
     """An Actions warning annotation."""
-    print(f"::warning::{message}")
+    print(f"::warning::{clean(message)}")
 
 
 def write_summary(rows: list[tuple[str, str, str]]) -> None:
@@ -95,9 +107,11 @@ def write_summary(rows: list[tuple[str, str, str]]) -> None:
     if not path or not rows:
         return
     lines = ["", "| member | action | outcome |", "| --- | --- | --- |"]
-    # An exception's repr can carry a pipe, which would break the table open.
+    # A cell carries remote text: a pipe would break the table open and a
+    # newline would forge a whole row of it.
     lines += [
-        "| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |" for row in rows
+        "| " + " | ".join(clean(cell).replace("|", "\\|") for cell in row) + " |"
+        for row in rows
     ]
     with open(path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -390,8 +404,11 @@ def deregister_member(
                         " registrations and replaces it."
                     )
                 return False
+            # Both the runner name and the response body are remote text and
+            # this message ends up in a log line and a summary cell.
             raise RuntimeError(
-                f"deregistering {runner['name']} failed: HTTP {error.code} {body}"
+                f"deregistering {clean(runner['name'])} failed:"
+                f" HTTP {error.code} {clean(body)}"
             ) from error
     return True
 
@@ -608,7 +625,9 @@ async def reconcile(ix: Any) -> int:
                 print(f"{name}: stale rev but busy -> deferred")
                 summary.append((name, "replace", "deferred (busy)"))
                 continue
-            print(f"{name}: rev {actual[:12]} != {rev[:12]} -> replace")
+            # The rev is whatever the guest printed, so it is cleaned and
+            # truncated before it reaches a log line.
+            print(f"{name}: rev {clean(actual[:12])} != {rev[:12]} -> replace")
             admit("replace", member, name)
             continue
         if member_online(runners, pool, member):
