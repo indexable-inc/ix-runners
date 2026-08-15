@@ -336,7 +336,14 @@ in
         CPUWeight = "100";
         # Hosted-runner parity: 0066 leaves job artifacts unreadable to other
         # UIDs, which breaks containers and bind mounts reading the checkout.
+        # /tmp is read-only under ProtectSystem=strict and $TMPDIR is the
+        # per-slot writable temp; do not add /tmp to ReadWritePaths (a shared
+        # writable /tmp would reintroduce a cross-slot channel).
         UMask = "0022";
+        # systemd's 0755 default would publish this slot's runner _diag logs
+        # and runtime dir to every other slot's user.
+        LogsDirectoryMode = "0700";
+        RuntimeDirectoryMode = "0700";
         # chromium and playwright ship their own sandbox, which needs user
         # and pid namespaces. The VM is the isolation boundary here.
         RestrictNamespaces = mkForce false;
