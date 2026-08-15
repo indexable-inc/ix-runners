@@ -177,24 +177,45 @@ label and nothing else, the way Blacksmith works today. The spec file is v1
 surface polish, and v1 surface is the part v2 deletes.
 
 
-## Why a GitHub App rather than a PAT
+## Why a vended token rather than a PAT, and rather than an App key
 
 The reconcile needs a credential that can mint runner registration tokens,
 and GitHub puts that behind the `administration` permission, which workflow
 `GITHUB_TOKEN` does not have and cannot be granted. So a second credential is
-structural, not a shortcut.
+structural, not a shortcut. The question is only what shape it takes, and two
+obvious answers are both wrong.
 
-The question is only what shape it takes. A fine-grained PAT is bound to a
-person: it carries whatever else that person granted it, it survives them
-leaving the org until somebody remembers it, and rotating it is a human task
-on a calendar. A GitHub App installation token is bound to an installation:
-scoped to the permissions in the App's manifest, valid for an hour, and
-removable by uninstalling the App.
+**A fine-grained PAT** is bound to a person: it carries whatever else that
+person granted it, it survives them leaving the org until somebody remembers
+it, and rotating it is a human task on a calendar. It works, and it is the
+fallback, but it is not somewhere to stay.
 
-The endpoints were checked against GitHub's permissions reference before the
-work started, because a single unsupported one would have ended it - the
-registration-token mint in particular has a persistent reputation for being
-PAT-only. It is not:
+**A GitHub App private key in the customer's repo** is worse, and it is the
+answer that looks right. An App's key is APP-GLOBAL: it mints installation
+tokens for EVERY installation of that App. Put ix's key in a customer repo
+and that repo holds a credential for every other pool ix runs. Have each
+customer create their own App and the "five-minute setup" becomes a
+manifest, a key download, a secret, and a rotation policy - per repo, forever.
+
+So the key stays with ix and the token comes over the wire. The runner proves
+which repository it is by presenting the OIDC identity GitHub signs for it;
+ix verifies that claim, checks the App is installed on that repository, and
+vends an installation token scoped to it alone. The caller cannot ask for a
+token for a repository it is not running in, because it cannot forge the
+claim. Nothing is stored on either side.
+
+    POST https://ix.dev/api/ci/github-token
+      Authorization: Bearer <IX_TOKEN>
+      {"oidc_token": "<GitHub Actions OIDC JWT, audience=ix.dev>"}
+      -> {"token": "ghs_...", "expires_at": ..., "installation_id": ..., "repository": ...}
+
+The audience matters: a JWT minted for a different audience is replayable
+there, so the action pins `audience=ix.dev` and a test asserts it does.
+
+### The endpoints, checked before any of this was built
+
+One unsupported endpoint would have ended the idea, and the registration-token
+mint in particular has a persistent reputation for being PAT-only. It is not:
 
 | endpoint | permission |
 | --- | --- |
@@ -210,7 +231,7 @@ to come from the ENTERPRISE-level runner endpoints, which need
 organization-level runner management, which needs a different permission
 again. Neither applies to a repository-scoped pool.
 
-Nothing in the reconcile changed for this. An installation token is a bearer
-token in the same header as the PAT was, and the code that reads it now takes
-either - not as a choice, but because a workflow pinned to an older action
-rev keeps working through the deprecation window.
+Nothing in the reconcile changed for any of this. An installation token is a
+bearer token in the same header the PAT used, and the code that reads it
+takes either - not as a choice, but because the vending endpoint is not
+deployed yet and the PAT is what pools run on until it is.

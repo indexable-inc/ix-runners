@@ -16,31 +16,38 @@ inputs:
     required: true
 
   # -- how this authenticates to GitHub to administer runners --
-  # A GitHub App, not a person. The installation token it mints is scoped to
-  # the installation, expires in an hour, and dies with the installation
-  # rather than with somebody's account.
-  github-app-id:
+  # NOT with a GitHub App private key. An App's key is APP-GLOBAL: it mints
+  # installation tokens for EVERY installation of that App, so putting one in
+  # a repo hands that repo the keys to every other pool the App serves. There
+  # is no version of that which is safe to ask a customer to do, so the
+  # action never accepts one.
+  token-source:
     description: >
-      App ID of a GitHub App installed on this repo with Administration
-      read/write and Actions read. Not a secret - a repository variable is
-      the right home for it.
-    default: ""
-  github-app-private-key:
-    description: >
-      The App's private key (PEM). Never leaves the hosted runner: it is
-      exchanged for a 1-hour installation token that mints registration
-      tokens and reads runner status. A VM only ever receives a
-      registration token, which can do nothing but register a runner.
-    default: ""
+      Where the GitHub credential comes from.
+
+      "ix" asks the ix API to vend a short-lived installation token for THIS
+      repository, proving which repository is asking with the runner's OIDC
+      identity. Nothing is stored: the calling workflow needs
+      `permissions: id-token: write`, and the repo needs the ix-runners App
+      installed (https://github.com/apps/ix-runners).
+
+      "pat" uses the admin PAT in `runner-pat`. The default today, because
+      the vending endpoint is not deployed yet; the default flips to "ix"
+      once it is.
+    default: pat
 
   runner-pat:
     description: >
-      DEPRECATED, accepted for one release. Fine-grained PAT with
-      Administration rw on this repo, used when the App inputs are absent.
-      A PAT is bound to a person, outlives them on the repo, and carries
-      whatever else they granted it; the App path exists to end all three.
-      Migrate to github-app-id + github-app-private-key.
+      Fine-grained PAT with Administration read/write on this repo. Required
+      when token-source is "pat", refused when it is "ix". A PAT is bound to
+      a person, outlives them on the repo, and carries whatever else they
+      granted it - which is why it is the fallback and not the destination.
     default: ""
+  ix-api:
+    description: >
+      Base URL of the ix API that vends the GitHub token. You should not
+      need to set this.
+    default: https://ix.dev
   config-file:
     description: >
       Path to the pool spec, relative to the workspace. Defaults to
@@ -58,44 +65,94 @@ inputs:
 runs:
   using: composite
   steps:
-    # Fail before anything is created, and name both paths, rather than
-    # letting the reconcile die on a missing environment variable.
-    - name: Check the admin credential
+    # Fail before anything is created, naming the fix, rather than letting
+    # the reconcile die on a missing environment variable mid-run.
+    - name: Check the token source
       shell: bash
       env:
-        APP_ID: ${{ inputs.github-app-id }}
-        APP_KEY: ${{ inputs.github-app-private-key }}
+        SOURCE: ${{ inputs.token-source }}
         PAT: ${{ inputs.runner-pat }}
       run: |
-        if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
-          exit 0
-        fi
-        if [ -n "$APP_ID" ] || [ -n "$APP_KEY" ]; then
-          echo "::error::github-app-id and github-app-private-key must be set together." >&2
-          exit 1
-        fi
-        if [ -n "$PAT" ]; then
-          echo "::warning::runner-pat is deprecated and will be removed in a" \
-               "future release. Create a GitHub App with Administration" \
-               "read/write and Actions read, then set github-app-id and" \
-               "github-app-private-key instead."
-          exit 0
-        fi
-        echo "::error::no admin credential: set github-app-id +" \
-             "github-app-private-key (preferred), or runner-pat." >&2
-        exit 1
+        case "$SOURCE" in
+          ix)
+            if [ -n "$PAT" ]; then
+              echo "::error::token-source is \"ix\" but runner-pat is also set." \
+                   "Remove the runner-pat input; leaving it wired means a PAT" \
+                   "nobody reads is still in this repo's secrets." >&2
+              exit 1
+            fi
+            if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+              echo "::error::token-source is \"ix\" but this job cannot request an" \
+                   "OIDC token. Add 'permissions: id-token: write' to the job (or" \
+                   "the workflow) - it is how ix knows which repository is asking." >&2
+              exit 1
+            fi
+            ;;
+          pat)
+            if [ -z "$PAT" ]; then
+              echo "::error::token-source is \"pat\" but runner-pat is empty." \
+                   "Set it, or switch to token-source: ix." >&2
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::token-source must be \"ix\" or \"pat\", got \"$SOURCE\"." >&2
+            exit 1
+            ;;
+        esac
 
-    - name: Mint an App installation token
-      id: app-token
-      if: inputs.github-app-id != ''
-      # Pinned by commit: this step turns a private key into a token with
-      # Administration rw on the repo, so a mutable tag here is a
-      # supply-chain hole into repo takeover. The action revokes the token in
-      # its own post step, so it never outlives this job.
-      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-      with:
-        app-id: ${{ inputs.github-app-id }}
-        private-key: ${{ inputs.github-app-private-key }}
+    - name: Vend a GitHub token from ix
+      id: vend
+      if: inputs.token-source == 'ix'
+      shell: bash
+      env:
+        IX_TOKEN: ${{ inputs.ix-token }}
+        IX_API: ${{ inputs.ix-api }}
+      # curl and python3 only - both preinstalled on hosted runners. This job
+      # holds IX_TOKEN and is about to hold a repo-admin credential; it is not
+      # the place to install anything.
+      run: |
+        set -euo pipefail
+
+        # The runner's own identity, as a JWT GitHub signs. ix verifies it and
+        # reads the repository out of it, which is what makes this safe: the
+        # caller cannot ask for a token for a repository it is not running in.
+        claim=$(curl -sS --fail-with-body \
+          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=ix.dev")
+        oidc=$(printf '%s' "$claim" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+        echo "::add-mask::$oidc"
+
+        # -o/-w so a non-2xx body can be read for the diagnosis below rather
+        # than being thrown away by --fail.
+        body=$(mktemp)
+        code=$(printf '%s' "{\"oidc_token\":\"$oidc\"}" | curl -sS -o "$body" -w '%{http_code}' \
+          -X POST "$IX_API/api/ci/github-token" \
+          -H "Authorization: Bearer $IX_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @-)
+
+        case "$code" in
+          200) ;;
+          401) echo "::error::ix rejected IX_TOKEN (401). The secret is wrong," \
+                    "expired, or belongs to another account." >&2; exit 1 ;;
+          403) echo "::error::ix rejected the OIDC token (403). Either the job is" \
+                    "missing 'permissions: id-token: write', or the audience is not" \
+                    "ix.dev, or the token expired before it was used." >&2; exit 1 ;;
+          404) echo "::error::the ix-runners GitHub App is not installed on this" \
+                    "repository (404). Install it:" \
+                    "https://github.com/apps/ix-runners" >&2; exit 1 ;;
+          429) echo "::error::ix is rate limiting token vending (429). This run does" \
+                    "nothing; the next tick reconciles." >&2; exit 1 ;;
+          *)   echo "::error::ix token vending failed with HTTP $code." >&2; exit 1 ;;
+        esac
+
+        token=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$body")
+        expires=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("expires_at","?"))' "$body")
+        rm -f "$body"
+        echo "::add-mask::$token"
+        echo "token=$token" >> "$GITHUB_OUTPUT"
+        echo "vended a GitHub token for this repository, expiring $expires"
 
     - name: Install uv
       # Pinned by commit: this job holds both secrets, so a mutable tag here
@@ -115,10 +172,10 @@ runs:
       shell: bash
       env:
         IX_TOKEN: ${{ inputs.ix-token }}
-        # The App token when there is one, else the deprecated PAT. The
-        # reconcile does not care which: an installation token is a bearer
-        # token, and every endpoint it calls accepts both.
-        GITHUB_ADMIN_TOKEN: ${{ steps.app-token.outputs.token || inputs.runner-pat }}
+        # The vended token when there is one, else the PAT. The reconcile
+        # does not care which: an installation token is a bearer token in the
+        # same header, and every endpoint it calls accepts both.
+        GITHUB_ADMIN_TOKEN: ${{ steps.vend.outputs.token || inputs.runner-pat }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         IX_POOL_SPEC: ${{ inputs.config-file }}
       # --locked: install exactly the hash-pinned ix-sdk in ix-runners.lock,

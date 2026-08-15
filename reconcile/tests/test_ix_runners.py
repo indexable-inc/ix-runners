@@ -14,6 +14,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import textwrap
 import subprocess
 import threading
 import time
@@ -2121,14 +2122,15 @@ class ActionSurfaceTest(unittest.TestCase):
         required = re.findall(r"\n  ([a-z-]+):\n(?:.*\n)*?    required: true", self.action())
         self.assertEqual(sorted(required), ["ix-token"])
 
-    def test_the_app_token_action_is_pinned_by_sha(self):
-        # This step turns a private key into a token with Administration
-        # read/write on the repo. A mutable tag here is a supply-chain hole
-        # straight into repo takeover.
-        uses = re.findall(r"uses: (\S+)", self.action())
-        app = [u for u in uses if "create-github-app-token" in u]
-        self.assertEqual(len(app), 1, uses)
-        self.assertRegex(app[0], r"@[0-9a-f]{40}$")
+    def test_no_github_app_private_key_is_ever_accepted(self):
+        # An App's private key is APP-GLOBAL: it mints installation tokens
+        # for EVERY installation of that App. Accepting one here would mean
+        # asking a customer to put a credential for other people's pools in
+        # their repo. There is no safe version of that, so the input does
+        # not exist and no step consumes one.
+        text = self.action()
+        self.assertNotIn("private-key", text)
+        self.assertNotIn("create-github-app-token", text)
 
     def test_every_third_party_action_is_pinned_by_sha(self):
         # Same reasoning for all of them: this job holds IX_TOKEN and a
@@ -2138,13 +2140,13 @@ class ActionSurfaceTest(unittest.TestCase):
                 self.assertRegex(used, r"@[0-9a-f]{40}$")
 
     def test_the_admin_credential_reaches_the_script_either_way(self):
-        # The App token when there is one, the deprecated PAT otherwise -
-        # and the fallback has to be in the expression, not in the script,
-        # or the App path silently keeps using a PAT that is also set.
+        # The vended token when there is one, the PAT otherwise - and the
+        # fallback has to be in the expression, not in the script, or the
+        # vended path silently keeps using a PAT that is also set.
         env = re.search(r"GITHUB_ADMIN_TOKEN: (.+)", self.action()).group(1)
-        self.assertIn("steps.app-token.outputs.token", env)
+        self.assertIn("steps.vend.outputs.token", env)
         self.assertIn("inputs.runner-pat", env)
-        self.assertLess(env.index("app-token"), env.index("runner-pat"))
+        self.assertLess(env.index("vend"), env.index("runner-pat"))
 
 
 class AdminCredentialTest(unittest.TestCase):
@@ -2197,6 +2199,198 @@ class AdminCredentialTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 main()
         self.assertIn("GITHUB_ADMIN_TOKEN", str(raised.exception))
+
+
+class TokenVendingTest(unittest.TestCase):
+    """The composite action's token-vending step, actually executed.
+
+    This step is the only place a GitHub credential enters the run, it talks
+    to two services, and nothing else in this suite touches it - a broken
+    curl invocation here would first be discovered by a job holding IX_TOKEN.
+    So the real shell from action.yml is run against a stand-in for both
+    endpoints, rather than being eyeballed.
+    """
+
+    def setUp(self):
+        self.replies = {}  # path prefix -> (status, body)
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def respond(self):
+                for prefix, (status, body) in test.replies.items():
+                    if self.path.startswith(prefix):
+                        payload = body.encode()
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
+                self.send_error(500)
+
+            do_GET = respond
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                test.posted = self.rfile.read(length).decode()
+                test.auth = self.headers.get("Authorization")
+                self.respond()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.addCleanup(self.server.shutdown)
+
+    def step(self, name):
+        """The named step's shell, straight out of action.yml.
+
+        Parsed by hand rather than with a YAML library because the suite
+        must run with no third-party dependencies - that is what lets it
+        gate a job holding a repo-admin credential.
+        """
+        text = (pathlib.Path(__file__).resolve().parent.parent.parent / "action.yml").read_text()
+        block = re.search(
+            rf"    - name: {re.escape(name)}\n(?:.*\n)*?      run: \|\n((?:        .*\n|\n)+)",
+            text,
+        )
+        self.assertIsNotNone(block, f"step {name!r} not found or not a literal block")
+        return textwrap.dedent(block.group(1))
+
+    def run_vend(self, **env):
+        output = pathlib.Path(tempfile.mkstemp()[1])
+        self.addCleanup(output.unlink, missing_ok=True)
+        done = subprocess.run(
+            ["bash", "-c", self.step("Vend a GitHub token from ix")],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "IX_TOKEN": "ix_secret",
+                "IX_API": self.base,
+                "ACTIONS_ID_TOKEN_REQUEST_URL": f"{self.base}/idtoken?api-version=2.0",
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner_bearer",
+                "GITHUB_OUTPUT": str(output),
+                **env,
+            },
+        )
+        return done, output.read_text()
+
+    def test_a_vended_token_reaches_the_step_output(self):
+        self.replies = {
+            "/idtoken": (200, json.dumps({"value": "eyJ.oidc.jwt"})),
+            "/api/ci/github-token": (
+                200,
+                json.dumps(
+                    {
+                        "token": "ghs_vended",
+                        "expires_at": "2026-08-15T21:00:00Z",
+                        "installation_id": 42,
+                        "repository": "example/baml",
+                    }
+                ),
+            ),
+        }
+        done, output = self.run_vend()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("token=ghs_vended", output)
+
+    def test_both_secrets_are_masked_before_anything_else_prints(self):
+        # The OIDC JWT is a bearer for this repository's identity and the
+        # vended token administers its runners. Either one in a public log
+        # is the whole game.
+        self.replies = {
+            "/idtoken": (200, json.dumps({"value": "eyJ.oidc.jwt"})),
+            "/api/ci/github-token": (200, json.dumps({"token": "ghs_vended"})),
+        }
+        done, _ = self.run_vend()
+        self.assertIn("::add-mask::eyJ.oidc.jwt", done.stdout)
+        self.assertIn("::add-mask::ghs_vended", done.stdout)
+        self.assertNotIn("ghs_vended", done.stdout.split("::add-mask::ghs_vended")[0])
+
+    def test_the_contract_is_sent_as_agreed(self):
+        # An ix-side service is being built against this exact shape.
+        self.replies = {
+            "/idtoken": (200, json.dumps({"value": "eyJ.oidc.jwt"})),
+            "/api/ci/github-token": (200, json.dumps({"token": "ghs_vended"})),
+        }
+        self.run_vend()
+        self.assertEqual(json.loads(self.posted), {"oidc_token": "eyJ.oidc.jwt"})
+        self.assertEqual(self.auth, "Bearer ix_secret")
+
+    def test_the_audience_is_pinned_to_ix(self):
+        # A token minted for another audience is replayable there. It is in
+        # the URL the step builds, so it is worth asserting on the URL.
+        self.assertIn("&audience=ix.dev", self.step("Vend a GitHub token from ix"))
+
+    def test_each_failure_says_what_to_do_about_it(self):
+        for status, expected in [
+            (401, "IX_TOKEN"),
+            (403, "id-token: write"),
+            (404, "github.com/apps/ix-runners"),
+            (429, "rate limiting"),
+            (500, "HTTP 500"),
+        ]:
+            with self.subTest(status=status):
+                self.replies = {
+                    "/idtoken": (200, json.dumps({"value": "eyJ.oidc.jwt"})),
+                    "/api/ci/github-token": (status, json.dumps({"error": "no"})),
+                }
+                done, output = self.run_vend()
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::", done.stderr)
+                self.assertIn(expected, done.stderr)
+                # A failed vend must not hand a half-token to the reconcile.
+                self.assertNotIn("token=", output)
+
+    def test_an_unreachable_oidc_endpoint_fails_the_step(self):
+        # Rather than proceeding with an empty token and failing later, in
+        # the middle of a reconcile that has already created machines.
+        self.replies = {"/api/ci/github-token": (200, json.dumps({"token": "ghs_x"}))}
+        done, output = self.run_vend(ACTIONS_ID_TOKEN_REQUEST_URL=f"{self.base}/nope")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("token=", output)
+
+
+class TokenSourceGuardTest(TokenVendingTest):
+    """The guard step, likewise executed rather than read."""
+
+    def run_guard(self, source, pat="", oidc=True):
+        env = {"SOURCE": source, "PAT": pat}
+        if oidc:
+            env["ACTIONS_ID_TOKEN_REQUEST_URL"] = f"{self.base}/idtoken"
+        return subprocess.run(
+            ["bash", "-c", self.step("Check the token source")],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", ""), **env},
+        )
+
+    def test_pat_source_needs_a_pat(self):
+        self.assertNotEqual(self.run_guard("pat").returncode, 0)
+        self.assertEqual(self.run_guard("pat", pat="github_pat").returncode, 0)
+
+    def test_ix_source_refuses_a_leftover_pat(self):
+        # Not pedantry: a PAT nobody reads is still a PAT in this repo's
+        # secrets, and flipping the source should be the moment it goes.
+        done = self.run_guard("ix", pat="github_pat")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("runner-pat is also set", done.stderr)
+
+    def test_ix_source_needs_the_id_token_permission(self):
+        done = self.run_guard("ix", oidc=False)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("id-token: write", done.stderr)
+
+    def test_ix_source_with_oidc_and_no_pat_is_accepted(self):
+        self.assertEqual(self.run_guard("ix").returncode, 0)
+
+    def test_an_unknown_source_is_refused(self):
+        done = self.run_guard("app")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn('must be "ix" or "pat"', done.stderr)
 
 
 class EntrypointTest(unittest.TestCase):
