@@ -54,7 +54,7 @@ ENV = {
     "GITHUB_REPOSITORY": "example/baml",
     "POOL_SIZE": "2",
     "MAX_REPLACEMENTS": "2",
-    "IX_REGION": "us-east-1",
+    "REGION": "us-east-1",
     "GITHUB_RUN_NUMBER": "0",
 }
 
@@ -2074,7 +2074,9 @@ class PoolSpecTest(unittest.TestCase):
         # Both entry points go through from_spec, so there is exactly one
         # implementation of every default and every rule. If they ever
         # diverge, a pool behaves differently in CI than under test.
-        spec_config, _ = self.load({"pool-size": 6, "min-warm": 2, "runner-label": "ix"})
+        spec_config, _ = self.load(
+            {"pool-size": 6, "min-warm": 2, "runner-label": "ix", "region": "us-east-1"}
+        )
         with mock.patch.dict(
             "os.environ",
             dict(ENV, POOL_SIZE="6", MIN_WARM="2", RUNNER_LABEL="ix",

@@ -181,7 +181,7 @@ async def execute(
                 if kind != "prune":
                     await create(
                         ix, config.repo, rev, config.secret_name,
-                        config.attr_prefix, member, name,
+                        config.attr_prefix, member, name, config.region,
                     )
                 result.summary.append((name, kind, "ok"))
             # Any exception, not just the SDK's: an unforeseen one used to

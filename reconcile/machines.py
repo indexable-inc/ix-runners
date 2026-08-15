@@ -106,6 +106,7 @@ async def create(
     prefix: str,
     member: int,
     name: str,
+    region: str,
 ) -> None:
     """Provision one pool member; the registration token is already stored.
 
@@ -118,7 +119,7 @@ async def create(
     options = create_options(
         template=f"github:{repo}/{rev}#{prefix}-{member}",
         name=name,
-        region=os.environ.get("IX_REGION") or "us-west-1",
+        region=region,
         secret_files={secret_name: "runner-token"},
     )
     await asyncio.wait_for(ix.machines().create(options), CREATE_TIMEOUT)

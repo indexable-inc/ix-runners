@@ -307,7 +307,7 @@ class Config:
             repo=os.environ["GITHUB_REPOSITORY"],
             pool=pool,
             attr_prefix=text("attr-prefix", "ci-runner"),
-            region=text("region", os.environ.get("IX_REGION") or "us-west-1"),
+            region=text("region", "us-west-1"),
             secret_name=os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token",
             pool_size=pool_size,
             max_replacements=number("max-replacements", 2),
