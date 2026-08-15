@@ -89,7 +89,10 @@ jobs:
     # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN or RUNNER_PAT.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Pinned by commit, not by tag: this job holds IX_TOKEN and a
+      # repo-admin PAT, and checkout runs before the reconcile does - it can
+      # rewrite the environment the reconcile then reads, through $GITHUB_ENV.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # The desired rev is the last commit touching the runner config, so
           # the whole history has to be here. Under a shallow checkout the
@@ -126,7 +129,9 @@ the ix SDK; templates compile server-side on first boot and cache by rev.
   deleted before the VM is - GitHub refuses (422) to delete a runner that is
   mid-job. That closes the wide window, not all of it: a job assigned in the
   seconds between the listing and the delete is still lost, and costs that
-  job one retry.
+  job one retry. A member that is busy at every single scan defers its own
+  replacement indefinitely; past 30 days the run says so and asks you to
+  drain it by hand, rather than killing a job to make a point.
 - Offline: restarted once, replaced if still offline next run.
 - Above `pool-size`: deregistered and deleted. Shrinking the pool would
   otherwise leave orphans billing and taking jobs.
@@ -144,7 +149,16 @@ what happened to each member.
 ## Security model
 
 - `IX_TOKEN` and `RUNNER_PAT` live in GitHub Actions secrets and never
-  reach a runner VM.
+  reach a runner VM. The reconcile refuses to start unless
+  `RUNNER_ENVIRONMENT` says it is on a GitHub-hosted runner: it is the
+  control plane for the pool, so running it on the pool would hand both
+  secrets to the machines they exist to control. On GHES or ARC, set
+  `IX_RUNNERS_ALLOW_NON_HOSTED=1` to accept that explicitly - which also
+  lets `GITHUB_API_URL` name your own https API base. Everywhere else the
+  API base is pinned to `api.github.com`, because `GITHUB_API_URL` is an
+  environment variable any earlier step in the job can rewrite.
+- No PAT-bearing request follows a redirect. urllib re-sends the
+  Authorization header across a 30x, so one redirect would be enough.
 - The only credential a VM ever holds is a registration token. For its
   one-hour life that token can register a runner against your repo and steal
   its jobs - it is short-lived, not harmless. It is masked in Actions logs
@@ -154,6 +168,11 @@ what happened to each member.
   hunting a status code.
 - Machines are disposable by design and rev-anchored: a hand-edited or
   wedged VM converges away on the next reconcile.
+- A pool VM is the least trusted party in the reconcile. It is asked one
+  question (which rev it was built from) and its answer is bounded and
+  read as a string; a member that floods, hangs, or fails in any way is
+  decided as unreachable and replaced, and can never end the run or stall
+  the other members' convergence.
 - The runners are persistent and shared across jobs: any job that runs on
   the pool owns the machine and its warm state (caches, toolchains) until the
   reconcile replaces it. Point only trusted events at the pool's labels -
