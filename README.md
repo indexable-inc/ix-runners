@@ -2,19 +2,11 @@
 
 Self-hosted GitHub Actions runner pools on [ix](https://ix.dev) VMs.
 
-Persistent machines: toolchains, package registries, and compile caches stay
-warm across runs. Why that beats stateless runners - with numbers - is the
-[ix CI blog post](https://ix.dev/blog/ci).
+[ix CI](https://ix.dev/blog/ci).
 
-This repository is the mechanism, maintained by ix. Your repo keeps only
-policy: which toolchains your jobs need, pool size, labels. Fixes and
-platform workarounds land here and reach you as a one-line pin bump.
+This repository is the mechanism for a nix github action runner, maintained by ix. 
 
-Runners are persistent, not ephemeral. That is the point, not an oversight:
-if you are used to ARC's job-scoped pods, the trade you are making is
-isolation between jobs for a warm cache. A member is disposable at the pool
-level - anything wedged converges away on the next reconcile - but two jobs
-that land on one member share its disk.
+Runners are persistent, not ephemeral
 
 ## Setup
 
@@ -24,7 +16,7 @@ that land on one member share its disk.
 
    The built-in `GITHUB_TOKEN` cannot stand in for the PAT: workflow
    permissions have no `administration` scope, so it structurally cannot mint
-   runner registration tokens. The PAT goes away with the ix GitHub App (#5).
+   runner registration tokens.
 
 2. Wire the pool into your `flake.nix`:
 
@@ -44,15 +36,12 @@ that land on one member share its disk.
    repo URL, a pool name, and the packages your jobs expect on PATH.
 
    `services.ix-runner.poolName` MUST equal the action's `pool-name` input
-   (which defaults to your repository's name). The module derives runner
-   daemon names from it and the reconcile matches on those names, so if they
-   disagree every member reads offline, gets repaired once, and is then
-   replaced - forever. The pool destroys and rebuilds itself and never
-   converges.
+   (which defaults to your repository's name). 
+   The module derives runner daemon names from it and the reconcile matches on those names, so if they
+   disagree every member reads offline, gets repaired once, and is then replaced. 
 
 4. Add the workflow below and merge.
 
-A complete consumer is four files, ~190 lines; all inputs are documented in
 [`action.yml`](./action.yml).
 
 ### The workflow
@@ -109,8 +98,7 @@ jobs:
           pool-size: "8"
 ```
 
-Then swap `runs-on:` to `[self-hosted, ix]` in your other workflows at your
-leisure.
+Then swap `runs-on:` to `[self-hosted, ix]` in your other workflows at your leisure.
 
 ## How it works
 
@@ -199,15 +187,6 @@ it is not:
 - Preinstalled tooling comes from the pool's nix policy, not from a hosted
   image: anything a job expects "to just be there" (Go, docker, protoc)
   must be listed there.
-
-## Development
-
-```
-uv run --no-project python -m unittest discover -s . -v
-```
-
-The suite fakes the ix SDK and the GitHub API, so it needs no credentials
-and no dependencies - only a Python.
 
 ## Roadmap
 
