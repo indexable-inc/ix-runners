@@ -16,6 +16,11 @@
 # stateless runners; do not make these runners ephemeral. Foreign
 # dynamically-linked FHS binaries (mise, rustup toolchains, prebuilt node,
 # cargo-binstall downloads) run unmodified via nix-ld + envfs.
+#
+# Each slot is its own UNIX user, so co-tenant slots cannot read each other's
+# runner credentials or caches. Consumer policy must therefore reference $HOME
+# rather than any fixed home path, and must not put these users in wheel,
+# docker, or nix trusted-users (asserted below).
 {
   config,
   lib,
@@ -25,6 +30,8 @@
 }:
 let
   inherit (lib)
+    any
+    elem
     genAttrs
     makeOverridable
     mkDefault
@@ -32,6 +39,7 @@ let
     mkForce
     mkIf
     mkOption
+    optional
     range
     types
     ;
@@ -39,10 +47,25 @@ let
   idx = toString poolIndex;
   runnerNames = map (i: "${cfg.poolName}-r${idx}-${toString i}") (range 1 cfg.slots);
   runnerUnits = map (name: "github-runner-${name}") runnerNames;
+  tokenPermsUnit = "ix-runner-token-perms";
 
+  # One UNIX user per slot, named after the slot. A shared uid would make the
+  # per-slot HOME/TMPDIR cosmetic: any job could read a co-tenant slot's
+  # runner .credentials (and re-register that runner elsewhere), its steps'
+  # /proc/<pid>/environ, and its at-rest ~/.npmrc, ~/.docker, ~/.cargo.
+  # Warm caches stay per-slot either way, so nothing is lost by splitting.
+  #
   # Per-slot, off the workDir the upstream unit wipes on every start.
   homeOf = name: "/var/lib/ix-runner-home/${name}";
   tmpOf = name: "/var/lib/ix-runner-tmp/${name}";
+
+  # Consumer footguns that are silently root-equivalent on a machine running
+  # untrusted job code. Read from the FINAL config, so a policy module adding
+  # them anywhere fails the build rather than shipping quietly.
+  extraGroupsOf = name: config.users.users.${name}.extraGroups or [ ];
+  inGroup =
+    group: name:
+    elem name (config.users.groups.${group}.members or [ ]) || elem group (extraGroupsOf name);
 
   # Already on the upstream unit's PATH (bashInteractive coreutils git gnutar
   # gzip), so job steps get them without us re-listing them per runner.
@@ -223,7 +246,33 @@ in
           ending with an alphanumeric.
         '';
       }
-    ];
+    ]
+    ++ map (name: {
+      assertion = !(elem name config.nix.settings.trusted-users);
+      message = ''
+        The runner user "${name}" is in nix.settings.trusted-users. A trusted
+        user can point the nix daemon at any substituter and import any store
+        path into the system's store, which is root-equivalent - and this user
+        runs untrusted job code on a VM that outlives the job. Remove it from
+        trusted-users; jobs do not need it to run `nix build`.
+      '';
+    }) runnerNames
+    ++ map (name: {
+      assertion = !(inGroup "wheel" name);
+      message = ''
+        The runner user "${name}" is in the wheel group (via
+        users.groups.wheel.members or users.users."${name}".extraGroups).
+        wheel means sudo, so every job on this slot is root on the VM and can
+        read every other slot's runner credentials. Remove it.
+      '';
+    }) runnerNames;
+
+    warnings = optional (any (inGroup "docker") runnerNames) ''
+      A runner user is in the "docker" group. docker group membership is
+      root-equivalent on a machine that runs untrusted CI; the pool is then
+      only as safe as the workflow runs-on gating that keeps untrusted events
+      off it.
+    '';
 
     networking.hostName = mkDefault "${cfg.poolName}-runner-${idx}";
 
@@ -240,8 +289,9 @@ in
       workDir = "/var/lib/ix-runner-work/${name}";
       extraLabels = cfg.labels;
       extraPackages = extraUserland ++ cfg.extraPackages;
-      user = "ci-runner";
-      group = "ci-runner";
+      # One user per slot, not one shared uid - see the users.users block.
+      user = name;
+      group = name;
       extraEnvironment = {
         # Upstream defaults HOME to workDir, which it wipes on every start;
         # a warm toolchain/registry cache needs a directory nothing clears.
@@ -253,8 +303,9 @@ in
       // nixLdEnvironment
       // cfg.jobEnvironment;
       serviceOverrides = {
-        # ProtectHome=true masks /home entirely, and tooling that resolves ~
-        # from passwd rather than $HOME lands in /home/ci-runner.
+        # ProtectHome=true masks /home entirely; this slot's home is its
+        # passwd home under /var/lib, and tooling that resolves ~ from passwd
+        # rather than $HOME must reach the same directory.
         ProtectHome = mkForce false;
         # ProtectSystem=strict: this slot's HOME and TMPDIR must stay
         # writable (upstream already BindPaths= its workDir).
@@ -272,8 +323,9 @@ in
         # Hosted runners give jobs 65536; the systemd default is 1024.
         LimitNOFILE = 1048576;
         # One runaway job must not exhaust system PIDs and take the
-        # co-tenant slots with it. LimitNPROC is per-UID and every slot runs
-        # as ci-runner, so it cannot bound a single slot - TasksMax can.
+        # co-tenant slots with it. TasksMax bounds the slot's cgroup whatever
+        # uid the tasks end up under (containers, setuid helpers), which
+        # per-UID LimitNPROC cannot.
         TasksMax = 65536;
         LimitNPROC = "infinity";
         # Turns the cpu controller ON for the slice, so busy slots get fair
@@ -284,7 +336,14 @@ in
         CPUWeight = "100";
         # Hosted-runner parity: 0066 leaves job artifacts unreadable to other
         # UIDs, which breaks containers and bind mounts reading the checkout.
+        # /tmp is read-only under ProtectSystem=strict and $TMPDIR is the
+        # per-slot writable temp; do not add /tmp to ReadWritePaths (a shared
+        # writable /tmp would reintroduce a cross-slot channel).
         UMask = "0022";
+        # systemd's 0755 default would publish this slot's runner _diag logs
+        # and runtime dir to every other slot's user.
+        LogsDirectoryMode = "0700";
+        RuntimeDirectoryMode = "0700";
         # chromium and playwright ship their own sandbox, which needs user
         # and pid namespaces. The VM is the isolation boundary here.
         RestrictNamespaces = mkForce false;
@@ -300,14 +359,18 @@ in
       "ix-runner/rev".text = cfg.configRev;
     };
 
-    users.users.ci-runner = {
+    # One user and group per slot: the slot boundary is a uid boundary, so a
+    # job cannot read a co-tenant slot's credentials, environ, or caches.
+    # passwd home == $HOME, so tooling that resolves ~ from passwd agrees
+    # with the unit environment.
+    users.users = genAttrs runnerNames (name: {
       isSystemUser = true;
-      group = "ci-runner";
-      home = "/home/ci-runner";
+      group = name;
+      home = homeOf name;
       createHome = true;
       shell = pkgs.bashInteractive;
-    };
-    users.groups.ci-runner = { };
+    });
+    users.groups = genAttrs runnerNames (_: { });
 
     systemd.tmpfiles.rules = [
       # 0700 root: the reconcile's strike marker lives here, and job code
@@ -316,13 +379,15 @@ in
       "d /var/lib/ix-runner-home 0755 root root -"
       "d /var/lib/ix-runner-tmp 0755 root root -"
     ]
-    ++ map (name: "d /var/lib/ix-runner-work/${name} 0750 ci-runner ci-runner -") runnerNames
+    # Owned by the slot's own user, so 0750/0700 is a real boundary between
+    # slots rather than decoration over one shared uid.
+    ++ map (name: "d /var/lib/ix-runner-work/${name} 0750 ${name} ${name} -") runnerNames
     # Caches, so never aged out.
-    ++ map (name: "d ${homeOf name} 0700 ci-runner ci-runner -") runnerNames
-    # Per-slot rather than one shared 1777 dir: every slot runs as the same
-    # UID, so the sticky bit bought nothing, while per-slot dirs make a
+    ++ map (name: "d ${homeOf name} 0700 ${name} ${name} -") runnerNames
+    # Per-slot rather than one shared 1777 dir: a shared temp is a cross-slot
+    # channel that the sticky bit does not close, while per-slot dirs make a
     # job's own cleanup step safe and bound what one leaking job fills.
-    ++ map (name: "d ${tmpOf name} 0700 ci-runner ci-runner 1d") runnerNames
+    ++ map (name: "d ${tmpOf name} 0700 ${name} ${name} 1d") runnerNames
     # The runner's _diag logs (LogsDirectory=) are never rotated and this VM
     # is long-lived. The dirs themselves are systemd's; only age the contents.
     ++ map (name: "e /var/log/github-runner/${name} - - - 30d") runnerNames;
@@ -333,8 +398,44 @@ in
       # at create, so it is present from the first boot.
       genAttrs runnerUnits (_: {
         unitConfig.ConditionPathExists = cfg.tokenFile;
+        # Requires, not just After: an ordering edge alone would let the
+        # slots start anyway when the permission check fails. A check that
+        # condition-skips (no token) still satisfies this.
+        requires = [ "${tokenPermsUnit}.service" ];
+        after = [ "${tokenPermsUnit}.service" ];
       })
       // {
+        # The registration token is delivered root-only by the platform; a
+        # job-readable one would let any slot re-register this whole pool
+        # somewhere else, so verify rather than trust. Refusing here keeps
+        # the slots down instead of starting them around a leaked secret.
+        ${tokenPermsUnit} = {
+          description = "verify the runner registration token is root-only";
+          wantedBy = [ "multi-user.target" ];
+          before = map (unit: "${unit}.service") runnerUnits;
+          # Same skip-not-fail contract as the runner units: a boot without
+          # the secret switches cleanly.
+          unitConfig.ConditionPathExists = cfg.tokenFile;
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = pkgs.writeShellScript "ix-runner-token-perms" ''
+              set -euo pipefail
+              perms=$(${pkgs.coreutils}/bin/stat -c '%U %G %a' ${cfg.tokenFile})
+              case "$perms" in
+                'root root 600' | 'root root 400') ;;
+                *)
+                  echo "REFUSING TO START THE RUNNER POOL: ${cfg.tokenFile} is [$perms]," >&2
+                  echo "expected [root root 600] (or 400). The GitHub registration token must be" >&2
+                  echo "readable by root only - anything else exposes it to job code, which can" >&2
+                  echo "then register runners for this repository on any machine it controls." >&2
+                  exit 1
+                  ;;
+              esac
+            '';
+          };
+        };
+
         # /tmp is a tmpfs sized off BOOT-time RAM (1.5G observed, 100% full
         # under concurrent jobs) and closure tmpfs settings do not reach
         # image boots - a live remount does (ix platform, see issue #2).
@@ -360,6 +461,11 @@ in
     boot.kernel.sysctl = {
       "kernel.threads-max" = 1048576;
       "kernel.pid_max" = 4194304;
+      # Defense in depth for the co-tenant slots: without Yama scope, one
+      # slot's job could ptrace-attach to another slot's steps. ix guests do
+      # not get the closure's lsm= kernel cmdline, so Yama may be inactive
+      # and this sysctl is the only place its scope is guaranteed.
+      "kernel.yama.ptrace_scope" = 1;
     };
 
     # Guests boot small and grow elastically: a job that outruns virtio-mem
@@ -502,8 +608,9 @@ in
         "flakes"
       ];
       # trusted-users is root-equivalent (it can point the daemon at any
-      # substituter or import any path). Job code runs as ci-runner on a
-      # machine that outlives the job, so it must not have it.
+      # substituter or import any path). Job code runs as its own per-slot
+      # user on a machine that outlives the job, so it must not have it -
+      # asserted above, since a policy module could add it back.
       trusted-users = [ "root" ];
     };
   };
