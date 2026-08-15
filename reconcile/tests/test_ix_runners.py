@@ -704,6 +704,32 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
         self.assertEqual(sorted(ix.created), ["baml-runner-1", "baml-runner-2"])
 
+    async def test_a_member_that_defers_forever_is_called_out(self):
+        # A member busy at every scan defers its own replacement for as long
+        # as it likes, so a runner-config change never reaches it. Nothing
+        # said so, and the deferral is silent by design.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-1": OLD_REV, "baml-runner-2": OLD_REV},
+            online={1, 2},
+            busy={1, 2},
+            markers=set(),
+            info={"baml-runner-1": {"created_at": now_ms() - 60 * DAY_MS}},
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(await self.reconcile_with(ix), 0)
+        warnings = [
+            line
+            for line in out.getvalue().splitlines()
+            if line.startswith("::warning::")
+        ]
+        # Exactly one: member 2 is busy and stale too, but a day old.
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("baml-runner-1", warnings[0])
+        # Warned about, never killed mid-job.
+        self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
+
     async def test_one_failed_create_does_not_abort_the_run(self):
         # A bad template rev spends the budget and exits non-zero, but every
         # member in budget is still attempted (no half-scanned pool).

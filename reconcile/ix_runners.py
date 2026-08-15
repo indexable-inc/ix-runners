@@ -77,6 +77,10 @@ CREATE_TIMEOUT = 1800
 BOOT_GRACE = CREATE_TIMEOUT
 # Spacing between registration DELETEs; see the 422 note on deregister_member.
 DEREGISTER_PAUSE = 1.0
+# How old a member may get while its stale-rev replacement keeps deferring
+# before the run says so out loud. Generous: a healthy pool replaces members
+# far sooner, so reaching this at all means something never converges.
+MAX_LIFETIME = 30 * 24 * 60 * 60
 
 
 # A newline in a log line opens a fresh line, where `::` workflow commands
@@ -622,6 +626,25 @@ async def reconcile(ix: Any) -> int:
             # Never roll a member out from under a running job: config
             # rolls wait for idleness, this member converges on a later run.
             if member_busy(runners, pool, member):
+                # ...unless it is never idle at scan time, in which case it
+                # defers its own replacement forever and no runner-config
+                # change - including a security one - ever reaches it. Say
+                # so; do NOT force the replace. The execute-time deregister
+                # refuses a busy member from the same snapshot, and bypassing
+                # that check is what leaves a member half-deregistered and
+                # serving at reduced capacity. A real drain (disable the
+                # registrations, wait for idle, then replace) is the fix, and
+                # it is a bigger change than this pass.
+                age = machine_age(info)
+                if age is not None and age > MAX_LIFETIME:
+                    log_warning(
+                        f"{name}: {int(age // 86400)} days old, on a stale rev,"
+                        " and busy at every scan, so its replacement keeps"
+                        " deferring and the current runner config has never"
+                        " reached it. Drain it by hand: disable its runners in"
+                        " the repo's Actions settings, let the jobs finish, and"
+                        " re-run this workflow."
+                    )
                 print(f"{name}: stale rev but busy -> deferred")
                 summary.append((name, "replace", "deferred (busy)"))
                 continue
