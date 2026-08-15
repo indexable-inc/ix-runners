@@ -37,6 +37,7 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.request
 
@@ -52,6 +53,8 @@ REPAIRED_MARKER = "/var/lib/ix-runner/repaired"
 EXEC_TIMEOUT = 60
 # Bounds a create: a first boot of a new rev builds the template in-guest.
 CREATE_TIMEOUT = 1800
+# Spacing between registration DELETEs; see the 422 note on deregister_member.
+DEREGISTER_PAUSE = 1.0
 
 
 def log_error(message: str) -> None:
@@ -69,6 +72,14 @@ def client():
     from ix_sdk import Client
 
     return Client()
+
+
+def error_body(error: urllib.error.HTTPError) -> str:
+    """The failed response's body; empty when it carried none."""
+    try:
+        return error.read().decode("utf-8", "replace")
+    except (AttributeError, OSError, ValueError):
+        return ""
 
 
 def github_api(pat: str, repo: str, path: str, *, method: str = "GET") -> dict:
@@ -171,47 +182,86 @@ def pool_name() -> str:
     return os.environ["GITHUB_REPOSITORY"].split("/")[1].lower()
 
 
+def member_runners(runners: list[dict], pool: str, member: int) -> list[dict]:
+    """Every runner daemon registration belonging to pool member N.
+
+    One VM runs `slots` daemons named `<pool>-r<N>-<slot>`; the trailing dash
+    is what keeps member 1 from matching member 10.
+    """
+    prefix = f"{pool}-r{member}-"
+    return [runner for runner in runners if runner["name"].startswith(prefix)]
+
+
 def member_online(runners: list[dict], pool: str, member: int) -> bool:
     """Any runner daemon of pool member N online?"""
-    prefix = f"{pool}-r{member}-"
     return any(
-        runner["name"].startswith(prefix) and runner["status"] == "online"
-        for runner in runners
+        runner["status"] == "online" for runner in member_runners(runners, pool, member)
     )
+
+
+def member_busy(runners: list[dict], pool: str, member: int) -> bool:
+    """Any runner daemon of pool member N mid-job?"""
+    return any(runner.get("busy") for runner in member_runners(runners, pool, member))
+
+
+# GitHub documents 422 on the runner-delete endpoint only as "Validation
+# failed, or the endpoint has been spammed"; that a BUSY runner refuses
+# deletion with it is undocumented community knowledge, and a
+# secondary-rate-limit 422 wears exactly the same code. Read the body before
+# believing "busy", or a rate-limited burst reads as a wholly idle pool.
+BUSY_REFUSAL = ("busy", "running a job", "job is still running")
+
+
+def is_busy_refusal(body: str) -> bool:
+    """Does this 422 body say the runner is mid-job, rather than spam?"""
+    lowered = body.lower()
+    return any(hint in lowered for hint in BUSY_REFUSAL)
 
 
 def deregister_member(
     pat: str, repo: str, runners: list[dict], pool: str, member: int
 ) -> bool:
-    """Delete pool member N's runner registrations; False when one is busy.
+    """Delete pool member N's runner registrations; False when it is busy.
 
-    GitHub refuses to delete a busy runner's registration (HTTP 422), which
-    makes this the atomic guard against rolling a VM out from under a job:
-    a busy check alone races the scan's snapshot. Deregistering first makes
-    GitHub itself the lock - only a member with zero registrations left is
-    safe to delete.
+    Busy is checked across ALL of the member's slots BEFORE any delete:
+    deleting until a 422 stops us leaves a half-deregistered VM that still
+    reads healthy (member_online is any-slot-online) and serves at reduced
+    capacity forever.
+
+    Deregistering before the VM delete remains the lock - GitHub refuses to
+    delete a busy runner - and the freshly-listed `busy` field closes the
+    wide window; only a seconds-old assignment can still slip through, at
+    the cost of one job retry.
+
+    Blocking urllib: the caller runs this in a thread, under a lock.
     """
-    prefix = f"{pool}-r{member}-"
-    for runner in runners:
-        if not runner["name"].startswith(prefix):
-            continue
+    registrations = member_runners(runners, pool, member)
+    if any(runner.get("busy") for runner in registrations):
+        return False
+    for index, runner in enumerate(registrations):
+        if index:
+            # Rapid DELETEs trip GitHub's secondary rate limit.
+            time.sleep(DEREGISTER_PAUSE)
         try:
             github_api(pat, repo, f"/actions/runners/{runner['id']}", method="DELETE")
         except urllib.error.HTTPError as error:
-            if error.code == 422:  # busy: picked up a job since the scan
-                return False
             if error.code == 404:  # already gone
                 continue
-            raise
+            body = error_body(error)
+            if error.code == 422 and is_busy_refusal(body):
+                if index:
+                    log_warning(
+                        f"{pool}-runner-{member}: took a job mid-deregister -"
+                        f" {index} of {len(registrations)} registration(s) are"
+                        " ALREADY DELETED. It is half-deregistered and serving"
+                        " at reduced capacity; a later run sees the missing"
+                        " registrations and replaces it."
+                    )
+                return False
+            raise RuntimeError(
+                f"deregistering {runner['name']} failed: HTTP {error.code} {body}"
+            ) from error
     return True
-
-
-def member_busy(runners: list[dict], pool: str, member: int) -> bool:
-    """Any runner daemon of pool member N mid-job?"""
-    prefix = f"{pool}-r{member}-"
-    return any(
-        runner["name"].startswith(prefix) and runner.get("busy") for runner in runners
-    )
 
 
 async def member_rev(machine) -> str | None:
@@ -361,17 +411,26 @@ async def reconcile(ix) -> int:
         await ix.secrets().set(secret, token["token"])
         print(f"executing {len(actions)} action(s), concurrency {concurrency}")
         gate = asyncio.Semaphore(concurrency)
+        # Deregistrations are serialized across members: concurrent DELETEs
+        # trip GitHub's secondary rate limit, whose 422 is indistinguishable
+        # by status code from a busy runner's refusal.
+        deregistering = asyncio.Lock()
 
         async def run_action(kind: str, member: int, name: str) -> None:
             nonlocal replaced, failures
             async with gate:
                 try:
                     if kind == "replace":
-                        # Deregister at EXECUTE time, right before the
-                        # delete: GitHub refuses (422) to deregister a busy
-                        # runner, so a member that picked up a job since the
-                        # scan is skipped, and its budget is refunded.
-                        if not deregister_member(pat, repo, runners, pool, member):
+                        # Deregister at EXECUTE time, right before the delete,
+                        # off the event loop: the blocking urllib calls would
+                        # otherwise stall every sibling create's timeout
+                        # budget. A member that picked up a job since the scan
+                        # is skipped, and its budget is refunded.
+                        async with deregistering:
+                            freed = await asyncio.to_thread(
+                                deregister_member, pat, repo, runners, pool, member
+                            )
+                        if not freed:
                             print(f"{name}: picked up a job mid-scan -> deferred")
                             replaced -= 1
                             return

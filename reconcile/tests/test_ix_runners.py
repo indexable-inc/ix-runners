@@ -1,18 +1,52 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import email.message
+import io
+import json
 import subprocess
+import time
 import unittest
 import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from reconcile.ix_runners import desired_rev, list_runners, member_online, reconcile
+from reconcile.ix_runners import (
+    deregister_member,
+    desired_rev,
+    list_runners,
+    member_online,
+    member_runners,
+    reconcile,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
 REV = "a" * 40
 OLD_REV = "b" * 40
+
+
+def http_error(code: int, message: str) -> urllib.error.HTTPError:
+    """An HTTPError carrying a real body, as GitHub's do: the 422 classifier
+    reads the body, so a body-less fake would wave a misclassification
+    through."""
+    body = io.BytesIO(json.dumps({"message": message}).encode())
+    return urllib.error.HTTPError(
+        "https://api.github.com", code, message, email.message.Message(), body
+    )
+
+
+class FakeIxError(RuntimeError):
+    """Mirrors ix_sdk.IxError, which subclasses RuntimeError."""
+
+
+class FakeNotFound(FakeIxError):
+    pass
+
+
+class FakeUnavailable(FakeIxError):
+    """What the SDK raises when the guest agent cannot be reached."""
 
 ENV = {
     "IX_TOKEN": "ix_test_token",
@@ -107,23 +141,34 @@ class FakeIx:
         markers,
         busy=frozenset(),
         busy_at_delete=frozenset(),
+        registered=None,
+        slots=1,
         broken=False,
         page_size=100,
     ):
         self.vms = vms  # existing VM names
         self.revs = revs  # name -> baked config rev (missing = unreachable)
-        self.online = online  # pool member numbers with an online runner
-        self.markers = markers  # names carrying the two-strike marker
-        self.busy = busy  # pool member numbers with a runner mid-job
+        self.online = set(online)  # pool member numbers with an online runner
+        self.markers = set(markers)  # names carrying the two-strike marker
+        self.busy = set(busy)  # pool member numbers with a runner mid-job
         # members that pick up a job AFTER the scan snapshot: idle in the
         # runners listing, but GitHub 422s the registration delete.
-        self.busy_at_delete = busy_at_delete
+        self.busy_at_delete = set(busy_at_delete)
+        # every member with runner registrations; online iff also in `online`.
+        self.registered = set(
+            self.online | self.busy if registered is None else registered
+        )
+        self.slots = slots  # runner daemons per VM
         self.broken = broken  # every create fails (bad template rev)
         self.page_size = page_size  # runner listing page size
         self.calls = []
         self.create_delay = 0.0
         self.in_flight = 0
         self.max_in_flight = 0
+        self.deletes_in_flight = 0
+        self.max_deletes_in_flight = 0
+        self.creates_during_a_delete = 0
+        self.delete_delay = 0.0
 
     def machines(self):
         return FakeMachines(self)
@@ -131,31 +176,45 @@ class FakeIx:
     def secrets(self):
         return FakeSecrets(self)
 
+    def runner_rows(self):
+        return [
+            {
+                "id": 1000 + member * 10 + slot,
+                "name": f"baml-r{member}-{slot}",
+                "status": "online" if member in self.online else "offline",
+                "busy": member in self.busy,
+            }
+            for member in sorted(self.registered)
+            for slot in range(1, self.slots + 1)
+        ]
+
     def github_api(self, pat, repo, path, *, method="GET"):
         self.calls.append((None, (method, path)))
         if path.startswith("/actions/runners?"):
-            runners = [
-                {
-                    "id": 1000 + member,
-                    "name": f"baml-r{member}-1",
-                    "status": "online",
-                    "busy": member in self.busy,
-                }
-                for member in sorted(self.online | self.busy)
-            ]
+            rows = self.runner_rows()
             start = (int(path.rsplit("page=", 1)[1]) - 1) * self.page_size
             return {
-                "total_count": len(runners),
-                "runners": runners[start : start + self.page_size],
+                "total_count": len(rows),
+                "runners": rows[start : start + self.page_size],
             }
         if path == "/actions/runners/registration-token":
             return {"token": "REGTOKEN"}
         if method == "DELETE" and path.startswith("/actions/runners/"):
-            runner_id = int(path.rsplit("/", 1)[1])
-            member = runner_id - 1000
-            if member in self.busy_at_delete:
-                raise urllib.error.HTTPError(path, 422, "busy", None, None)
-            return {}
+            self.deletes_in_flight += 1
+            self.max_deletes_in_flight = max(
+                self.max_deletes_in_flight, self.deletes_in_flight
+            )
+            try:
+                time.sleep(self.delete_delay)
+                self.creates_during_a_delete = max(
+                    self.creates_during_a_delete, self.in_flight
+                )
+                member = (int(path.rsplit("/", 1)[1]) - 1000) // 10
+                if member in self.busy_at_delete:
+                    raise http_error(422, f"baml-r{member} is still running a job")
+                return {}
+            finally:
+                self.deletes_in_flight -= 1
         raise AssertionError(f"unexpected API path {path}")
 
 
@@ -166,6 +225,7 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
             mock.patch("reconcile.ix_runners.github_api", ix.github_api),
             mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
+            mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
         ):
             return await reconcile(ix)
 
@@ -216,9 +276,39 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             markers=set(),
         )
         self.assertEqual(await self.reconcile_with(ix), 1)
-        dereg = ix.calls.index((None, ("DELETE", "/actions/runners/1001")))
+        dereg = ix.calls.index((None, ("DELETE", "/actions/runners/1011")))
         vm_delete = ix.calls.index(("baml-runner-1", ("delete",)))
         self.assertLess(dereg, vm_delete)
+
+    async def test_deregistrations_never_overlap(self):
+        # Concurrent DELETEs trip GitHub's secondary rate limit, whose 422 is
+        # indistinguishable by status from a busy runner: serialize them.
+        ix = FakeIx(
+            vms={f"baml-runner-{m}" for m in range(1, 5)},
+            revs={f"baml-runner-{m}": OLD_REV for m in range(1, 5)},
+            online={1, 2, 3, 4},
+            markers=set(),
+            slots=2,
+        )
+        ix.delete_delay = 0.01
+        env = dict(ENV, POOL_SIZE="4", MAX_REPLACEMENTS="4", CONCURRENCY="4")
+        self.assertEqual(await self.reconcile_with(ix, env=env), 4)
+        self.assertEqual(ix.max_deletes_in_flight, 1)
+
+    async def test_a_deregistration_does_not_stall_a_sibling_create(self):
+        # deregister_member is blocking urllib: called on the event loop it
+        # freezes every sibling action, eating their CREATE_TIMEOUT budget.
+        ix = FakeIx(
+            vms={"baml-runner-1"},
+            revs={"baml-runner-1": OLD_REV},
+            online={1},
+            markers=set(),
+        )
+        ix.delete_delay = 0.05
+        ix.create_delay = 0.05
+        env = dict(ENV, POOL_SIZE="2", MAX_REPLACEMENTS="2", CONCURRENCY="2")
+        await self.reconcile_with(ix, env=env)
+        self.assertGreater(ix.creates_during_a_delete, 0)
 
     async def test_mid_scan_job_pickup_defers_the_replace(self):
         # Member 1 reads idle in the scan snapshot but picks up a job before
@@ -396,7 +486,78 @@ class DesiredRevTest(unittest.TestCase):
             self.assertEqual(desired_rev(), REV)
 
 
-class MemberOnlineTest(unittest.TestCase):
+class DeregisterTest(unittest.TestCase):
+    @staticmethod
+    def slots(member: int, count: int, busy=frozenset()):
+        return [
+            {
+                "id": 1000 + member * 10 + slot,
+                "name": f"baml-r{member}-{slot}",
+                "status": "online",
+                "busy": slot in busy,
+            }
+            for slot in range(1, count + 1)
+        ]
+
+    def test_a_busy_slot_defers_before_any_delete(self):
+        # Deleting until a 422 stops us leaves a half-deregistered member that
+        # still reads healthy and serves at reduced capacity.
+        runners = self.slots(1, 4, busy={3})
+        calls = []
+
+        def api(pat, repo, path, *, method="GET"):
+            calls.append((method, path))
+            return {}
+
+        with mock.patch("reconcile.ix_runners.github_api", api):
+            self.assertFalse(deregister_member("pat", "r", runners, "baml", 1))
+        self.assertEqual(calls, [])
+
+    def test_a_mid_loop_busy_422_is_loud_about_the_damage(self):
+        runners = self.slots(1, 3)
+
+        def api(pat, repo, path, *, method="GET"):
+            if path.endswith("1012"):
+                raise http_error(422, "baml-r1-2 is still running a job")
+            return {}
+
+        out = io.StringIO()
+        with (
+            mock.patch("reconcile.ix_runners.github_api", api),
+            mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertFalse(deregister_member("pat", "r", runners, "baml", 1))
+        self.assertIn("::warning::", out.getvalue())
+        self.assertIn("half-deregistered", out.getvalue())
+
+    def test_a_non_busy_422_is_a_failure_not_a_defer(self):
+        # A secondary-rate-limit 422 read as "busy" silently freezes every
+        # replacement in the pool.
+        runners = self.slots(1, 1)
+
+        def api(pat, repo, path, *, method="GET"):
+            raise http_error(422, "You have exceeded a secondary rate limit")
+
+        with mock.patch("reconcile.ix_runners.github_api", api):
+            with self.assertRaises(RuntimeError) as caught:
+                deregister_member("pat", "r", runners, "baml", 1)
+        self.assertIn("secondary rate limit", str(caught.exception))
+
+    def test_a_404_registration_is_already_gone(self):
+        runners = self.slots(1, 2)
+
+        def api(pat, repo, path, *, method="GET"):
+            raise http_error(404, "Not Found")
+
+        with (
+            mock.patch("reconcile.ix_runners.github_api", api),
+            mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+        ):
+            self.assertTrue(deregister_member("pat", "r", runners, "baml", 1))
+
+
+class MemberMatchTest(unittest.TestCase):
     def test_prefix_does_not_cross_member_boundaries(self):
         runners = [{"name": "baml-r10-1", "status": "online"}]
         self.assertFalse(member_online(runners, "baml", 1))
@@ -405,6 +566,14 @@ class MemberOnlineTest(unittest.TestCase):
     def test_offline_runner_does_not_count(self):
         runners = [{"name": "baml-r1-1", "status": "offline"}]
         self.assertFalse(member_online(runners, "baml", 1))
+
+    def test_every_slot_of_a_member_is_matched(self):
+        runners = [
+            {"name": "baml-r1-1", "status": "online"},
+            {"name": "baml-r1-2", "status": "offline"},
+            {"name": "baml-r2-1", "status": "online"},
+        ]
+        self.assertEqual(len(member_runners(runners, "baml", 1)), 2)
 
 
 if __name__ == "__main__":
