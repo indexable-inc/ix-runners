@@ -39,7 +39,7 @@ tightened.
 
 Labels are read off the runners' own registrations rather than configured, so
 what the pool advertises and what it is matched on cannot drift apart.
-`runner-label` in the spec is only the fallback for a pool that has not
+`runner-label` in `ix-pool.toml` is only the fallback for a pool that has not
 registered anything yet, and `mkPool` asserts at build time that it is one of
 `services.ix-runner.labels` - a label nothing advertises means the pool never
 wakes for a wave, silently, because zero *servable* jobs and zero jobs look
@@ -169,3 +169,9 @@ per job, booted from a warm snapshot on a webhook and destroyed when the job
 ends - which removes the idle question entirely rather than managing it. That
 needs an ix-hosted control plane; until it exists, a fixed pool with a power
 dial is the version that is honest about what it can guarantee.
+
+That also removes the customer-side file entirely. `ix-pool.toml` and the
+reconcile workflow exist because the pool is managed from the consumer's own
+CI; once the control plane runs it, adopting ix CI is choosing a `runs-on`
+label and nothing else, the way Blacksmith works today. The spec file is v1
+surface polish, and v1 surface is the part v2 deletes.

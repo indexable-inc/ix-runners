@@ -23,8 +23,8 @@ inputs:
   config-file:
     description: >
       Path to the pool spec, relative to the workspace. Defaults to
-      nix/ix-pool.json, which is where the flake looks for it too.
-    default: nix/ix-pool.json
+      nix/ix-pool.toml, which is where the flake looks for it too.
+    default: nix/ix-pool.toml
   github-token:
     description: >
       Reads the job queue for the demand signal, and nothing else. The
