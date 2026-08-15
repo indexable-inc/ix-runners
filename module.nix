@@ -58,15 +58,12 @@ let
     bzip2
   ];
 
-  # GitHub's runner hardcodes node20 as its INTERNAL runtime (NodeUtil.cs),
-  # but nixpkgs dropped end-of-life node20 and ships externals/node24 only:
-  # without this shim every hashFiles() expression dies "No such file or
-  # directory". COPY the package (an overrideAttrs would lose the
-  # binary-cache hit and rebuild the runner in-guest, measured ~45 min/VM),
-  # rewrite the bin wrappers' absolute store self-references so the runner's
-  # root is the copy, and serve node24 as node20 (it executes the runner's
-  # internal scripts fine). makeOverridable because the nixos module applies
-  # `pkg.override { inherit nodeRuntimes; }`.
+  # GitHub's runner hardcodes node20 as its internal runtime; nixpkgs ships
+  # node24 only (node20 is EOL), which breaks every hashFiles() expression.
+  # Serve node24 under the node20 name inside a copied package: a copy keeps
+  # the binary-cache hit (an override would rebuild the runner from source),
+  # and the bin-wrapper rewrite makes the copy the runner's root so it finds
+  # the shim. makeOverridable because the NixOS module calls `pkg.override`.
   runnerPackage = lib.makeOverridable (
     {
       nodeRuntimes ? [ "node24" ],
@@ -120,14 +117,13 @@ in
       type = types.str;
       default = "/run/secrets/runner-token";
       description = ''
-        Runner registration credential, attached at VM CREATE time via the
-        ix secret store (`ix new --secret-file <key>=runner-token:root:0400`)
-        - never baked into the image, so the template cache stays
-        content-addressed and shareable. Use a SHORT-LIVED registration
-        token (1 h, POST /repos/{repo}/actions/runners/registration-token),
-        not a PAT: registration only happens at (re)configure time, so
-        nothing long-lived ever sits on the VM. Units condition-skip while
-        the file is absent, so a boot without the secret switches cleanly.
+        Runner registration credential, attached at machine create through
+        the ix secret store (the reconcile's `secret_files` option) - never
+        baked into the image, so the template cache stays shareable. Always
+        a short-lived (1 h) registration token, never a PAT: registration
+        only happens at configure time, so nothing long-lived sits on the
+        VM. Units condition-skip while the file is absent, so a boot
+        without the secret still switches cleanly.
       '';
     };
 
@@ -165,31 +161,27 @@ in
       # Persistence is the point (see header).
       ephemeral = false;
       replace = true;
-      # NOT the module default (a /run tmpfs: checkouts land in RAM and die
-      # ENOSPC). The unit cleans workDir on service START, not between jobs:
-      # a reboot drops checkouts/target dirs but keeps HOME (registry,
-      # sccache, mise, rustup), which recovers the loss quickly.
+      # Persistent disk, not the module's /run tmpfs default: checkouts and
+      # target dirs live here between jobs; HOME carries the caches.
       workDir = "/var/lib/ix-runner-work/${name}";
       extraLabels = cfg.labels;
       extraPackages = basePackages ++ cfg.extraPackages;
       user = "ci-runner";
       group = "ci-runner";
       serviceOverrides = {
-        # Jobs need a stable writable HOME (mise, rustup, cargo, pnpm) to
-        # stay warm across runs; the nixpkgs unit hardens it away.
+        # A stable writable HOME keeps toolchains and caches warm across
+        # runs; the nixpkgs unit hardens it away.
         DynamicUser = lib.mkForce false;
         ProtectHome = lib.mkForce false;
         # ProtectSystem=strict: the shared TMPDIR must stay writable.
         ReadWritePaths = [ "/var/lib/ix-runner-tmp" ];
-        # systemd DefaultTasksMax and the boot-RAM-derived RLIMIT_NPROC both
-        # cap thread creation below what concurrent cargo jobs need
-        # (pthread_create EAGAIN killing rustc/sccache, observed live).
+        # Defaults cap thread creation below what concurrent build jobs
+        # need; see also the sysctl pins below.
         TasksMax = "infinity";
         LimitNPROC = "infinity";
         Environment = [
-          # Keep job temp off the small boot-path /tmp tmpfs (ix platform,
-          # see issue #2): gcc, go, and mise/python-build scratch all honor
-          # TMPDIR. Disk-backed, wiped by the tmpfiles age rule below.
+          # Disk-backed job temp, off the small boot-path /tmp (issue #2);
+          # wiped by the tmpfiles age rule below.
           "TMPDIR=/var/lib/ix-runner-tmp"
         ]
         ++ cfg.jobEnvironment;

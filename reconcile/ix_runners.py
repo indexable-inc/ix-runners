@@ -119,13 +119,11 @@ def deregister_member(
 ) -> bool:
     """Delete pool member N's runner registrations; False when one is busy.
 
-    GitHub refuses to delete a BUSY runner's registration (HTTP 422), which
+    GitHub refuses to delete a busy runner's registration (HTTP 422), which
     makes this the atomic guard against rolling a VM out from under a job:
-    the busy check alone races, because a member can pick up a job between
-    the scan's runners snapshot and the delete (observed live: two jobs
-    died step-less when their member rolled seconds after passing the busy
-    check). Deregistering first turns GitHub itself into the lock - only a
-    member with zero registrations left is safe to delete.
+    a busy check alone races the scan's snapshot. Deregistering first makes
+    GitHub itself the lock - only a member with zero registrations left is
+    safe to delete.
     """
     prefix = f"{pool}-r{member}-"
     for runner in runners:

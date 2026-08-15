@@ -1,22 +1,22 @@
 # ix-runners
 
 Self-hosted GitHub Actions runner pools on [ix](https://ix.dev) VMs.
-Persistent machines, so toolchains, registries, and compile caches stay warm
-across runs - that is the entire pitch versus stateless runners.
 
-This repository is the **mechanism**, maintained by ix and shared by every
-repo that runs CI on ix. Your repo keeps only **policy**: which toolchains
-your jobs need, pool size, labels. Platform quirks and their workarounds live
-here, tracked on this repo's issues, and fixes reach you as a rev bump of
-one flake input.
+Persistent machines: toolchains, package registries, and compile caches stay
+warm across runs. Why that beats stateless runners - with numbers - is the
+[ix CI blog post](https://ix.dev/blog/ci).
 
-## Setup (the whole of it)
+This repository is the mechanism, maintained by ix. Your repo keeps only
+policy: which toolchains your jobs need, pool size, labels. Fixes and
+platform workarounds land here and reach you as a one-line pin bump.
+
+## Setup
 
 1. Add two Actions secrets to your repo: `IX_TOKEN` (the ix account the VMs
-   bill to) and `RUNNER_PAT` (fine-grained PAT, Administration rw on the
-   repo - it never leaves GitHub-hosted runners).
+   bill to) and `RUNNER_PAT` (fine-grained PAT, Administration read/write on
+   the repo).
 
-2. Add the flake input and pool to your `flake.nix`:
+2. Wire the pool into your `flake.nix`:
 
    ```nix
    inputs.nixpkgs-ci.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -30,34 +30,46 @@ one flake input.
    };
    ```
 
-3. Write your policy in `nix/ci-runner.nix` (~40 lines): `services.ix-runner`
-   with your repo URL, pool name, and the toolchain packages your jobs
-   expect on PATH.
+3. Write your policy in `nix/ci-runner.nix`: `services.ix-runner` with your
+   repo URL, a pool name, and the packages your jobs expect on PATH.
 
 4. Add a workflow that runs this repo's action on a schedule and on pushes
-   touching the runner config, then dispatch it once with
-   `max-replacements` = your pool size. Runners appear; swap `runs-on:` to
-   `[self-hosted, ix]` at your leisure.
+   touching the runner config. Merge. The first reconcile builds the whole
+   pool; swap `runs-on:` to `[self-hosted, ix]` at your leisure.
+
+A complete consumer is four files, ~190 lines; see the action inputs in
+[`action.yml`](./action.yml).
+
+## How it works
+
+A scheduled reconcile - on GitHub-hosted runners, never on the pool it
+manages - converges reality to your git history: the last commit touching
+the runner config is the desired state, every VM image bakes the rev it was
+built from, and any member that drifts is replaced. Creation goes through
+the ix SDK; templates compile server-side on first boot and cache by rev.
+
+- Missing member: created, with a fresh 1-hour registration token attached
+  as a root-only file at first boot. No post-boot seeding step exists.
+- Stale rev: replaced, never under a running job - registrations are
+  deleted first, and GitHub's refusal to delete a busy runner is the lock.
+- Offline: restarted once, replaced if still offline next run.
+- Empty pool: the per-run replacement cap self-raises, so first bootstrap
+  is just the first tick.
 
 ## Security model
 
-- The reconcile runs on GitHub-hosted runners only. `IX_TOKEN` and
-  `RUNNER_PAT` never reach a runner VM.
-- At create, a short-lived (1 h) registration token is placed in the ix
-  secret store (API body, never argv) and attached as a root-only file
-  present at first boot. No post-boot seeding; nothing durable on any VM.
-- Each image bakes the git rev it was built from; the reconciler replaces
-  any member whose rev drifts from the last commit touching the runner
-  config. Hand-edited or stale VMs converge away automatically.
-- A member whose runners are mid-job is never replaced by a config roll; it
-  is deferred until idle.
+- `IX_TOKEN` and `RUNNER_PAT` live in GitHub Actions secrets and never
+  reach a runner VM.
+- The only credential a VM ever holds is a registration token that expires
+  in an hour and can do nothing but register a runner.
+- Machines are disposable by design and rev-anchored: a hand-edited or
+  wedged VM converges away on the next reconcile.
+- Everything that runs your CI is in this repository, readable.
 
 ## Roadmap
 
-- ~~Drop the ix CLI~~ (#3): done - provisioning is pure `ix-sdk`, including
-  server-side first-boot template builds. Nothing is installed by `curl`.
-- An official ix GitHub App + token vending via the ix API (#5) replaces
-  `RUNNER_PAT`: customer setup becomes install-app + one secret.
-- The scheduled-reconcile model is the v1. The v2 is an ix-hosted control
-  plane (webhook-driven, ephemeral runners booted from warm snapshots), at
-  which point the workflow file in consumer repos deletes too.
+- An official ix GitHub App with token vending through the ix API replaces
+  `RUNNER_PAT`; setup becomes install-app plus one secret (#5).
+- v2 is an ix-hosted control plane: webhook-driven ephemeral runners booted
+  from warm snapshots. The workflow file in consumer repos deletes; the
+  policy file stays.
