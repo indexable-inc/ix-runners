@@ -3,11 +3,13 @@
 Runs from CI on GITHUB-HOSTED runners only - never self-hosted, since a
 runner VM must never see IX_TOKEN, and require_hosted_runner refuses at
 startup rather than trusting the caller. Secrets: IX_TOKEN (the ix account
-the VMs bill to), RUNNER_PAT (fine-grained, "administration" repo rw). The
-PAT never leaves that runner: it mints SHORT-LIVED (1 h) registration tokens
-and reads runner status, over a host-pinned, redirect-refusing opener; a VM
-only ever receives a registration token, which can do nothing but register a
-runner and is dead within the hour.
+the VMs bill to) and a GitHub App (id + private key) whose installation
+token administers the runners. That token never leaves the hosted runner: it
+mints SHORT-LIVED (1 h) registration tokens and reads runner status, over a
+host-pinned, redirect-refusing opener; a VM only ever receives a
+registration token, which can do nothing but register a runner and is dead
+within the hour. The App installation token is itself hour-scoped and bound
+to an installation rather than to a person.
 
 Provisioning is pure ix Python SDK (ix-sdk on PyPI, pinned in the
 entrypoint's inline metadata) - no CLI, no output parsing. The
@@ -112,7 +114,7 @@ async def reconcile(ix: Any) -> int:
     keeping this function short is that the ORDER is the only thing it
     expresses, and the order is the part that has bitten us.
     """
-    pat = os.environ["RUNNER_PAT"]
+    pat = admin_token()
     # Mask the admin PAT for the whole run, as we do the registration token: it
     # is never deliberately printed, but this redacts it from any traceback the
     # runner emits. flush so the directive lands before anything it must cover.
@@ -170,6 +172,31 @@ async def reconcile(ix: Any) -> int:
         raise SystemExit(1)
     return outcome.applied
 
+ADMIN_TOKEN_VARS = ("GITHUB_ADMIN_TOKEN", "RUNNER_PAT")
+
+
+def admin_token() -> str:
+    """The credential that administers runners: an App installation token,
+    or the legacy PAT.
+
+    Two names because they are two eras, not two options. The action sets
+    GITHUB_ADMIN_TOKEN from whichever source the caller chose; RUNNER_PAT is
+    still read so a workflow pinned to an older action rev keeps working.
+
+    Nothing downstream cares which it is - a vended installation token is a
+    bearer token like the PAT, and every endpoint this uses accepts both.
+    """
+    for name in ADMIN_TOKEN_VARS:
+        value = os.environ.get(name)
+        if value:
+            return value
+    raise SystemExit(
+        "no admin credential: set GITHUB_ADMIN_TOKEN (the action does this"
+        " from the token it vends, or from runner-pat) or, when driving this"
+        " script directly, RUNNER_PAT"
+    )
+
+
 def require_hosted_runner() -> None:
     """Refuse to run anywhere but a GitHub-hosted runner.
 
@@ -201,9 +228,12 @@ def main() -> None:
     # ::add-mask:: can trail the output it was meant to mask.
     sys.stdout.reconfigure(line_buffering=True)
     require_hosted_runner()
-    for required in ("IX_TOKEN", "RUNNER_PAT", "GITHUB_REPOSITORY"):
+    for required in ("IX_TOKEN", "GITHUB_REPOSITORY"):
         if not os.environ.get(required):
             raise SystemExit(f"{required} is required")
+    # Checked here rather than at first use so a missing credential fails
+    # before anything has been created.
+    admin_token()
     asyncio.run(reconcile(client()))
 
 

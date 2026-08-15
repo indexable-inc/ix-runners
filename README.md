@@ -12,11 +12,42 @@ caches are the point. If you need per-job isolation, this is not that tool.
 
 Ten minutes, four steps.
 
-**1. Two Actions secrets.** `IX_TOKEN` (the ix account the VMs bill to) and
-`RUNNER_PAT` (a fine-grained PAT with Administration read/write on the repo).
-The built-in `GITHUB_TOKEN` cannot stand in for the PAT: workflow permissions
-have no `administration` scope, so it structurally cannot mint runner
-registration tokens.
+**1. Install the App, add one secret.** Install
+[ix-runners](https://github.com/apps/ix-runners) on your repository, then set
+one Actions secret:
+
+- `IX_TOKEN` — the ix account the VMs bill to.
+
+That is the whole credential story. The reconcile asks the ix API for a
+short-lived GitHub token scoped to *this* repository, proving which
+repository is asking with the runner's own OIDC identity, so there is nothing
+to store, rotate, or leak. Your workflow grants `id-token: write`; see the
+example below.
+
+> **You are never asked for a GitHub App private key**, and you should refuse
+> any tool that does. An App's key is *app-global*: it mints installation
+> tokens for **every** installation of that App, so a key sitting in one repo
+> is a credential for every other pool the App serves. That is why the token
+> is vended rather than minted locally.
+
+The built-in `GITHUB_TOKEN` cannot do this job: workflow permissions have no
+`administration` scope, so it structurally cannot mint runner registration
+tokens. That is why a second credential exists at all.
+
+<details>
+<summary>Fallback: a fine-grained PAT (<code>token-source: pat</code>)</summary>
+
+Until the vending endpoint is deployed this is the default. Create a
+fine-grained PAT with **Administration: read and write** and **Actions:
+read** on the repo, store it as `RUNNER_PAT`, and pass
+`runner-pat: ${{ secrets.RUNNER_PAT }}`.
+
+It works, and it is what the pools run on today. It is the fallback rather
+than the destination because a PAT is bound to a person: it carries whatever
+else they granted it, it outlives them on the repo until somebody remembers
+it, and rotating it is a human task on a calendar.
+
+</details>
 
 **2. Describe the pool** in `nix/ix-pool.toml`:
 
@@ -72,6 +103,7 @@ on:
 permissions:
   contents: read
   actions: read                # reads the job queue for the demand signal
+  id-token: write              # proves to ix which repo is asking for a token
 
 # One reconcile at a time, and never cancel one mid-create.
 concurrency:
@@ -80,7 +112,7 @@ concurrency:
 
 jobs:
   reconcile:
-    # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN or RUNNER_PAT.
+    # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -91,7 +123,9 @@ jobs:
       - uses: indexable-inc/ix-runners@<rev>
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
-          runner-pat: ${{ secrets.RUNNER_PAT }}
+          # "ix" once the vending endpoint is deployed; "pat" until then,
+          # with runner-pat: ${{ secrets.RUNNER_PAT }} alongside it.
+          token-source: ix
 ```
 
 `schedule` and `workflow_run` only fire from a workflow file on your
@@ -227,7 +261,18 @@ default branch. A workflow still on a feature branch never ticks.
 
 ## Security
 
-- `IX_TOKEN` and `RUNNER_PAT` never reach a runner VM. The reconcile refuses
+- **Runners are administered by a GitHub App, and no key for it exists in
+  your repository.** The reconcile presents the runner's OIDC identity to the
+  ix API, which checks that the App is installed on the calling repository
+  and vends an installation token scoped to that one repository. The token
+  lives an hour. Removing access is uninstalling the App - there is no human
+  account whose leaving, or whose other grants, matter.
+- **No App private key is ever accepted as an input**, and a test enforces
+  that. An App's key is app-global: it mints installation tokens for every
+  installation of that App, so a key in one customer's repo is a credential
+  for every other pool. Only ix holds the key, and it never vends a token for
+  a repository other than the one whose OIDC claim it just verified.
+- `IX_TOKEN` and the vended GitHub token never reach a runner VM. The reconcile refuses
   to start unless `RUNNER_ENVIRONMENT` says GitHub-hosted - it is the control
   plane for the pool, so running it on the pool would hand both secrets to
   the machines they exist to control. On GHES/ARC set
@@ -242,8 +287,9 @@ default branch. A workflow still on a feature branch never ticks.
 - The demand signal uses the workflow's own `GITHUB_TOKEN`, never the PAT:
   listing runs needs the Actions permission, and repo administration has no
   business holding one.
-- An expired or revoked `RUNNER_PAT` presents as HTTP 401 and the reconcile
-  says exactly that, so you rotate a secret rather than hunt a status code.
+- A rejected admin credential presents as HTTP 401 and the reconcile says so
+  in those terms, naming both paths, so you check an installation or rotate a
+  secret rather than hunt a status code.
 - A pool VM is the least trusted party here. It is asked one question - which
   rev it was built from - and its answer is bounded and read as a string. A
   member that floods, hangs or fails is decided as unreachable and replaced,
@@ -277,8 +323,8 @@ it is not:
 
 ## Roadmap
 
-- An ix GitHub App with token vending replaces `RUNNER_PAT`; setup becomes
-  install-app plus one secret (#5).
+- `token-source: ix` becomes the default once the vending endpoint is
+  deployed, and `runner-pat` becomes legacy at that point (#5).
 - v2 is an ix-hosted control plane: webhook-driven ephemeral runners from
   warm snapshots. The workflow file in consumer repos deletes; the policy
   file stays.

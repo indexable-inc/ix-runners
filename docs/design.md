@@ -175,3 +175,63 @@ reconcile workflow exist because the pool is managed from the consumer's own
 CI; once the control plane runs it, adopting ix CI is choosing a `runs-on`
 label and nothing else, the way Blacksmith works today. The spec file is v1
 surface polish, and v1 surface is the part v2 deletes.
+
+
+## Why a vended token rather than a PAT, and rather than an App key
+
+The reconcile needs a credential that can mint runner registration tokens,
+and GitHub puts that behind the `administration` permission, which workflow
+`GITHUB_TOKEN` does not have and cannot be granted. So a second credential is
+structural, not a shortcut. The question is only what shape it takes, and two
+obvious answers are both wrong.
+
+**A fine-grained PAT** is bound to a person: it carries whatever else that
+person granted it, it survives them leaving the org until somebody remembers
+it, and rotating it is a human task on a calendar. It works, and it is the
+fallback, but it is not somewhere to stay.
+
+**A GitHub App private key in the customer's repo** is worse, and it is the
+answer that looks right. An App's key is APP-GLOBAL: it mints installation
+tokens for EVERY installation of that App. Put ix's key in a customer repo
+and that repo holds a credential for every other pool ix runs. Have each
+customer create their own App and the "five-minute setup" becomes a
+manifest, a key download, a secret, and a rotation policy - per repo, forever.
+
+So the key stays with ix and the token comes over the wire. The runner proves
+which repository it is by presenting the OIDC identity GitHub signs for it;
+ix verifies that claim, checks the App is installed on that repository, and
+vends an installation token scoped to it alone. The caller cannot ask for a
+token for a repository it is not running in, because it cannot forge the
+claim. Nothing is stored on either side.
+
+    POST https://ix.dev/api/ci/github-token
+      Authorization: Bearer <IX_TOKEN>
+      {"oidc_token": "<GitHub Actions OIDC JWT, audience=ix.dev>"}
+      -> {"token": "ghs_...", "expires_at": ..., "installation_id": ..., "repository": ...}
+
+The audience matters: a JWT minted for a different audience is replayable
+there, so the action pins `audience=ix.dev` and a test asserts it does.
+
+### The endpoints, checked before any of this was built
+
+One unsupported endpoint would have ended the idea, and the registration-token
+mint in particular has a persistent reputation for being PAT-only. It is not:
+
+| endpoint | permission |
+| --- | --- |
+| `POST /actions/runners/registration-token` | Administration: write |
+| `GET /actions/runners` | Administration: read |
+| `DELETE /actions/runners/{id}` | Administration: write |
+| `GET /actions/runs` | Actions: read |
+| `GET /actions/runs/{id}/jobs` | Actions: read |
+
+All five list installation access tokens as supported. The folklore appears
+to come from the ENTERPRISE-level runner endpoints, which need
+`manage_runners:enterprise` and were not App-callable in older docs, and from
+organization-level runner management, which needs a different permission
+again. Neither applies to a repository-scoped pool.
+
+Nothing in the reconcile changed for any of this. An installation token is a
+bearer token in the same header the PAT used, and the code that reads it
+takes either - not as a choice, but because the vending endpoint is not
+deployed yet and the PAT is what pools run on until it is.
