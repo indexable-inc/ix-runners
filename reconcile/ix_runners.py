@@ -31,21 +31,47 @@ Per pool member:
     VM unreachable                  -> replace
     VM above POOL_SIZE              -> prune (a shrink's orphan still bills)
 
-AUTOSCALING is a second, independent axis: the pool is a FIXED declarative
-set of POOL_SIZE machines, and the only thing that moves is their power
-state. A stopped machine keeps its disk - and with it its runner
-registration credentials, so it re-registers on boot with no token - and
-bills storage alone. Demand is GitHub's own job queue for the pool's label;
-the queue is the buffer while a machine boots.
+AUTOSCALING is a second, independent axis, and it is LEVEL-BASED: every
+tick observes the world fresh and moves it toward a level, rather than
+replaying events or remembering what it did last time. Nothing is stored
+between runs - not an idle counter, not a pending action, nothing - so a
+missed tick costs latency and never correctness, and two reconciles cannot
+hold different beliefs about the pool.
 
-    desired_online = clamp(demand_members + SCALE_HEADROOM,
+The member set is FIXED and declarative: POOL_SIZE machines, named and
+built from the repo's runner config. Power state is the only thing that
+moves. A stopped machine keeps its disk and bills storage alone.
+
+    desired_online = clamp(ceil(servable_jobs / slots) + SCALE_HEADROOM,
                            MIN_WARM, MAX_ONLINE)
 
-Below it, stopped members START (always preferred over a create: seconds,
-not a template build). Above it, idle members STOP, highest index first, so
-the warm core stays the same low-numbered machines and their template cache
-stays hot. MIN_WARM defaults to POOL_SIZE, which is autoscaling OFF and
-byte-for-byte today's behavior; nothing scales until a pool dials it down.
+SERVABLE is strict: a job counts only when some runner in this pool
+advertises EVERY label in its runs-on. GitHub ANDs those labels, and a repo
+routinely has jobs queued forever against labels nothing here carries;
+counting them would pin the pool at MAX_ONLINE on work it cannot do.
+
+The GitHub queue is the buffer. Below the level, stopped members START -
+always before a create, which is a template build rather than a boot, and
+never rationed, because being short of capacity is the state with a queue
+behind it. Above it, idle members STOP, highest index first, so the warm
+core stays the same low-numbered machines with the hottest caches.
+
+Two rules keep a wave from being throttled by its own arrival:
+
+  * only a SCHEDULED tick may scale down. An event tick fires when a run is
+    requested - before its jobs are in the queue - so it sees an idle pool
+    at the moment a wave is landing.
+  * a tick that cannot read GitHub makes NO scaling decision. Missing data
+    is not zero demand, and it is not zero idleness either.
+
+Scale-down DEREGISTERS before it cuts power. GitHub refuses (422) to delete
+a runner mid-job, and that refusal is the only real lock here: after the
+DELETE the runner cannot be assigned anything, which no amount of
+re-reading a listing can guarantee. The price is that waking a member needs
+a fresh registration token, which is why a start rotates the secret.
+
+MIN_WARM defaults to POOL_SIZE, which is autoscaling off; nothing scales,
+and no tick even reads the queue, until a pool dials it down.
 
 Three phases, deliberately: PROBE every member concurrently, DECIDE from
 that snapshot in a deterministic (rotated) order, then EXECUTE the admitted
@@ -63,6 +89,7 @@ config roll converges across successive runs like a rolling update.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -84,12 +111,6 @@ REV_PATH = "/etc/ix-runner/rev"
 REPAIRED_MARKER = "/var/lib/ix-runner/repaired"
 # What the probe script prints when the marker is there; never a valid rev.
 STRIKE = "ix-runner-strike"
-# Consecutive scans this member has been idle-and-surplus, kept on the VM for
-# the same reason the strike is: scale-down grace has to survive across runs
-# without this script holding state anywhere.
-IDLE_PATH = "/var/lib/ix-runner/idle-ticks"
-# Prefix the probe prints it behind, so a count can never be read as a rev.
-IDLE_PREFIX = "idle="
 # A wedged VM must not hang the reconcile.
 EXEC_TIMEOUT = 60
 # The probe's whole legitimate answer is a 40-char rev plus a marker word.
@@ -114,10 +135,12 @@ MAX_LIFETIME = 30 * 24 * 60 * 60
 # machine autoscaling started reads as offline-and-reachable and gets
 # "repaired" on the spot, and a second tick starts it all over again.
 WARM_GRACE = 300
-# Ceiling on active workflow runs whose jobs are counted for demand. Past it
-# the demand number is not trustworthy, and the safe direction is up: the run
-# scales to MAX_ONLINE rather than guessing low and stranding a queue.
+# Ceiling on active workflow runs whose jobs are counted for demand.
 MAX_DEMAND_RUNS = 100
+# Recently-completed runs read to derive the idle clock. The window this
+# buys has to be longer than IDLE_GRACE or a runner's absence from it proves
+# nothing, which the scale-down checks before trusting it.
+IDLE_SCAN_RUNS = 30
 
 
 # A newline in a log line opens a fresh line, where `::` workflow commands
@@ -306,101 +329,204 @@ def list_runners(pat: str, repo: str) -> list[dict[str, Any]]:
     return runners
 
 
-def active_run_ids(token: str, repo: str) -> tuple[list[int], bool]:
-    """Ids of every queued or in-progress workflow run; True when truncated.
+def runner_label_sets(
+    runners: list[dict[str, Any]], pool: str, pool_size: int
+) -> list[set[str]]:
+    """What each of THIS pool's runners advertises it can serve.
 
-    Both statuses, because a job can be queued inside a run that is already
-    in_progress - the common shape of a wave, where the fan-out jobs sit
-    behind a setup job that is already running. Counting only `queued` runs
-    misses exactly the demand the pool exists to absorb.
+    Read off the registrations rather than configured, because GitHub's own
+    matching rule is defined over exactly these sets and nothing else.
     """
-    # A dict, not a list: a run that flips queued -> in_progress between the
-    # two passes appears in both, and counted twice it inflates demand.
+    sets = []
+    for member in range(1, pool_size + 1):
+        for runner in member_runners(runners, pool, member):
+            labels = {
+                str(label.get("name") or "")
+                for label in (runner.get("labels") or [])
+                if label.get("name")
+            }
+            if labels:
+                sets.append(labels)
+    return sets
+
+
+def pool_can_serve(job: dict[str, Any], label_sets: list[set[str]]) -> bool:
+    """Could any runner in this pool pick this job up?
+
+    GitHub ANDs the labels in `runs-on`: a runner is eligible when it carries
+    EVERY one of them. So the test is subset, not intersection, and it has to
+    be per runner - two runners that between them cover a job's labels cannot
+    run it.
+
+    This is the difference between a demand signal and a stuck-queue
+    amplifier. The repo has runs queued indefinitely against labels no ix
+    runner has (blacksmith-*, macos-*, windows-*): jobs that will never be
+    served by anything here. Counting them is not conservative, it is a
+    permanent maximum - the pool would be pinned at max-online forever by
+    work it cannot do.
+    """
+    wanted = {
+        str(label) for label in (job.get("labels") or []) if isinstance(label, str)
+    }
+    if not wanted:
+        return False
+    return any(wanted <= advertised for advertised in label_sets)
+
+
+def run_ids(token: str, repo: str, status: str, cap: int) -> tuple[list[int], bool]:
+    """Ids of runs in one status, newest first; True when the cap was hit."""
     ids: dict[int, None] = {}
-    for status in ("queued", "in_progress"):
-        seen = 0
-        page = 1
-        # One PAST the cap, so "exactly MAX_DEMAND_RUNS runs" is a complete
-        # answer rather than a truncated-looking one.
-        while len(ids) <= MAX_DEMAND_RUNS:
-            body = github_api(
-                token,
-                repo,
-                f"/actions/runs?status={status}&per_page=100&page={page}",
-                pat=False,
-            )
-            batch = body.get("workflow_runs") or []
-            if not batch:
-                break
-            ids.update((int(run["id"]), None) for run in batch)
-            seen += len(batch)
-            if seen >= int(body.get("total_count") or 0):
-                break
-            page += 1
-    return list(ids)[:MAX_DEMAND_RUNS], len(ids) > MAX_DEMAND_RUNS
-
-
-def pool_demand(token: str, repo: str, label: str) -> int | None:
-    """Jobs queued or running against the pool's label; None when unknown.
-
-    Jobs, never runs: one run fans out into a matrix, and the pool is sized
-    in jobs. A job's `labels` is its `runs-on` set, so a job belongs to this
-    pool exactly when the pool's label is in it.
-
-    `token` is deliberately NOT the admin PAT: reading workflow runs needs
-    the Actions permission, which the PAT does not carry and must not be
-    given - a demand scan is a read of public-ish job metadata and has no
-    business holding repo administration. The caller passes the workflow's
-    own GITHUB_TOKEN.
-
-    None means the answer could not be trusted, which the caller reads as
-    "scale to MAX_ONLINE" - the direction that strands no queue.
-    """
-    run_ids, truncated = active_run_ids(token, repo)
-    if truncated:
-        log_warning(
-            f"more than {MAX_DEMAND_RUNS} active workflow runs: treating"
-            " demand as unbounded and scaling to the maximum"
+    seen = 0
+    page = 1
+    # One PAST the cap, so exactly `cap` runs is a complete answer rather than
+    # one that looks truncated.
+    while len(ids) <= cap:
+        body = github_api(
+            token,
+            repo,
+            f"/actions/runs?status={status}&per_page=100&page={page}",
+            pat=False,
         )
-        return None
-    jobs = 0
-    for run_id in run_ids:
-        page = 1
-        while True:
-            body = github_api(
-                token,
-                repo,
-                f"/actions/runs/{run_id}/jobs?filter=latest&per_page=100&page={page}",
-                pat=False,
-            )
-            batch = body.get("jobs") or []
-            jobs += sum(
-                1
-                for job in batch
-                if job.get("status") in ("queued", "in_progress")
-                and label in (job.get("labels") or [])
-            )
-            if len(batch) < 100:
-                break
-            page += 1
+        batch = body.get("workflow_runs") or []
+        if not batch:
+            break
+        ids.update((int(run["id"]), None) for run in batch)
+        seen += len(batch)
+        if seen >= int(body.get("total_count") or 0):
+            break
+        page += 1
+    return list(ids)[:cap], len(ids) > cap
+
+
+def run_jobs(token: str, repo: str, run_id: int) -> list[dict[str, Any]]:
+    """Every job of one run, across pages."""
+    jobs: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        body = github_api(
+            token,
+            repo,
+            f"/actions/runs/{run_id}/jobs?filter=latest&per_page=100&page={page}",
+            pat=False,
+        )
+        batch = body.get("jobs") or []
+        jobs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
     return jobs
 
 
-def demand_or_none(token: str, repo: str, label: str) -> int | None:
-    """pool_demand, but a broken demand read never ends the run.
+def parse_time(value: Any) -> float | None:
+    """An ISO-8601 GitHub timestamp as epoch seconds, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
-    The commonest cause is a token without the Actions permission, and the
-    honest response to "I cannot see the queue" is to keep the pool up, not
-    to stop reconciling it: healing matters more than the bill.
+
+class Observation:
+    """Everything the scaler learned from GitHub in one tick.
+
+    One object because the parts are only meaningful together: a demand
+    number without the idle window can scale up but must not scale down.
+    """
+
+    def __init__(
+        self,
+        demand: int,
+        idle_since: dict[str, float],
+        window_start: float | None,
+        truncated: bool,
+    ) -> None:
+        self.demand = demand
+        # runner name -> when it last finished a job (epoch seconds).
+        self.idle_since = idle_since
+        # Oldest job completion the scan saw. Absence of a runner from
+        # idle_since only proves it has been idle since HERE.
+        self.window_start = window_start
+        # More active runs than the scan will read: the demand number is a
+        # floor, not a count.
+        self.truncated = truncated
+
+    def idle_for(self, names: list[str], now: float) -> float | None:
+        """How long every one of these runners has been idle, or None when
+        the scan cannot say."""
+        latest = max(
+            (self.idle_since[name] for name in names if name in self.idle_since),
+            default=None,
+        )
+        if latest is not None:
+            return now - latest
+        # Never seen finishing a job in the window. That means idle since at
+        # least the start of the window - but only if there IS a window.
+        if self.window_start is None:
+            return None
+        return now - self.window_start
+
+
+def observe(
+    token: str, repo: str, label_sets: list[set[str]], idle_scan_runs: int
+) -> Observation:
+    """One pass over GitHub's job queue: demand, and when runners last worked.
+
+    Active runs give demand. Recently-completed runs give the idle clock -
+    derived, not stored, so the reconcile keeps no state between ticks and
+    two reconciles cannot disagree about how long something has been idle.
+    """
+    active: list[int] = []
+    truncated = False
+    for status in ("queued", "in_progress"):
+        ids, hit_cap = run_ids(token, repo, status, MAX_DEMAND_RUNS)
+        active.extend(ids)
+        truncated = truncated or hit_cap
+
+    demand = 0
+    for run_id in dict.fromkeys(active):
+        for job in run_jobs(token, repo, run_id):
+            if job.get("status") in ("queued", "in_progress") and pool_can_serve(
+                job, label_sets
+            ):
+                demand += 1
+
+    idle_since: dict[str, float] = {}
+    window_start: float | None = None
+    completed, _ = run_ids(token, repo, "completed", idle_scan_runs)
+    for run_id in completed:
+        for job in run_jobs(token, repo, run_id):
+            finished = parse_time(job.get("completed_at"))
+            name = job.get("runner_name")
+            if finished is None:
+                continue
+            window_start = (
+                finished if window_start is None else min(window_start, finished)
+            )
+            if isinstance(name, str) and name:
+                idle_since[name] = max(idle_since.get(name, 0.0), finished)
+
+    return Observation(demand, idle_since, window_start, truncated)
+
+
+def observe_or_none(
+    token: str, repo: str, label_sets: list[set[str]], idle_scan_runs: int
+) -> Observation | None:
+    """observe(), except that a failed read is None rather than an exception.
+
+    None means "this tick learned nothing", and the caller's answer to that
+    is to make no scaling decision at all. Missing data is not zero demand,
+    and it is not zero idleness either: guessing in EITHER direction on an
+    unread queue is how a pool stops the work it should be doing, or stops
+    machines that are about to be handed a job.
+
+    Broad on purpose. HTTPError subclasses OSError, which also covers a reset
+    connection, a DNS failure and a TLS error; RuntimeError is the redirect
+    refusal. This runs before the execute phase, so an escaping exception
+    would discard every create, replace and repair the run had decided on.
     """
     try:
-        return pool_demand(token, repo, label)
-    # Broad on purpose, and the breadth IS the feature. HTTPError subclasses
-    # OSError, which also covers a reset connection, a DNS failure and a TLS
-    # error; RuntimeError is the redirect refusal. This runs BEFORE the
-    # execute phase, so anything escaping here discards every create, replace
-    # and repair the run had already decided on - a 502 from one read would
-    # stop the pool being healed at all.
+        return observe(token, repo, label_sets, idle_scan_runs)
     except (OSError, RuntimeError) as error:
         code = getattr(error, "code", None)
         hint = (
@@ -409,12 +535,10 @@ def demand_or_none(token: str, repo: str, label: str) -> int | None:
             else ""
         )
         log_warning(
-            f"reading the job queue failed ({code or type(error).__name__})."
-            f"{hint} Scaling to the maximum for this run."
+            f"could not read the job queue ({code or type(error).__name__})."
+            f"{hint} Making no scaling decision this tick."
         )
         return None
-
-
 def pool_slots(runners: list[dict[str, Any]], pool: str, pool_size: int) -> int:
     """Runner daemons per VM, read back off the registrations.
 
@@ -620,28 +744,19 @@ def deregister_member(
     return True
 
 
-async def probe_member(
-    machine: Any, *, clear_marker: bool
-) -> tuple[str | None, bool, int]:
-    """One guest round-trip: baked rev, strike marker, idle count, removal.
+async def probe_member(machine: Any, *, clear_marker: bool) -> tuple[str | None, bool]:
+    """One guest round-trip: the baked rev, the strike marker, its removal.
 
     Folded into a single shell because the marker `rm` was a whole extra exec
     on every healthy member, for a file that is almost never there. Exit
     status is deliberately ignored: `test -f` sets it whenever the marker is
     absent, which is the ordinary case.
 
-    The idle count is read the same way and always printed, so a machine
-    built before this existed answers 0 rather than nothing - the scale-down
-    grace works on today's fleet without rolling it.
-
     Every failure reads as "unreachable", which is a state the decide loop
     already handles. The guest is the least trusted thing here: it answers
     with whatever it likes, so nothing it says may end the run.
     """
-    script = (
-        f"cat {REV_PATH}; test -f {REPAIRED_MARKER} && echo {STRIKE};"
-        f" echo {IDLE_PREFIX}$(cat {IDLE_PATH} 2>/dev/null || echo 0)"
-    )
+    script = f"cat {REV_PATH}; test -f {REPAIRED_MARKER} && echo {STRIKE}"
     if clear_marker:
         script += f"; rm -f {REPAIRED_MARKER}"
     try:
@@ -650,7 +765,7 @@ async def probe_member(
     # covers the wait_for bound, but a MemoryError from a huge reply is
     # neither, and one member must never take the whole reconcile down.
     except Exception:
-        return None, False, 0
+        return None, False
     stdout = result.stdout or ""
     if len(stdout) > MAX_PROBE_OUTPUT:
         # A `head -c` inside the script bounds nothing - the guest chooses
@@ -659,29 +774,10 @@ async def probe_member(
             f"a pool member answered the probe with {len(stdout)} bytes"
             f" (cap {MAX_PROBE_OUTPUT}); treating it as unreachable"
         )
-        return None, False, 0
+        return None, False
     tokens = stdout.split()
-    rev = None
-    idle = 0
-    for token in tokens:
-        if token == STRIKE:
-            continue
-        if token.startswith(IDLE_PREFIX):
-            digits = token[len(IDLE_PREFIX) :]
-            # The guest chose this string. Anything but a small count reads
-            # as no idle history - never an exception, which the caller would
-            # turn into "unreachable" and then into a delete. isascii is not
-            # decoration: str.isdigit() is true for "²" and other Unicode
-            # digits that int() then refuses.
-            idle = (
-                int(digits)
-                if digits.isascii() and digits.isdigit() and len(digits) <= 3
-                else 0
-            )
-            continue
-        if rev is None:
-            rev = token
-    return rev, STRIKE in tokens, idle
+    rev = next((token for token in tokens if token != STRIKE), None)
+    return rev, STRIKE in tokens
 
 
 async def guest(machine: Any, *command: str) -> bool:
@@ -693,19 +789,6 @@ async def guest(machine: Any, *command: str) -> bool:
     except (TimeoutError, OSError, RuntimeError):
         return False
 
-
-async def record_idle(machine: Any, ticks: int) -> bool:
-    """Persist the consecutive-idle count on the VM itself.
-
-    int() is the whole of the injection story: the count is the only thing
-    interpolated, and it can only ever be a number.
-    """
-    return await guest(
-        machine,
-        "sh",
-        "-c",
-        f"mkdir -p /var/lib/ix-runner && echo {int(ticks)} > {IDLE_PATH}",
-    )
 
 
 def machine_age(info: Any) -> float | None:
@@ -773,9 +856,27 @@ async def reconcile(ix: Any) -> int:
     min_warm = int(os.environ.get("MIN_WARM") or pool_size)
     max_online = int(os.environ.get("MAX_ONLINE") or pool_size)
     headroom = int(os.environ.get("SCALE_HEADROOM") or 2)
-    idle_grace = max(int(os.environ.get("IDLE_GRACE_TICKS") or 1), 1)
-    max_power_actions = int(os.environ.get("MAX_POWER_ACTIONS") or 8)
+    # Seconds, not ticks: idle time is derived from GitHub's own job
+    # timestamps, so it is a real duration and does not depend on how often
+    # this runs. A tick counter meant the grace silently changed length
+    # whenever the cron did.
+    idle_grace = float(os.environ.get("IDLE_GRACE_SECONDS") or 600)
+    # Only stops are capped. Being SHORT of capacity is the state with a
+    # queue behind it, so a start is never rationed; being long of it costs
+    # money, which can wait for the next tick.
+    max_stops = int(os.environ.get("MAX_STOPS") or 4)
     runner_label = os.environ.get("RUNNER_LABEL") or ""
+    # Which trigger this is. Only a scheduled tick may switch machines OFF:
+    # an event tick fires when a run is REQUESTED, before its jobs reach the
+    # queue, so it sees an idle pool at the exact moment a wave is landing.
+    tick_mode = (
+        os.environ.get("TICK_MODE")
+        or (
+            "scheduled"
+            if os.environ.get("GITHUB_EVENT_NAME") in (None, "", "schedule", "workflow_dispatch")
+            else "event"
+        )
+    ).lower()
     # The workflow's own token, which needs `actions: read` and nothing else.
     # Falling back to the PAT would work only if someone had granted it the
     # Actions permission, and the whole point is that it must not have one.
@@ -818,9 +919,10 @@ async def reconcile(ix: Any) -> int:
             refuse_autoscaling(
                 "RUNNER_LABEL is unset, so there is no demand signal. Set it"
                 " to the label your jobs target (one of"
-                " `services.ix-runner.labels`); without it every wave would"
-                f" read as zero jobs and the pool would park at {min_warm}"
-                " members while jobs queued behind it."
+                " `services.ix-runner.labels`). It is what a bootstrap pool"
+                " matches jobs against before any runner has registered a"
+                " label set of its own; without it a pool with nothing"
+                " registered can serve no job it can see."
             )
         elif not demand_token:
             refuse_autoscaling(
@@ -831,6 +933,13 @@ async def reconcile(ix: Any) -> int:
 
     rev = desired_rev()
     runners = list_runners(pat, repo)
+    # What this pool can actually serve, read off its own registrations so
+    # GitHub's matching rule is applied against real advertised labels. A
+    # pool with nothing registered yet (a bootstrap) has none to read, so
+    # fall back to the declared label plus the implicit self-hosted one.
+    label_sets = runner_label_sets(runners, pool, pool_size) or (
+        [{"self-hosted", runner_label}] if runner_label else []
+    )
     vms = {info.name: info for info in await ix.machines().list()}
     # Empty pool = first bootstrap: nothing exists to thrash, so the cap
     # protects nothing - raise it and build the whole pool in one run.
@@ -844,7 +953,7 @@ async def reconcile(ix: Any) -> int:
     # -- probe (concurrent) --
     members = list(range(1, pool_size + 1))
 
-    async def probe(member: int) -> tuple[int, str | None, bool, int]:
+    async def probe(member: int) -> tuple[int, str | None, bool]:
         info = vms.get(f"{pool}-runner-{member}")
         # A stopped or failed machine has no guest to answer, and the decide
         # loop reads silence as "unreachable -> replace". Probing one would
@@ -852,7 +961,7 @@ async def reconcile(ix: Any) -> int:
         # autoscaling had just parked; power state is read off the machine
         # row, never inferred from a guest that cannot speak.
         if info is None or machine_status(info) != "running":
-            return member, None, False, 0
+            return member, None, False
         async with gate:
             try:
                 # connect() and the marker decision are inside the try too:
@@ -861,7 +970,7 @@ async def reconcile(ix: Any) -> int:
                 machine = ix.machines().connect(info.id)
                 # The marker clear rides the probe, so a healthy member costs
                 # one round-trip; only a member with a live runner is sent it.
-                found, struck, idle = await probe_member(
+                found, struck = await probe_member(
                     machine, clear_marker=member_online(runners, pool, member)
                 )
             except Exception as error:
@@ -869,8 +978,8 @@ async def reconcile(ix: Any) -> int:
                     f"{pool}-runner-{member}: probe failed ({error!r})"
                     " -> reading it as unreachable"
                 )
-                return member, None, False, 0
-        return member, found, struck, idle
+                return member, None, False
+        return member, found, struck
 
     # return_exceptions: one member's failure decides that member, never the
     # whole run. An escaping exception cancelled every sibling probe and left
@@ -878,17 +987,17 @@ async def reconcile(ix: Any) -> int:
     probed = await asyncio.gather(
         *(probe(member) for member in members), return_exceptions=True
     )
-    state: dict[int, tuple[str | None, bool, int]] = {}
+    state: dict[int, tuple[str | None, bool]] = {}
     for member, outcome in zip(members, probed):
         if isinstance(outcome, BaseException):
             log_warning(
                 f"{pool}-runner-{member}: probe raised past the handler"
                 f" ({outcome!r}) -> reading it as unreachable"
             )
-            state[member] = (None, False, 0)
+            state[member] = (None, False)
             continue
-        _, found, struck, idle = outcome
-        state[member] = (found, struck, idle)
+        _, found, struck = outcome
+        state[member] = (found, struck)
 
     replaced = 0
     actions: list[tuple[str, int, str]] = []  # (kind, member, name)
@@ -957,7 +1066,7 @@ async def reconcile(ix: Any) -> int:
             summary.append((name, "skip", f"status {clean(status or 'none')}"))
             continue
         running.append(member)
-        actual, struck, idle_ticks = state[member]
+        actual, struck = state[member]
         if actual is None:
             # A machine started moments ago answers nothing yet, and its AGE
             # says nothing about that: age is measured from creation, so a
@@ -1046,103 +1155,135 @@ async def reconcile(ix: Any) -> int:
         admit("prune", member, name)
 
     # -- scale --
+    # Level-based, and stateless by construction: every number below is
+    # observed fresh this tick from GitHub and the machine rows. Nothing is
+    # remembered between runs, so two reconciles cannot disagree about what
+    # the pool looked like, and a missed tick costs latency rather than
+    # correctness.
+    #
     # A member already booked for a create/replace/repair is not a power
     # candidate: stopping something mid-replace, or starting something whose
     # units are being restarted, races the action for no benefit.
     booked = {member for _, member, _ in actions}
-    idle_marks: list[tuple[int, int]] = []  # (member, count to persist)
-    if not autoscaling:
-        # The clamp pins desired to max_online whatever demand says, so
-        # asking GitHub would be a wasted scan. This is the default path:
-        # every member that exists should be on, and a member someone
-        # stopped by hand is STARTED rather than deleted and rebuilt.
-        desired = max_online
-        print(f"autoscaling off -> desired_online {desired} (every member)")
-    elif (demand := demand_or_none(demand_token, repo, runner_label)) is None:
-        desired = max_online
-        print(f"demand unknown -> desired_online {desired} (the maximum)")
-    else:
-        slots = pool_slots(runners, pool, pool_size)
-        # Jobs round UP into members: one leftover job still needs a
-        # whole machine to run on.
-        needed = -(-demand // slots)
-        desired = min(max(needed + headroom, min_warm), max_online)
-        print(
-            f"demand {demand} job(s) / {slots} slot(s) = {needed} member(s)"
-            f" + headroom {headroom}, clamped to [{min_warm}, {max_online}]"
-            f" -> desired_online {desired}"
-        )
-    # Everything already powered on counts, not just the healthy ones. A
-    # warming member is seconds from taking a job; one being repaired, or
-    # deferred mid-config-roll, is up and serving right now. Counting only
-    # `online` would wake a parked machine for every member a roll had
-    # temporarily unsettled, on top of the ones still running. Members booked
+    # Everything already powered on counts as capacity, not just the healthy.
+    # A warming member is seconds from taking a job; one being repaired, or
+    # deferred mid-config-roll, is up and serving right now. Members booked
     # for a replace or a prune do NOT count: they are about to go away.
     doomed = {member for kind, member, _ in actions if kind in ("replace", "prune")}
     effective = len([member for member in running if member not in doomed])
-    print(
-        f"powered on {effective} (online {len(online)}, warming"
-        f" {len(warming)}), stopped {len(stopped)}"
-    )
 
-    if effective < desired:
-        # Start before create, always: a stopped member is a boot, a
-        # missing one is a template build. Lowest index first, the mirror
-        # of the stop order, so the warm core is a stable set.
-        wanted = min(desired - effective, max_power_actions)
-        for member in sorted(m for m in stopped if m not in booked)[:wanted]:
-            name = f"{pool}-runner-{member}"
-            print(f"{name}: below desired_online -> start")
-            actions.append(("start", member, name))
-    elif effective > desired:
-        surplus = effective - desired
-        # Never a busy one, and never a warming one (it has not had the
-        # chance to take a job yet, and stopping it wastes the boot).
-        # Highest index first: the low members stay warm, so their
-        # template cache and toolchain caches stay hot.
-        candidates = [
-            member
-            for member in sorted(online, reverse=True)
-            if member not in booked and not member_busy(runners, pool, member)
-        ]
-        stops = 0
-        for member in candidates:
-            if stops >= surplus or stops >= max_power_actions:
-                break
-            name = f"{pool}-runner-{member}"
-            seen_idle = state[member][2] + 1
-            if seen_idle < idle_grace:
-                # Grace is counted on the VM, not here: this script holds
-                # no state between runs. A member that takes a job before
-                # the count is reached has it cleared below.
-                print(
-                    f"{name}: idle {seen_idle}/{idle_grace} scan(s) -> not yet"
-                )
-                idle_marks.append((member, seen_idle))
-                continue
-            print(f"{name}: surplus and idle -> stop")
-            actions.append(("stop", member, name))
-            stops += 1
-        if stops < surplus:
-            print(
-                f"{len(candidates)} idle candidate(s) for {surplus} surplus"
-                f" member(s): stopped {stops} this run, rest next run"
+    seen: Observation | None = None
+    if not autoscaling:
+        # The clamp pins desired to max_online whatever demand says, so there
+        # is nothing to ask GitHub. This is the default path: every member
+        # that exists should be on, and one stopped by hand is STARTED rather
+        # than deleted and rebuilt.
+        desired = max_online
+        why = "autoscaling off"
+    else:
+        seen = observe_or_none(demand_token, repo, label_sets, IDLE_SCAN_RUNS)
+        if seen is None:
+            # A tick that learned nothing makes NO scaling decision. Missing
+            # data is not zero demand, and it is not zero idleness either:
+            # guessing up strands nothing but costs money forever, guessing
+            # down stops machines about to be handed a job. Healing above
+            # still ran; only scaling is skipped.
+            desired = effective
+            why = "queue unreadable"
+        else:
+            slots = pool_slots(runners, pool, pool_size)
+            # Jobs round UP into members: one leftover job still needs a
+            # whole machine to run on.
+            needed = -(-seen.demand // slots)
+            desired = min(max(needed + headroom, min_warm), max_online)
+            why = (
+                f"{seen.demand} servable job(s)/{slots} slot(s) = {needed}"
+                f" +{headroom} headroom, clamped [{min_warm},{max_online}]"
             )
-    # Anything online that is NOT being stopped has its idle count reset,
-    # so grace means CONSECUTIVE idle scans. Only members carrying a
-    # non-zero count are written to; a healthy busy pool costs no extra
-    # round-trips at all.
-    stopping = {member for kind, member, _ in actions if kind == "stop"}
-    counted = {member for member, _ in idle_marks}
-    idle_marks += [
-        (member, 0)
-        for member in online
-        if member not in stopping and member not in counted and state[member][2]
-    ]
+
+    starts: list[int] = []
+    stops: list[int] = []
+    if effective < desired:
+        # Start before create, always: a stopped member is a boot, a missing
+        # one is a template build. Lowest index first, the mirror of the stop
+        # order, so the warm core is a stable set of the same machines.
+        # Deliberately NOT rate-capped: being short of capacity is the state
+        # with a queue behind it, and every tick of delay is queued jobs.
+        starts = sorted(member for member in stopped if member not in booked)[
+            : desired - effective
+        ]
+    elif effective > desired and seen is not None:
+        if tick_mode != "scheduled":
+            # An event tick fires when a run is REQUESTED, which is the
+            # moment before its jobs appear in the queue: the pool looks idle
+            # precisely because the wave has not landed yet. Scaling down
+            # here would switch machines off at the start of a wave. Event
+            # ticks may only ever add capacity.
+            print(f"{effective - desired} surplus member(s), but an event tick"
+                  " never scales down")
+        else:
+            surplus = effective - desired
+            now = time.time()
+            # Never a busy one, and never a warming one (it has not had the
+            # chance to take a job yet, and stopping it wastes the boot).
+            # Highest index first: the low members stay warm, so their
+            # template and toolchain caches stay hot.
+            for member in sorted(online, reverse=True):
+                if len(stops) >= min(surplus, max_stops):
+                    break
+                if member in booked or member_busy(runners, pool, member):
+                    continue
+                name = f"{pool}-runner-{member}"
+                # Idle time is DERIVED: the last completion GitHub recorded
+                # for any of this member's runners. No stored counter, no
+                # consecutive-tick bookkeeping, nothing to get out of step.
+                names = [
+                    runner["name"] for runner in member_runners(runners, pool, member)
+                ]
+                idle_for = seen.idle_for(names, now)
+                if idle_for is None:
+                    # The scan saw no completions at all, so "never finished a
+                    # job recently" is indistinguishable from "the window is
+                    # empty". Not evidence of idleness.
+                    print(f"{name}: no idle history in the scan -> not stopped")
+                    continue
+                if idle_for < idle_grace:
+                    # Covers both shapes at once, which is why there is no
+                    # separate window check: for a member the scan DID see
+                    # finish, this is its real idle time; for one it did not,
+                    # idle_for is the window's own length, so a window
+                    # shorter than the grace fails here exactly as it should.
+                    # Absence from a short window is not evidence of idleness.
+                    print(
+                        f"{name}: idle {int(idle_for)}s of {int(idle_grace)}s"
+                        " grace -> not yet"
+                    )
+                    continue
+                stops.append(member)
+
+    for member in starts:
+        actions.append(("start", member, f"{pool}-runner-{member}"))
+    for member in stops:
+        actions.append(("stop", member, f"{pool}-runner-{member}"))
+
+    # One line per tick, so a reader can reconstruct the decision without
+    # replaying the log: what was observed, what it implied, what was done.
+    print(
+        f"DECISION [{tick_mode}] powered_on={effective}"
+        f" (online={len(online)} warming={len(warming)} stopped={len(stopped)})"
+        f" demand={seen.demand if seen else 'n/a'}"
+        f"{' (truncated)' if seen and seen.truncated else ''}"
+        f" -> desired={desired} [{why}]"
+        f" | start {sorted(starts)} stop {sorted(stops)}"
+    )
 
     # -- execute --
     minted = False
-    if any(kind in ("create", "replace") for kind, _, _ in actions):
+    # A START needs one too, now that scale-down deregisters: the woken
+    # machine has no registration left, so it must re-register at boot, and
+    # it can only do that with a token it has never seen before (the runner
+    # re-registers precisely BECAUSE the token file changed).
+    if any(kind in ("create", "replace", "start") for kind, _, _ in actions):
         token = github_api(
             pat, repo, "/actions/runners/registration-token", method="POST"
         )["token"]
@@ -1152,6 +1293,15 @@ async def reconcile(ix: Any) -> int:
         # can still be sitting in this process while the SDK call below writes
         # the token into a traceback on stderr.
         print(f"::add-mask::{token}", flush=True)
+        # OVERWRITE the account secret; never delete-then-recreate it. The
+        # platform propagates a rotation to every machine already holding a
+        # copy - stopped ones included, where it lands in the machine's
+        # secret row and is delivered at next boot - but ONLY when the write
+        # updates an existing row. A write that INSERTS is a first write,
+        # fires no rotation, and every pool member would go on booting with
+        # the spent token from whenever it was created. Deleting the spent
+        # secret at the end of a run, which is what this used to do, turns
+        # every subsequent write into exactly that insert.
         await ix.secrets().set(secret_name, token)
         minted = True
 
@@ -1173,42 +1323,53 @@ async def reconcile(ix: Any) -> int:
                         summary.append((name, kind, "units restarted"))
                         return
                     if kind == "start":
+                        # The token was rotated into vm_secrets before this
+                        # gather began; boot re-reads that table, so the guest
+                        # comes up with the FRESH token and its runner
+                        # re-registers from scratch. That is the whole reason
+                        # a wake costs a token mint: scale-down deregistered
+                        # it, so there is nothing left to reconnect with.
                         await ix.machines().connect(vms[name].id).start()
                         summary.append((name, kind, "started"))
                         return
                     if kind == "stop":
-                        # Re-read THIS member's registrations, moments before
-                        # pulling the power: the scan snapshot is by now tens
-                        # of seconds old, and a job assigned in that window
-                        # would die with the machine. GitHub offers no lock
-                        # here - deregistering to get the 422 would throw away
-                        # the credentials that make a stop cheap - so the
-                        # window is narrowed, not closed, exactly as the
-                        # replace path narrows its own.
-                        try:
-                            fresh = await asyncio.to_thread(list_runners, pat, repo)
-                        except SystemExit:
-                            # list_runners exits the process on an expired PAT
-                            # or a short listing. SystemExit is a
-                            # BaseException, so return_exceptions on the
-                            # gather below does NOT hold it - it would tear
-                            # down every sibling create mid-flight. A stop is
-                            # the most abandonable action there is.
-                            log_warning(f"{name}: could not re-read runners -> not stopped")
-                            summary.append((name, kind, "skipped (no listing)"))
-                            return
-                        if member_busy(fresh, pool, member):
+                        # DEREGISTER FIRST, then cut the power. GitHub refuses
+                        # (422) to delete a runner that is mid-job, and that
+                        # refusal is the only real lock in this system: it is
+                        # atomic with respect to job assignment in a way no
+                        # amount of re-reading a listing can be. Checking
+                        # `busy` and then stopping leaves a window in which a
+                        # job is assigned and then killed; deregistering
+                        # closes it, because after the DELETE the runner
+                        # cannot be assigned anything at all.
+                        #
+                        # The cost is that the stop is no longer free to undo:
+                        # the registration is gone, so waking this member
+                        # needs a fresh token. That is what the rotation
+                        # before this gather pays for.
+                        async with deregistering:
+                            try:
+                                freed = await asyncio.to_thread(
+                                    deregister_member, pat, repo, runners, pool, member
+                                )
+                            except SystemExit:
+                                # deregister_member reaches github_api, which
+                                # exits the process on an expired PAT.
+                                # SystemExit is a BaseException, so
+                                # return_exceptions on the gather does NOT
+                                # hold it - it would tear down every sibling
+                                # mid-flight. A stop is the most abandonable
+                                # action there is.
+                                log_warning(
+                                    f"{name}: deregister could not run -> left running"
+                                )
+                                summary.append((name, kind, "skipped (no listing)"))
+                                return
+                        if not freed:
                             print(f"{name}: took a job before the stop -> left running")
                             summary.append((name, kind, "skipped (busy)"))
                             return
-                        machine = ix.machines().connect(vms[name].id)
-                        # Zero the grace counter BEFORE the power goes, or the
-                        # stale count rides the disk into the next start and
-                        # spends the member's whole grace the moment it is
-                        # surplus again - which is start/stop flapping around
-                        # the demand threshold, at a boot per flap.
-                        await record_idle(machine, 0)
-                        await machine.stop()
+                        await ix.machines().connect(vms[name].id).stop()
                         summary.append((name, kind, "stopped"))
                         return
                     if kind in ("replace", "prune"):
@@ -1237,41 +1398,39 @@ async def reconcile(ix: Any) -> int:
                     )
                     summary.append((name, kind, f"FAILED: {error}"))
 
-        outcomes = await asyncio.gather(
-            *(run_action(*action) for action in actions), return_exceptions=True
-        )
-        # run_action swallows Exception itself, so anything surviving is a
-        # BaseException; return_exceptions keeps it from cancelling siblings,
-        # and it is still a failure.
-        for (kind, _, name), outcome in zip(actions, outcomes):
-            if isinstance(outcome, BaseException):
-                failures += 1
-                log_error(f"{name}: {kind} raised past the handler ({outcome!r})")
-                summary.append((name, kind, f"FAILED: {outcome!r}"))
+        # STARTS (and every healing action) run to completion BEFORE any
+        # stop begins, so a tick that dies halfway leaves the pool larger
+        # than intended, never smaller: too much capacity is a bill, too
+        # little is a stuck queue.
+        #
+        # As the scaler stands this is a guard rather than a live path - the
+        # plan is a single if/elif on effective vs desired, so one tick emits
+        # starts or stops and never both (pinned by a test). The split is
+        # here so that stops cannot overtake starts if that ever changes.
+        phases = [
+            [action for action in actions if action[0] != "stop"],
+            [action for action in actions if action[0] == "stop"],
+        ]
+        for phase in phases:
+            if not phase:
+                continue
+            outcomes = await asyncio.gather(
+                *(run_action(*action) for action in phase), return_exceptions=True
+            )
+            # run_action swallows Exception itself, so anything surviving is
+            # a BaseException; return_exceptions keeps it from cancelling
+            # siblings, and it is still a failure.
+            for (kind, _, name), outcome in zip(phase, outcomes):
+                if isinstance(outcome, BaseException):
+                    failures += 1
+                    log_error(f"{name}: {kind} raised past the handler ({outcome!r})")
+                    summary.append((name, kind, f"FAILED: {outcome!r}"))
 
-    if idle_marks:
-        # Best effort, and deliberately silent on failure: an unwritten count
-        # only delays a scale-down by a scan, and a member that cannot be
-        # written to is already on its way to repair or replace.
-        async def mark(member: int, ticks: int) -> None:
-            async with gate:
-                await record_idle(
-                    ix.machines().connect(vms[f"{pool}-runner-{member}"].id), ticks
-                )
-
-        await asyncio.gather(
-            *(mark(member, ticks) for member, ticks in idle_marks),
-            return_exceptions=True,
-        )
-
-    if minted:
-        # Spent registration tokens are dead within the hour and would
-        # otherwise pile up in the secret store forever. Best effort only:
-        # every VM that needed this one already has it as a boot-time file.
-        try:
-            await ix.secrets().delete(secret_name)
-        except Exception as error:
-            log_warning(f"could not delete the spent secret {secret_name} ({error!r})")
+    # The spent token is deliberately LEFT in the secret store. It is dead
+    # within the hour and can do nothing but register a runner on this one
+    # repo, and keeping the row is what makes the next write a rotation
+    # rather than an insert - which is the only way a stopped machine ever
+    # receives a usable token again.
 
     # Counted off the summary, not off the plan: a stop that found its member
     # busy, or failed outright, did not change any power state.

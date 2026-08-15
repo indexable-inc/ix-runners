@@ -133,7 +133,8 @@ the ix SDK; templates compile server-side on first boot and cache by rev.
   boot grace. The grace exists because a young machine's *silence* proves
   nothing; a machine saying it is dead is not silent.
 - Stopped: left alone, and never probed. Its power state is read off the
-  machine row, so a parked member is never mistaken for a dead one.
+  machine row, so a parked member is never mistaken for a dead one. Waking
+  one re-registers it; see Autoscaling for why it cannot simply reconnect.
 - Above `pool-size`: deregistered and deleted. Shrinking the pool would
   otherwise leave orphans billing and taking jobs.
 - Empty pool: the per-run replacement cap self-raises to `pool-size`, so a
@@ -149,28 +150,84 @@ what happened to each member.
 
 ## Autoscaling
 
-The member set never moves. `pool-size` machines exist, they are named and
-built from your config, and the only thing autoscaling changes is which of
-them are switched on. There is no scheduler here, nothing elastic, and
-nothing that looks like Kubernetes: a stopped machine keeps its disk, so it
-keeps its runner registration credentials and re-registers by itself on
-boot, and while it is off it bills storage and nothing else.
+The member set never moves. `pool-size` machines exist, named and built from
+your config, and the only thing autoscaling changes is which of them are
+switched on. There is no scheduler here and nothing that resembles
+Kubernetes: a stopped machine keeps its disk, and while it is off it bills
+storage and nothing else.
 
-Demand is GitHub's own queue - the jobs, queued or running, whose `runs-on`
-includes `runner-label`. Each reconcile computes:
+It is **level-based and stateless**. Every tick observes the world fresh -
+the machine rows, the runner registrations, GitHub's job queue - computes a
+level, and moves toward it. Nothing is remembered between runs: no idle
+counters, no pending-action list, no event log to replay. A missed tick
+costs latency, never correctness, and two reconciles racing cannot disagree
+about what the pool looked like.
 
 ```
-desired_online = clamp(ceil(jobs / slots) + scale-headroom,
+desired_online = clamp(ceil(servable_jobs / slots) + scale-headroom,
                        min-warm, max-online)
 ```
 
-Below that number, stopped members are started - always before creating
-anything, because a start is a boot and a create is a template build. Above
-it, idle members are stopped, highest index first, so the warm core is
-always the same low-numbered machines and their caches stay hot. Nothing
-busy is ever stopped: the decide pass skips it, and the execute pass re-reads
-that member's registrations moments before pulling the power. That window is
-narrowed, not closed, which is the same trade the replace path makes.
+**Servable is strict.** A job counts only when some runner in this pool
+advertises *every* label in its `runs-on` - GitHub ANDs them, and it checks
+them against one runner, so two machines cannot combine to cover a job. This
+is not a detail. Repos routinely have jobs queued indefinitely against
+labels nothing in the pool carries (`blacksmith-*`, `macos-*`, hosted-only
+labels): work that will never be served from here. Counting it is not
+conservative, it is a permanent maximum, and the pool would sit at
+`max-online` forever running nothing. Labels are read off the runners' own
+registrations, so what the pool advertises and what it is matched on cannot
+drift apart.
+
+**The GitHub queue is the buffer.** A job that finds no free runner waits,
+which is what a queue is for. Below the level, stopped members start -
+always before anything is created, since a start is a boot and a create is a
+template build, and never rate-limited, because being short of capacity is
+the state with a queue behind it. Above the level, idle members stop,
+highest index first, so the warm core is a stable set of low-numbered
+machines whose caches stay hot.
+
+Two rules stop a wave being throttled by its own arrival:
+
+- **Only a scheduled tick may scale down.** An event tick fires when a run is
+  *requested*, before its jobs reach the queue, so it sees an idle pool at
+  the exact moment a wave is landing. Event ticks may only add capacity.
+- **A tick that cannot read GitHub makes no scaling decision at all.**
+  Missing data is not zero demand, and it is not zero idleness either -
+  guessing up costs money forever, guessing down stops machines about to be
+  handed a job. Healing still runs; only scaling is skipped.
+
+**Idle time is derived, not counted.** A member's idle clock is the last job
+completion GitHub recorded against its runners. No stored counter, nothing
+to reset, nothing that can fall out of step with reality. A member the scan
+never saw finish anything is idle only as far back as the scan's own window
+reaches, which is why a very busy repo - where that window is shorter than
+the grace - simply does not scale down that tick.
+
+**Scale-down deregisters before it cuts power.** GitHub refuses (422) to
+delete a runner that is mid-job, and that refusal is the only real lock in
+this system: once the registration is gone the runner cannot be assigned
+anything, which is a guarantee no amount of re-reading a listing can give.
+Checking `busy` and then stopping always leaves a window where a job is
+assigned and then killed. This closes it.
+
+The price is that a stop is no longer free to undo. The registration is
+gone, so waking a member means minting a fresh registration token,
+overwriting the pool's secret, and letting the platform deliver it - the
+machine re-registers at boot precisely because the token changed. Two
+consequences worth knowing:
+
+- The secret row is **never deleted**. A rotation only propagates to
+  machines already holding a copy when the write *updates* an existing row;
+  a write that inserts is a first write and reaches nobody. Deleting the
+  spent token would make every subsequent write an insert, and no stopped
+  member would ever receive a usable token again.
+- A rotation reaches every member, running ones included, where it lands as
+  a new token file. Those members re-register on their next unit restart,
+  which is fine while the token is fresh and fails once it has expired. The
+  reconcile mints in the same tick as any repair, so a restart it drives is
+  always holding a new token; an unplanned reboot long after the last
+  rotation can need one repair cycle to come back.
 
 `min-warm` defaults to `pool-size`, so **autoscaling is off until you dial
 it down**, and an unconfigured pool behaves exactly as it did before and
@@ -182,28 +239,31 @@ with:
   min-warm: 3           # always-on floor: a small wave starts instantly
   scale-headroom: 2     # keep 2 spare above current demand
   max-online: 32
-  runner-label: ix      # the demand signal; must be one of your labels
+  runner-label: ix      # fallback match for a pool with nothing registered
 ```
 
-Two things carry the latency. `min-warm` means the front of a wave never
-waits for a boot at all, and the GitHub queue absorbs the rest: a job that
-finds no free runner waits, which is what a queue is for. A `workflow_run`
-trigger on the reconcile turns a wave into a wake-up, so the pool is already
-starting while the first jobs run - worst case is one boot, once per wave,
-not once per job.
+Reading the queue needs `permissions: actions: read` and the workflow's own
+`GITHUB_TOKEN`. The admin PAT is deliberately not used for it: minting
+registration tokens and deleting runners is one job, reading a job list is
+another.
 
-Reading the queue needs `permissions: actions: read` on the reconcile job
-and the workflow's own `GITHUB_TOKEN`. The admin PAT is deliberately not
-used for it: minting registration tokens and deleting runners is one job,
-and reading a job list is another. If the read fails, the run says so and
-keeps every member on - no view of the queue is never a reason to park the
-pool.
+Every tick prints one `DECISION` line - observed counts, the level they
+imply, and the actions taken - so a reader can reconstruct what happened
+without replaying the log.
 
-Knobs, all optional: `min-warm`, `max-online`, `scale-headroom`,
-`runner-label`, `idle-grace-ticks` (consecutive idle scans before a stop,
-counted on the VM so it survives across runs), `max-power-actions` (per-run
-cap on starts and stops, so a wrong decision converges slowly rather than
-moving the fleet at once).
+Remaining knobs, all optional: `idle-grace-seconds` (default 600),
+`max-stops` (per-tick cap, default 4; starts are uncapped), `tick-mode`
+(defaults from the triggering event).
+
+### Where this is going
+
+This is v1, and it is deliberately the simple thing: long-lived machines
+whose power state follows a level. The end state is ephemeral runners - a
+machine per job, booted from a warm snapshot on a webhook and destroyed
+when the job ends - which removes the idle question entirely rather than
+managing it. That needs an ix-hosted control plane (see the roadmap); until
+it exists, a fixed pool with a power dial is the version that is honest
+about what it can guarantee.
 
 ## Security model
 

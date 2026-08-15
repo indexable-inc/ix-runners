@@ -73,23 +73,32 @@ inputs:
   runner-label:
     description: >
       The label your jobs target, e.g. the first of
-      `services.ix-runner.labels`. This is the demand signal: jobs queued or
-      running against it are what the pool is sized to. REQUIRED once
-      min-warm is below max-online - without it every wave would read as
-      zero jobs.
+      `services.ix-runner.labels`. Demand is matched against what each
+      runner ACTUALLY advertises, read off its registration, so this is only
+      the fallback for a pool that has not registered anything yet - but it
+      is required once min-warm is below max-online, because a bootstrap
+      pool would otherwise match no job at all.
     default: ""
-  idle-grace-ticks:
+  idle-grace-seconds:
     description: >
-      Consecutive reconciles a member must be seen idle before it is
-      switched off (default 1, meaning the first idle scan is enough). The
-      count lives on the VM, so it survives across runs; raise it if your
-      jobs arrive in closely-spaced bursts.
+      How long a member must have been idle before it is switched off
+      (default 600). Derived from GitHub's own job timestamps - the last
+      completion recorded against that runner - so it is a real duration
+      and does not change length when the cron does.
     default: ""
-  max-power-actions:
+  max-stops:
     description: >
-      Per-run cap on starts+stops (default 8). The same idea as
-      max-replacements: a wrong scaling decision converges slowly instead
-      of moving the whole fleet at once.
+      Per-tick cap on stops (default 4). Starts are deliberately NOT capped:
+      being short of capacity is the state with a queue behind it, while
+      being long of it merely costs money and can wait for the next tick.
+    default: ""
+  tick-mode:
+    description: >
+      `scheduled` or `event`. Only a scheduled tick may switch machines OFF.
+      Defaults from the triggering event, which is almost always what you
+      want: a workflow_run tick fires when a run is REQUESTED, before its
+      jobs reach the queue, so it sees an idle pool at the exact moment a
+      wave is landing.
     default: ""
   github-token:
     description: >
@@ -131,8 +140,9 @@ runs:
         MAX_ONLINE: ${{ inputs.max-online }}
         SCALE_HEADROOM: ${{ inputs.scale-headroom }}
         RUNNER_LABEL: ${{ inputs.runner-label }}
-        IDLE_GRACE_TICKS: ${{ inputs.idle-grace-ticks }}
-        MAX_POWER_ACTIONS: ${{ inputs.max-power-actions }}
+        IDLE_GRACE_SECONDS: ${{ inputs.idle-grace-seconds }}
+        MAX_STOPS: ${{ inputs.max-stops }}
+        TICK_MODE: ${{ inputs.tick-mode }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       # --locked: install exactly the hash-pinned ix-sdk in ix-runners.lock,
       # never whatever the index resolves to today.
