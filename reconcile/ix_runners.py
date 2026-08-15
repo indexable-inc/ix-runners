@@ -314,11 +314,15 @@ def active_run_ids(token: str, repo: str) -> tuple[list[int], bool]:
     behind a setup job that is already running. Counting only `queued` runs
     misses exactly the demand the pool exists to absorb.
     """
-    ids: list[int] = []
+    # A dict, not a list: a run that flips queued -> in_progress between the
+    # two passes appears in both, and counted twice it inflates demand.
+    ids: dict[int, None] = {}
     for status in ("queued", "in_progress"):
         seen = 0
         page = 1
-        while len(ids) < MAX_DEMAND_RUNS:
+        # One PAST the cap, so "exactly MAX_DEMAND_RUNS runs" is a complete
+        # answer rather than a truncated-looking one.
+        while len(ids) <= MAX_DEMAND_RUNS:
             body = github_api(
                 token,
                 repo,
@@ -328,12 +332,12 @@ def active_run_ids(token: str, repo: str) -> tuple[list[int], bool]:
             batch = body.get("workflow_runs") or []
             if not batch:
                 break
-            ids.extend(int(run["id"]) for run in batch)
+            ids.update((int(run["id"]), None) for run in batch)
             seen += len(batch)
             if seen >= int(body.get("total_count") or 0):
                 break
             page += 1
-    return ids[:MAX_DEMAND_RUNS], len(ids) >= MAX_DEMAND_RUNS
+    return list(ids)[:MAX_DEMAND_RUNS], len(ids) > MAX_DEMAND_RUNS
 
 
 def pool_demand(token: str, repo: str, label: str) -> int | None:
@@ -391,15 +395,24 @@ def demand_or_none(token: str, repo: str, label: str) -> int | None:
     """
     try:
         return pool_demand(token, repo, label)
-    except urllib.error.HTTPError as error:
-        if error.code in (401, 403, 404):
-            log_warning(
-                f"reading the job queue failed (HTTP {error.code}): the"
-                " workflow's token needs `actions: read`. Scaling to the"
-                " maximum until it does."
-            )
-            return None
-        raise
+    # Broad on purpose, and the breadth IS the feature. HTTPError subclasses
+    # OSError, which also covers a reset connection, a DNS failure and a TLS
+    # error; RuntimeError is the redirect refusal. This runs BEFORE the
+    # execute phase, so anything escaping here discards every create, replace
+    # and repair the run had already decided on - a 502 from one read would
+    # stop the pool being healed at all.
+    except (OSError, RuntimeError) as error:
+        code = getattr(error, "code", None)
+        hint = (
+            " The workflow's token needs `actions: read`."
+            if code in (401, 403, 404)
+            else ""
+        )
+        log_warning(
+            f"reading the job queue failed ({code or type(error).__name__})."
+            f"{hint} Scaling to the maximum for this run."
+        )
+        return None
 
 
 def pool_slots(runners: list[dict[str, Any]], pool: str, pool_size: int) -> int:
@@ -409,6 +422,14 @@ def pool_slots(runners: list[dict[str, Any]], pool: str, pool_size: int) -> int:
     member IS the configured value - which is why this is a max: a member
     caught mid-deregister reports fewer daemons, never more, and reading the
     pool as narrower than it is would over-provision on every wave.
+
+    Offline registrations count too, deliberately: in the steady state most
+    of the pool is parked, and a parked member's registrations are all
+    offline. The cost is that REDUCING `slots` reads high until every member
+    has rolled, because the removed slots stay registered (the module says as
+    much), so a wave in that window is under-provisioned by the old ratio.
+    That is a slower wave during one config roll, against reading every
+    parked pool as one slot wide, which would over-provision permanently.
     """
     widest = max(
         (
@@ -649,8 +670,14 @@ async def probe_member(
             digits = token[len(IDLE_PREFIX) :]
             # The guest chose this string. Anything but a small count reads
             # as no idle history - never an exception, which the caller would
-            # turn into "unreachable" and then into a delete.
-            idle = int(digits) if digits.isdigit() and len(digits) <= 3 else 0
+            # turn into "unreachable" and then into a delete. isascii is not
+            # decoration: str.isdigit() is true for "²" and other Unicode
+            # digits that int() then refuses.
+            idle = (
+                int(digits)
+                if digits.isascii() and digits.isdigit() and len(digits) <= 3
+                else 0
+            )
             continue
         if rev is None:
             rev = token
@@ -771,10 +798,14 @@ async def reconcile(ix: Any) -> int:
         but healing still happens, because a pool that stops being repaired
         is a worse outcome than a pool that is briefly too expensive.
         """
-        nonlocal autoscaling, failures
+        nonlocal autoscaling, failures, min_warm, max_online
         log_error(f"autoscaling is off for this run: {why}")
         autoscaling = False
         failures += 1
+        # Off means the WHOLE pool stays on, which is what the log line below
+        # goes on to claim. Leaving a hand-set MAX_ONLINE in place would keep
+        # stopping machines while announcing that it does not.
+        min_warm = max_online = pool_size
 
     if not 0 <= min_warm <= max_online <= pool_size:
         refuse_autoscaling(
@@ -782,9 +813,6 @@ async def reconcile(ix: Any) -> int:
             f" POOL_SIZE={pool_size} must satisfy"
             " 0 <= MIN_WARM <= MAX_ONLINE <= POOL_SIZE"
         )
-        # Whatever the operator meant, the safe reading of a broken range is
-        # the whole pool on.
-        min_warm = max_online = pool_size
     if autoscaling:
         if not runner_label:
             refuse_autoscaling(
@@ -867,6 +895,7 @@ async def reconcile(ix: Any) -> int:
     summary: list[tuple[str, str, str]] = []  # (member, action, outcome)
     # Power-state classification, filled by the decide loop below and read by
     # the scaling plan after it. A member appears in at most one of these.
+    running: list[int] = []  # powered on, whatever its health
     online: list[int] = []  # running, with a runner registered online
     warming: list[int] = []  # running and young, runner not registered yet
     stopped: list[int] = []  # parked; startable in seconds
@@ -920,8 +949,28 @@ async def reconcile(ix: Any) -> int:
             print(f"{name}: stopped")
             stopped.append(member)
             continue
+        if status != "running":
+            # Not a status this version understands. Every branch below reads
+            # a silent guest as "delete and rebuild", and a status we cannot
+            # interpret is no evidence at all that the machine is dead.
+            log_warning(f"{name}: unknown status {clean(status or 'none')} -> skip")
+            summary.append((name, "skip", f"status {clean(status or 'none')}"))
+            continue
+        running.append(member)
         actual, struck, idle_ticks = state[member]
         if actual is None:
+            # A machine started moments ago answers nothing yet, and its AGE
+            # says nothing about that: age is measured from creation, so a
+            # member created last week and started twenty seconds ago sails
+            # past BOOT_GRACE and gets deleted - taking with it the disk, and
+            # the registration credentials that make a stop cheap in the
+            # first place. Autoscaling creates this case on every scale-up,
+            # and a wake-triggered reconcile lands right in it.
+            if started_recently(info):
+                print(f"{name}: started {int(WARM_GRACE)}s-fresh, guest not up yet -> warming")
+                warming.append(member)
+                summary.append((name, "skip", "warming"))
+                continue
             age = machine_age(info)
             if age is not None and age < BOOT_GRACE:
                 print(f"{name}: {int(age)}s old, still building/booting -> skip")
@@ -1023,11 +1072,18 @@ async def reconcile(ix: Any) -> int:
             f" + headroom {headroom}, clamped to [{min_warm}, {max_online}]"
             f" -> desired_online {desired}"
         )
-    # A warming member is already on its way to online; counting it is
-    # what keeps the next tick from starting a second machine for a job
-    # the first one is seconds from taking.
-    effective = len(online) + len(warming)
-    print(f"online {len(online)}, warming {len(warming)}, stopped {len(stopped)}")
+    # Everything already powered on counts, not just the healthy ones. A
+    # warming member is seconds from taking a job; one being repaired, or
+    # deferred mid-config-roll, is up and serving right now. Counting only
+    # `online` would wake a parked machine for every member a roll had
+    # temporarily unsettled, on top of the ones still running. Members booked
+    # for a replace or a prune do NOT count: they are about to go away.
+    doomed = {member for kind, member, _ in actions if kind in ("replace", "prune")}
+    effective = len([member for member in running if member not in doomed])
+    print(
+        f"powered on {effective} (online {len(online)}, warming"
+        f" {len(warming)}), stopped {len(stopped)}"
+    )
 
     if effective < desired:
         # Start before create, always: a stopped member is a boot, a
@@ -1129,12 +1185,30 @@ async def reconcile(ix: Any) -> int:
                         # the credentials that make a stop cheap - so the
                         # window is narrowed, not closed, exactly as the
                         # replace path narrows its own.
-                        fresh = await asyncio.to_thread(list_runners, pat, repo)
+                        try:
+                            fresh = await asyncio.to_thread(list_runners, pat, repo)
+                        except SystemExit:
+                            # list_runners exits the process on an expired PAT
+                            # or a short listing. SystemExit is a
+                            # BaseException, so return_exceptions on the
+                            # gather below does NOT hold it - it would tear
+                            # down every sibling create mid-flight. A stop is
+                            # the most abandonable action there is.
+                            log_warning(f"{name}: could not re-read runners -> not stopped")
+                            summary.append((name, kind, "skipped (no listing)"))
+                            return
                         if member_busy(fresh, pool, member):
                             print(f"{name}: took a job before the stop -> left running")
                             summary.append((name, kind, "skipped (busy)"))
                             return
-                        await ix.machines().connect(vms[name].id).stop()
+                        machine = ix.machines().connect(vms[name].id)
+                        # Zero the grace counter BEFORE the power goes, or the
+                        # stale count rides the disk into the next start and
+                        # spends the member's whole grace the moment it is
+                        # surplus again - which is start/stop flapping around
+                        # the demand threshold, at a boot per flap.
+                        await record_idle(machine, 0)
+                        await machine.stop()
                         summary.append((name, kind, "stopped"))
                         return
                     if kind in ("replace", "prune"):
@@ -1199,7 +1273,13 @@ async def reconcile(ix: Any) -> int:
         except Exception as error:
             log_warning(f"could not delete the spent secret {secret_name} ({error!r})")
 
-    powered = sum(1 for kind, _, _ in actions if kind in ("start", "stop"))
+    # Counted off the summary, not off the plan: a stop that found its member
+    # busy, or failed outright, did not change any power state.
+    powered = sum(
+        1
+        for _, kind, outcome in summary
+        if kind in ("start", "stop") and outcome in ("started", "stopped")
+    )
     print(
         f"reconcile done: {replaced} creation(s)/replacement(s),"
         f" {powered} power change(s), {failures} failed"

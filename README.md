@@ -66,6 +66,11 @@ on:
 
 permissions:
   contents: read
+  # Only needed once you turn autoscaling on: it is how the demand signal
+  # reads the job queue. Without it the queue read is refused, the run warns,
+  # and the pool stays fully on - so a pool that never scales down is the
+  # first thing to check here.
+  actions: read
 
 # One reconcile at a time, and never cancel one mid-create: a cancelled run
 # can leave a VM created but not yet registered.
