@@ -9,22 +9,36 @@ import subprocess
 import time
 import unittest
 import urllib.error
-from pathlib import Path
 from unittest import mock
 
 from reconcile.ix_runners import (
     deregister_member,
     desired_rev,
+    extra_members,
     list_runners,
     member_online,
     member_runners,
     reconcile,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
-
 REV = "a" * 40
 OLD_REV = "b" * 40
+MARKER = "/var/lib/ix-runner/repaired"
+DAY_MS = 24 * 60 * 60 * 1000
+
+ENV = {
+    "IX_TOKEN": "ix_test_token",
+    "RUNNER_PAT": "github_pat_test",
+    "GITHUB_REPOSITORY": "example/baml",
+    "POOL_SIZE": "2",
+    "MAX_REPLACEMENTS": "2",
+    "IX_REGION": "us-east-1",
+    "GITHUB_RUN_NUMBER": "0",
+}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def http_error(code: int, message: str) -> urllib.error.HTTPError:
@@ -48,28 +62,26 @@ class FakeNotFound(FakeIxError):
 class FakeUnavailable(FakeIxError):
     """What the SDK raises when the guest agent cannot be reached."""
 
-ENV = {
-    "IX_TOKEN": "ix_test_token",
-    "RUNNER_PAT": "github_pat_test",
-    "GITHUB_REPOSITORY": "example/baml",
-    "POOL_SIZE": "2",
-    "MAX_REPLACEMENTS": "2",
-    "IX_REGION": "us-east-1",
-}
-
 
 class FakeInfo:
-    def __init__(self, name):
+    """Mirrors MachineInfo: created_at is Unix epoch MILLISECONDS."""
+
+    def __init__(self, name, *, created_at=None, status="Running", failure_reason=None):
         self.name = name
         self.id = f"id-{name}"
+        self.created_at = now_ms() - DAY_MS if created_at is None else created_at
+        self.status = status
+        self.failure_reason = failure_reason
 
 
 class FakeExec:
     """Mirrors the SDK's ExecResult: exit_code is a PROPERTY, not a method
     (calling it was a live failure the method-shaped fake waved through)."""
 
-    def __init__(self, code):
+    def __init__(self, code, stdout=""):
         self._code = code
+        self.stdout = stdout
+        self.stderr = ""
 
     @property
     def exit_code(self):
@@ -83,15 +95,19 @@ class FakeMachine:
         self.platform = platform
         self.name = name
 
-    async def read_file(self, path):
+    async def shell(self, script, working_dir=None):
+        self.platform.calls.append((self.name, ("shell", script)))
         if self.name not in self.platform.revs:
-            raise OSError("unreachable")
-        return self.platform.revs[self.name] + "\n"
+            raise FakeUnavailable("guest agent did not answer")
+        out = self.platform.revs[self.name] + "\n"
+        if self.name in self.platform.markers:
+            out += "ix-runner-strike\n"
+        if f"rm -f {MARKER}" in script:
+            self.platform.markers.discard(self.name)
+        return FakeExec(0, out)
 
-    async def exec(self, command):
+    async def exec(self, command, working_dir=None):
         self.platform.calls.append((self.name, tuple(command)))
-        if command[0] == "test":
-            return FakeExec(0 if self.name in self.platform.markers else 1)
         return FakeExec(0)
 
     async def delete(self):
@@ -103,22 +119,24 @@ class FakeMachines:
         self.platform = platform
 
     async def list(self):
-        return [FakeInfo(name) for name in sorted(self.platform.vms)]
+        return [FakeInfo(name, **self.platform.info.get(name, {})) for name in sorted(self.platform.vms)]
 
     def connect(self, vm_id):
-        name = vm_id.removeprefix("id-")
-        return FakeMachine(self.platform, name)
+        return FakeMachine(self.platform, vm_id.removeprefix("id-"))
 
     async def create(self, options):
+        name = options["name"]
         self.platform.calls.append((None, ("create", options)))
-        if self.platform.broken:
-            raise RuntimeError("template build failed")
+        error = self.platform.create_errors.get(name, self.platform.create_error)
+        if error is not None:
+            raise error
         self.platform.in_flight += 1
         self.platform.max_in_flight = max(
             self.platform.max_in_flight, self.platform.in_flight
         )
         await asyncio.sleep(self.platform.create_delay)
         self.platform.in_flight -= 1
+        self.platform.created.append(name)
 
 
 class FakeSecrets:
@@ -127,6 +145,9 @@ class FakeSecrets:
 
     async def set(self, name, value):
         self.platform.calls.append((None, ("secret-set", name, value)))
+
+    async def delete(self, name):
+        self.platform.calls.append((None, ("secret-delete", name)))
 
 
 class FakeIx:
@@ -143,7 +164,10 @@ class FakeIx:
         busy_at_delete=frozenset(),
         registered=None,
         slots=1,
+        info=None,
         broken=False,
+        create_error=None,
+        create_errors=None,
         page_size=100,
     ):
         self.vms = vms  # existing VM names
@@ -155,13 +179,18 @@ class FakeIx:
         # runners listing, but GitHub 422s the registration delete.
         self.busy_at_delete = set(busy_at_delete)
         # every member with runner registrations; online iff also in `online`.
-        self.registered = set(
-            self.online | self.busy if registered is None else registered
-        )
+        self.registered = set(self.online | self.busy if registered is None else registered)
         self.slots = slots  # runner daemons per VM
-        self.broken = broken  # every create fails (bad template rev)
-        self.page_size = page_size  # runner listing page size
+        self.info = info or {}  # name -> FakeInfo kwargs
+        self.create_error = (
+            create_error
+            if create_error is not None
+            else (FakeIxError("template build failed") if broken else None)
+        )
+        self.create_errors = create_errors or {}  # name -> exception
+        self.page_size = page_size
         self.calls = []
+        self.created = []  # names whose create ran to completion
         self.create_delay = 0.0
         self.in_flight = 0
         self.max_in_flight = 0
@@ -192,7 +221,8 @@ class FakeIx:
         self.calls.append((None, (method, path)))
         if path.startswith("/actions/runners?"):
             rows = self.runner_rows()
-            start = (int(path.rsplit("page=", 1)[1]) - 1) * self.page_size
+            page = int(path.rsplit("page=", 1)[1])
+            start = (page - 1) * self.page_size
             return {
                 "total_count": len(rows),
                 "runners": rows[start : start + self.page_size],
@@ -221,7 +251,7 @@ class FakeIx:
 class ReconcileTest(unittest.IsolatedAsyncioTestCase):
     async def reconcile_with(self, ix, env=ENV):
         with (
-            mock.patch.dict("os.environ", env),
+            mock.patch.dict("os.environ", env, clear=True),
             mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
             mock.patch("reconcile.ix_runners.github_api", ix.github_api),
             mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
@@ -255,6 +285,16 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_attr_prefix_is_configurable(self):
+        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        env = dict(ENV, ATTR_PREFIX="runner", POOL_NAME="pool", POOL_SIZE="1")
+        await self.reconcile_with(ix, env=env)
+        creates = [c for _, c in ix.calls if c[0] == "create"]
+        self.assertEqual(
+            creates[0][1]["template"], f"github:example/baml/{REV}#runner-1"
+        )
+        self.assertEqual(creates[0][1]["name"], "pool-runner-1")
+
     async def test_stale_rev_is_replaced(self):
         ix = FakeIx(
             vms={"baml-runner-1", "baml-runner-2"},
@@ -279,6 +319,21 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         dereg = ix.calls.index((None, ("DELETE", "/actions/runners/1011")))
         vm_delete = ix.calls.index(("baml-runner-1", ("delete",)))
         self.assertLess(dereg, vm_delete)
+
+    async def test_mid_scan_job_pickup_defers_the_replace(self):
+        # Member 1 reads idle in the scan snapshot but picks up a job before
+        # the delete: GitHub 422s the deregister, the member is skipped with
+        # no budget spent, and the other stale member still converges.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-1": OLD_REV, "baml-runner-2": OLD_REV},
+            online={1, 2},
+            markers=set(),
+            busy_at_delete={1},
+        )
+        self.assertEqual(await self.reconcile_with(ix), 1)
+        self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
+        self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
 
     async def test_deregistrations_never_overlap(self):
         # Concurrent DELETEs trip GitHub's secondary rate limit, whose 422 is
@@ -310,21 +365,6 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         await self.reconcile_with(ix, env=env)
         self.assertGreater(ix.creates_during_a_delete, 0)
 
-    async def test_mid_scan_job_pickup_defers_the_replace(self):
-        # Member 1 reads idle in the scan snapshot but picks up a job before
-        # the delete: GitHub 422s the deregister, the member is skipped with
-        # no budget spent, and the other stale member still converges.
-        ix = FakeIx(
-            vms={"baml-runner-1", "baml-runner-2"},
-            revs={"baml-runner-1": OLD_REV, "baml-runner-2": OLD_REV},
-            online={1, 2},
-            markers=set(),
-            busy_at_delete={1},
-        )
-        self.assertEqual(await self.reconcile_with(ix), 1)
-        self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
-        self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
-
     async def test_unreachable_member_is_replaced(self):
         ix = FakeIx(
             vms={"baml-runner-1", "baml-runner-2"},
@@ -334,6 +374,19 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.reconcile_with(ix), 1)
         self.assertIn(("baml-runner-1", ("delete",)), ix.calls)
+
+    async def test_young_unreachable_member_is_left_alone(self):
+        # A first boot compiles the template in-guest: silence from a machine
+        # created minutes ago is the build running, not a dead VM.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-2": REV},
+            online={2},
+            markers=set(),
+            info={"baml-runner-1": {"created_at": now_ms() - 60_000}},
+        )
+        self.assertEqual(await self.reconcile_with(ix), 0)
+        self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
 
     async def test_offline_member_is_repaired_first(self):
         ix = FakeIx(
@@ -347,10 +400,7 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             ("baml-runner-1", ("systemctl", "restart", "github-runner-*")),
             ix.calls,
         )
-        self.assertIn(
-            ("baml-runner-1", ("touch", "/var/lib/ix-runner/repaired")),
-            ix.calls,
-        )
+        self.assertIn(("baml-runner-1", ("touch", MARKER)), ix.calls)
         self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
 
     async def test_offline_member_with_strike_is_replaced(self):
@@ -363,7 +413,9 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.reconcile_with(ix), 1)
         self.assertIn(("baml-runner-1", ("delete",)), ix.calls)
 
-    async def test_healthy_member_clears_the_strike_marker(self):
+    async def test_healthy_member_clears_the_marker_in_the_probe(self):
+        # One guest round-trip per healthy member: the rev read and the marker
+        # clear share a shell.
         ix = FakeIx(
             vms={"baml-runner-1", "baml-runner-2"},
             revs={"baml-runner-1": REV, "baml-runner-2": REV},
@@ -371,10 +423,24 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             markers={"baml-runner-1"},
         )
         self.assertEqual(await self.reconcile_with(ix), 0)
-        self.assertIn(
-            ("baml-runner-1", ("rm", "-f", "/var/lib/ix-runner/repaired")),
-            ix.calls,
+        shells = [c[1] for name, c in ix.calls if name == "baml-runner-1"]
+        self.assertEqual(len(shells), 1)
+        self.assertIn(f"rm -f {MARKER}", shells[0])
+        self.assertNotIn("baml-runner-1", ix.markers)
+
+    async def test_offline_member_probe_does_not_clear_the_marker(self):
+        # Clearing the strike on an offline member would make the two-strike
+        # replace unreachable: it would repair forever.
+        ix = FakeIx(
+            vms={"baml-runner-1"},
+            revs={"baml-runner-1": REV},
+            online=set(),
+            markers={"baml-runner-1"},
         )
+        env = dict(ENV, POOL_SIZE="1", MAX_REPLACEMENTS="0")
+        await self.reconcile_with(ix, env=env)
+        shells = [c[1] for name, c in ix.calls if name == "baml-runner-1" and c[0] == "shell"]
+        self.assertNotIn(f"rm -f {MARKER}", shells[0])
 
     async def test_replacement_budget_caps_work_per_run(self):
         # A non-empty stale pool rolls at most MAX_REPLACEMENTS per run.
@@ -390,6 +456,75 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(len(creates), 2)
 
+    async def test_budget_exhaustion_skips_rather_than_ends_the_pass(self):
+        # Members past the budget still get their free work: with a `break`,
+        # member 3's repair never ran and it stayed offline forever.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2", "baml-runner-3"},
+            revs={
+                "baml-runner-1": OLD_REV,
+                "baml-runner-2": OLD_REV,
+                "baml-runner-3": REV,
+            },
+            online={1, 2},
+            markers=set(),
+        )
+        env = dict(ENV, POOL_SIZE="3", MAX_REPLACEMENTS="1")
+        self.assertEqual(await self.reconcile_with(ix, env=env), 1)
+        self.assertIn(
+            ("baml-runner-3", ("systemctl", "restart", "github-runner-*")),
+            ix.calls,
+        )
+
+    async def test_scan_order_rotates_with_the_run_number(self):
+        # A fixed order lets one unfixable low-numbered member own the whole
+        # budget run after run; the rotation moves the starting point.
+        def stale_pool():
+            vms = {f"baml-runner-{m}" for m in range(1, 5)}
+            return FakeIx(
+                vms=vms,
+                revs={name: OLD_REV for name in vms},
+                online={1, 2, 3, 4},
+                markers=set(),
+            )
+
+        base = dict(ENV, POOL_SIZE="4", MAX_REPLACEMENTS="1")
+        first = stale_pool()
+        await self.reconcile_with(first, env=dict(base, GITHUB_RUN_NUMBER="0"))
+        self.assertIn(("baml-runner-1", ("delete",)), first.calls)
+
+        second = stale_pool()
+        await self.reconcile_with(second, env=dict(base, GITHUB_RUN_NUMBER="1"))
+        self.assertNotIn(("baml-runner-1", ("delete",)), second.calls)
+        self.assertIn(("baml-runner-2", ("delete",)), second.calls)
+
+    async def test_members_above_pool_size_are_pruned(self):
+        # Shrinking the pool must not orphan VMs: they keep billing and keep
+        # taking jobs from a config nothing reconciles.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-1": REV, "baml-runner-2": REV},
+            online={1, 2},
+            markers=set(),
+        )
+        env = dict(ENV, POOL_SIZE="1")
+        await self.reconcile_with(ix, env=env)
+        self.assertIn((None, ("DELETE", "/actions/runners/1021")), ix.calls)
+        self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
+        self.assertEqual([c for _, c in ix.calls if c[0] == "create"], [])
+
+    async def test_a_pool_size_of_zero_drains_the_pool(self):
+        # Draining is the limit case of a shrink, not a crash.
+        ix = FakeIx(
+            vms={"baml-runner-1"},
+            revs={"baml-runner-1": REV},
+            online={1},
+            markers=set(),
+        )
+        env = dict(ENV, POOL_SIZE="0", MAX_REPLACEMENTS="1")
+        await self.reconcile_with(ix, env=env)
+        self.assertIn(("baml-runner-1", ("delete",)), ix.calls)
+
     async def test_creates_run_concurrently_under_the_cap(self):
         # The execute phase overlaps guest boots but never exceeds the
         # semaphore; with 8 creates and concurrency 3, peak in-flight is 3.
@@ -399,6 +534,32 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.reconcile_with(ix, env=env), 8)
         self.assertGreater(ix.max_in_flight, 1)
         self.assertLessEqual(ix.max_in_flight, 3)
+
+    async def test_probes_run_concurrently(self):
+        # An all-unreachable pool used to pay EXEC_TIMEOUT per member, in
+        # series, before anything happened.
+        ix = FakeIx(
+            vms={f"baml-runner-{m}" for m in range(1, 9)},
+            revs={},
+            online=set(),
+            markers=set(),
+        )
+        env = dict(ENV, POOL_SIZE="8", MAX_REPLACEMENTS="0", CONCURRENCY="4")
+        with mock.patch("reconcile.ix_runners.probe_member") as probe:
+            in_flight = 0
+            peak = 0
+
+            async def slow_probe(machine, *, clear_marker):
+                nonlocal in_flight, peak
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0.01)
+                in_flight -= 1
+                return None, False
+
+            probe.side_effect = slow_probe
+            await self.reconcile_with(ix, env=env)
+        self.assertEqual(peak, 4)
 
     async def test_empty_pool_bootstraps_past_the_cap(self):
         # First bootstrap: nothing exists to thrash, so the cap self-raises
@@ -429,6 +590,38 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             await self.reconcile_with(ix)
         creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(len(creates), 2)
+
+    async def test_an_unforeseen_exception_is_reported_as_that_member_failing(self):
+        # Fault isolation caught only RuntimeError-rooted errors, so anything
+        # else escaped the handler and lost the member/action attribution.
+        ix = FakeIx(
+            vms=set(),
+            revs={},
+            online=set(),
+            markers=set(),
+            create_error=ValueError("not an SDK error"),
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            await self.reconcile_with(ix)
+        self.assertEqual(len([c for _, c in ix.calls if c[0] == "create"]), 2)
+        self.assertIn("::error::baml-runner-1: create FAILED", out.getvalue())
+
+    async def test_a_straggler_exception_does_not_cancel_a_sibling_mid_create(self):
+        # An exception the handler cannot catch (BaseException, a cancelled
+        # child) used to abort the gather and kill in-flight creates halfway.
+        ix = FakeIx(
+            vms=set(),
+            revs={},
+            online=set(),
+            markers=set(),
+            create_errors={"baml-runner-1": asyncio.CancelledError()},
+        )
+        ix.create_delay = 0.05
+        env = dict(ENV, CONCURRENCY="2")
+        with self.assertRaises(SystemExit):
+            await self.reconcile_with(ix, env=env)
+        self.assertEqual(ix.created, ["baml-runner-2"])
 
 
 class ListRunnersTest(unittest.TestCase):
@@ -574,6 +767,15 @@ class MemberMatchTest(unittest.TestCase):
             {"name": "baml-r2-1", "status": "online"},
         ]
         self.assertEqual(len(member_runners(runners, "baml", 1)), 2)
+
+
+class ExtraMembersTest(unittest.TestCase):
+    def test_only_members_above_the_pool_size_are_extra(self):
+        names = ["baml-runner-1", "baml-runner-9", "baml-runner-10", "other-runner-3"]
+        self.assertEqual(extra_members(names, "baml", 8), [9, 10])
+
+    def test_a_foreign_name_is_never_pruned(self):
+        self.assertEqual(extra_members(["baml-runner-x", "bamlx-runner-9"], "baml", 1), [])
 
 
 if __name__ == "__main__":
