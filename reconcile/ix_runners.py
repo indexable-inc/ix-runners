@@ -46,6 +46,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -520,8 +521,11 @@ async def reconcile(ix: Any) -> int:
             pat, repo, "/actions/runners/registration-token", method="POST"
         )["token"]
         # Mask BEFORE the token can reach any other output: for its one-hour
-        # life it can register a runner that steals this repo's jobs.
-        print(f"::add-mask::{token}")
+        # life it can register a runner that steals this repo's jobs. flush is
+        # load-bearing - stdout to a pipe block-buffers, so an unflushed mask
+        # can still be sitting in this process while the SDK call below writes
+        # the token into a traceback on stderr.
+        print(f"::add-mask::{token}", flush=True)
         await ix.secrets().set(secret_name, token)
         minted = True
 
@@ -622,6 +626,10 @@ def require_hosted_runner() -> None:
 
 def main() -> None:
     """Entry point: require a hosted runner and the secrets, then converge."""
+    # Actions pipes stdout, so Python block-buffers it: without this, a
+    # traceback on stderr overtakes the log lines that explain it, and a
+    # ::add-mask:: can trail the output it was meant to mask.
+    sys.stdout.reconfigure(line_buffering=True)
     require_hosted_runner()
     for required in ("IX_TOKEN", "RUNNER_PAT", "GITHUB_REPOSITORY"):
         if not os.environ.get(required):

@@ -16,6 +16,7 @@ from reconcile.ix_runners import (
     desired_rev,
     extra_members,
     list_runners,
+    main,
     member_online,
     member_runners,
     reconcile,
@@ -295,6 +296,26 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             await self.reconcile_with(ix)
         self.assertIn("::add-mask::REGTOKEN", out.getvalue())
         self.assertIn((None, ("secret-delete", "baml_runner_reg_token")), ix.calls)
+
+    async def test_the_mask_is_flushed_before_the_token_is_used(self):
+        # Python block-buffers stdout to a pipe, so an unflushed mask can
+        # still be sitting in this process while the very next call writes the
+        # token into a traceback. The mask has to be out first, not merely
+        # printed first.
+        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        printed = []
+
+        def recording_print(*args, **kwargs):
+            printed.append((args, kwargs))
+
+        with mock.patch("builtins.print", recording_print):
+            await self.reconcile_with(ix)
+        masks = [
+            kwargs
+            for args, kwargs in printed
+            if args and str(args[0]).startswith("::add-mask::")
+        ]
+        self.assertEqual(masks, [{"flush": True}])
 
     async def test_attr_prefix_is_configurable(self):
         ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
@@ -814,6 +835,27 @@ class HostedRunnerTest(unittest.TestCase):
             clear=True,
         ):
             require_hosted_runner()
+
+
+class MainTest(unittest.TestCase):
+    def test_stdout_is_line_buffered(self):
+        # Unbuffered ordering is a security property here: log lines and the
+        # ::add-mask:: must reach the runner before the stderr they explain.
+        stdout = mock.Mock()
+
+        async def converged(ix):
+            return 0
+
+        with (
+            mock.patch.dict(
+                "os.environ", dict(ENV, RUNNER_ENVIRONMENT="github-hosted"), clear=True
+            ),
+            mock.patch("reconcile.ix_runners.sys.stdout", stdout),
+            mock.patch("reconcile.ix_runners.client", lambda: object()),
+            mock.patch("reconcile.ix_runners.reconcile", converged),
+        ):
+            main()
+        stdout.reconfigure.assert_called_once_with(line_buffering=True)
 
 
 class ExtraMembersTest(unittest.TestCase):
