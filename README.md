@@ -55,6 +55,9 @@ the ix SDK; templates compile server-side on first boot and cache by rev.
 - Offline: restarted once, replaced if still offline next run.
 - Empty pool: the per-run replacement cap self-raises, so first bootstrap
   is just the first tick.
+- Creations and replacements execute concurrently (bounded, one
+  registration token per run): a full-pool roll takes minutes, not one
+  boot at a time.
 
 ## Security model
 

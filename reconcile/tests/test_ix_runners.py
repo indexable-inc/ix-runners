@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import unittest
 import urllib.error
 from pathlib import Path
@@ -77,6 +79,12 @@ class FakeMachines:
         self.platform.calls.append((None, ("create", options)))
         if self.platform.broken:
             raise RuntimeError("template build failed")
+        self.platform.in_flight += 1
+        self.platform.max_in_flight = max(
+            self.platform.max_in_flight, self.platform.in_flight
+        )
+        await asyncio.sleep(self.platform.create_delay)
+        self.platform.in_flight -= 1
 
 
 class FakeSecrets:
@@ -111,6 +119,9 @@ class FakeIx:
         self.busy_at_delete = busy_at_delete
         self.broken = broken  # every create fails (bad template rev)
         self.calls = []
+        self.create_delay = 0.0
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     def machines(self):
         return FakeMachines(self)
@@ -155,12 +166,18 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
     async def test_missing_member_is_created_with_secret_at_boot(self):
         ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
         self.assertEqual(await self.reconcile_with(ix), 2)
-        # The registration token reaches the store as an API body, never a
-        # command line, and is attached as a root-only file at create.
+        # ONE token mint and ONE secret store per run, however many members
+        # are created: registration tokens are repo-scoped and hour-valid.
         secret_sets = [c for _, c in ix.calls if c[0] == "secret-set"]
-        self.assertEqual(len(secret_sets), 2)
-        for call in secret_sets:
-            self.assertEqual(call[1:], ("baml_runner_reg_token", "REGTOKEN"))
+        self.assertEqual(
+            secret_sets, [("secret-set", "baml_runner_reg_token", "REGTOKEN")]
+        )
+        mints = [
+            c
+            for _, c in ix.calls
+            if c == ("POST", "/actions/runners/registration-token")
+        ]
+        self.assertEqual(len(mints), 1)
         creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(
             creates[0][1],
@@ -276,6 +293,16 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.reconcile_with(ix, env=env), 2)
         creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(len(creates), 2)
+
+    async def test_creates_run_concurrently_under_the_cap(self):
+        # The execute phase overlaps guest boots but never exceeds the
+        # semaphore; with 8 creates and concurrency 3, peak in-flight is 3.
+        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        ix.create_delay = 0.01
+        env = dict(ENV, POOL_SIZE="8", MAX_REPLACEMENTS="8", CONCURRENCY="3")
+        self.assertEqual(await self.reconcile_with(ix, env=env), 8)
+        self.assertGreater(ix.max_in_flight, 1)
+        self.assertLessEqual(ix.max_in_flight, 3)
 
     async def test_empty_pool_bootstraps_past_the_cap(self):
         # First bootstrap: nothing exists to thrash, so the cap self-raises

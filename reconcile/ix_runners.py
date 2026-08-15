@@ -176,22 +176,15 @@ def create_options(**kwargs):
     return CreateMachineOptions(**kwargs)
 
 
-async def create(
-    ix, pat: str, repo: str, rev: str, pool: str, member: int, name: str
-) -> None:
-    """Provision one pool member with the registration token at first boot.
+async def create(ix, repo: str, rev: str, secret: str, member: int, name: str) -> None:
+    """Provision one pool member; the registration token is already stored.
 
-    A fresh 1 h registration token goes into the ix secret store (an API
-    body, never argv) and reaches the VM as a root-only file via the
-    secret_files attach; nothing durable ever lands on a VM. The runner
-    units read it as root at configure time and skip cleanly while it is
-    absent. An unbuilt (rev, attr) template compiles server-side on first
-    boot (single-flight per pinned rev; idempotency_key is refused for
-    flake-ref templates, so none is sent).
+    The token reaches the VM as a root-only file via the secret_files
+    attach, present at first boot - no post-boot seeding step exists. An
+    unbuilt (rev, attr) template compiles server-side on first boot
+    (single-flight per pinned rev; idempotency_key is refused for flake-ref
+    templates, so none is sent).
     """
-    secret = os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token"
-    token = github_api(pat, repo, "/actions/runners/registration-token", method="POST")
-    await ix.secrets().set(secret, token["token"])
     options = create_options(
         template=f"github:{repo}/{rev}#ci-runner-{member}",
         name=name,
@@ -202,15 +195,26 @@ async def create(
 
 
 async def reconcile(ix) -> int:
-    """Converge the pool; return the number of creations/replacements."""
+    """Converge the pool; return the number of creations/replacements.
+
+    Three phases. The SCAN walks members in order and collects
+    budget-admitted create/replace actions (cheap, sequential). One
+    registration token is then minted and stored - GitHub registration
+    tokens are repo-scoped and hour-valid, so one serves every member this
+    run touches. The EXECUTE phase runs the actions concurrently under a
+    bounded semaphore: the minutes in a roll are guest boots, and they
+    overlap; a full-pool roll takes waves of CONCURRENCY instead of one
+    boot at a time.
+    """
     pat = os.environ["RUNNER_PAT"]
     repo = os.environ["GITHUB_REPOSITORY"]
     pool = pool_name()
-    os.environ.setdefault("IX_REGION", "us-west-1")
     # POOL_SIZE x `slots` runner daemons each = the concurrent job budget
     # (the consuming flake's mkPool size and this must agree).
     pool_size = int(os.environ.get("POOL_SIZE") or 8)
     max_replacements = int(os.environ.get("MAX_REPLACEMENTS") or 2)
+    concurrency = int(os.environ.get("CONCURRENCY") or 4)
+    secret = os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token"
 
     rev = desired_rev()
     runners = github_api(pat, repo, "/actions/runners?per_page=100")["runners"]
@@ -221,55 +225,39 @@ async def reconcile(ix) -> int:
     if empty and max_replacements < pool_size:
         print(f"empty pool -> bootstrap: raising the cap to {pool_size}")
         max_replacements = pool_size
-    replaced = 0
 
-    def budget() -> bool:
+    replaced = 0
+    failures = 0
+    actions: list[tuple[str, int, str]] = []  # (kind, member, name)
+
+    def admit(kind: str, member: int, name: str) -> bool:
+        # Budget is spent at ADMISSION: a bad template rev stalls after N
+        # attempts even when every attempt fails.
+        nonlocal replaced
         if replaced >= max_replacements:
             print(
                 f"replacement budget ({max_replacements}) exhausted;"
                 " remaining members reconcile next run"
             )
             return False
+        replaced += 1
+        actions.append((kind, member, name))
         return True
 
-    failures = 0
-
-    async def make(member: int, name: str) -> None:
-        # The budget is spent even when the create FAILS: a bad template
-        # rev must stall after N attempts, not thrash the whole pool.
-        nonlocal replaced, failures
-        replaced += 1
-        try:
-            await create(ix, pat, repo, rev, pool, member, name)
-        except (TimeoutError, OSError, RuntimeError) as e:
-            failures += 1
-            print(f"{name}: create FAILED ({e}); reconciling again next run")
-
-    async def replace(member: int, name: str) -> None:
-        # Deregister BEFORE deleting the VM: a busy registration (422)
-        # means the member picked up a job since the scan - skip it this
-        # round rather than kill the job. No budget is spent on a skip.
-        if not deregister_member(pat, repo, runners, pool, member):
-            print(f"{name}: picked up a job mid-scan -> deferred")
-            return
-        await ix.machines().connect(vms[name]).delete()
-        await make(member, name)
-
+    # -- scan --
     for member in range(1, pool_size + 1):
         name = f"{pool}-runner-{member}"
         if name not in vms:
-            if not budget():
-                break
             print(f"{name}: missing -> create")
-            await make(member, name)
+            if not admit("create", member, name):
+                break
             continue
         machine = ix.machines().connect(vms[name])
         actual = await member_rev(machine)
         if actual is None:
-            if not budget():
-                break
             print(f"{name}: unreachable -> replace")
-            await replace(member, name)
+            if not admit("replace", member, name):
+                break
             continue
         if actual != rev:
             # Never roll a member out from under a running job: config
@@ -277,10 +265,9 @@ async def reconcile(ix) -> int:
             if member_busy(runners, pool, member):
                 print(f"{name}: stale rev but busy -> deferred")
                 continue
-            if not budget():
-                break
             print(f"{name}: rev {actual[:12]} != {rev[:12]} -> replace")
-            await replace(member, name)
+            if not admit("replace", member, name):
+                break
             continue
         if member_online(runners, pool, member):
             print(f"{name}: healthy")
@@ -292,14 +279,43 @@ async def reconcile(ix) -> int:
         # run already repaired and it is STILL offline (two-strike, with the
         # strike recorded on the VM itself so this script stays stateless).
         if await guest(machine, "test", "-f", REPAIRED_MARKER):
-            if not budget():
-                break
             print(f"{name}: still offline after repair -> replace")
-            await replace(member, name)
+            if not admit("replace", member, name):
+                break
         else:
             print(f"{name}: runners offline -> repair (restart units)")
             await guest(machine, "systemctl", "restart", "github-runner-*")
             await guest(machine, "touch", REPAIRED_MARKER)
+
+    # -- execute --
+    if actions:
+        token = github_api(
+            pat, repo, "/actions/runners/registration-token", method="POST"
+        )
+        await ix.secrets().set(secret, token["token"])
+        print(f"executing {len(actions)} action(s), concurrency {concurrency}")
+        gate = asyncio.Semaphore(concurrency)
+
+        async def run_action(kind: str, member: int, name: str) -> None:
+            nonlocal replaced, failures
+            async with gate:
+                try:
+                    if kind == "replace":
+                        # Deregister at EXECUTE time, right before the
+                        # delete: GitHub refuses (422) to deregister a busy
+                        # runner, so a member that picked up a job since the
+                        # scan is skipped, and its budget is refunded.
+                        if not deregister_member(pat, repo, runners, pool, member):
+                            print(f"{name}: picked up a job mid-scan -> deferred")
+                            replaced -= 1
+                            return
+                        await ix.machines().connect(vms[name]).delete()
+                    await create(ix, repo, rev, secret, member, name)
+                except (TimeoutError, OSError, RuntimeError) as e:
+                    failures += 1
+                    print(f"{name}: {kind} FAILED ({e}); reconciling again next run")
+
+        await asyncio.gather(*(run_action(*action) for action in actions))
 
     print(f"reconcile done: {replaced} creation(s)/replacement(s), {failures} failed")
     if failures:
