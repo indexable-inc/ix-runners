@@ -285,6 +285,16 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_registration_token_is_masked_and_the_secret_cleaned_up(self):
+        # The token can register a job-stealing runner for an hour: it must
+        # never land unmasked in a log, and must not outlive the run.
+        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            await self.reconcile_with(ix)
+        self.assertIn("::add-mask::REGTOKEN", out.getvalue())
+        self.assertIn((None, ("secret-delete", "baml_runner_reg_token")), ix.calls)
+
     async def test_attr_prefix_is_configurable(self):
         ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
         env = dict(ENV, ATTR_PREFIX="runner", POOL_NAME="pool", POOL_SIZE="1")

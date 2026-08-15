@@ -513,11 +513,16 @@ async def reconcile(ix: Any) -> int:
         admit("prune", member, name)
 
     # -- execute --
+    minted = False
     if any(kind in ("create", "replace") for kind, _, _ in actions):
         token = github_api(
             pat, repo, "/actions/runners/registration-token", method="POST"
         )["token"]
+        # Mask BEFORE the token can reach any other output: for its one-hour
+        # life it can register a runner that steals this repo's jobs.
+        print(f"::add-mask::{token}")
         await ix.secrets().set(secret_name, token)
+        minted = True
 
     if actions:
         print(f"executing {len(actions)} action(s), concurrency {concurrency}")
@@ -573,6 +578,15 @@ async def reconcile(ix: Any) -> int:
                 failures += 1
                 log_error(f"{name}: {kind} raised past the handler ({outcome!r})")
                 summary.append((name, kind, f"FAILED: {outcome!r}"))
+
+    if minted:
+        # Spent registration tokens are dead within the hour and would
+        # otherwise pile up in the secret store forever. Best effort only:
+        # every VM that needed this one already has it as a boot-time file.
+        try:
+            await ix.secrets().delete(secret_name)
+        except Exception as error:
+            log_warning(f"could not delete the spent secret {secret_name} ({error!r})")
 
     print(f"reconcile done: {replaced} creation(s)/replacement(s), {failures} failed")
     write_summary(sorted(summary))
