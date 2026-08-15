@@ -10,6 +10,7 @@ import io
 import json
 import os
 import pathlib
+import sys
 import subprocess
 import tempfile
 import threading
@@ -19,29 +20,26 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-from reconcile.ix_runners import (
+from reconcile.config import Config, desired_rev
+from reconcile.github import (
     MAX_DEMAND_RUNS,
-    machine_status,
+    OPENER,
+    api_url,
+    deregister_member,
+    extra_members,
+    github_api,
+    list_runners,
+    member_online,
+    member_runners,
     parse_time,
     pool_can_serve,
     pool_slots,
     run_ids,
     runner_label_sets,
-    MAX_PROBE_OUTPUT,
-    OPENER,
-    api_url,
-    deregister_member,
-    desired_rev,
-    extra_members,
-    github_api,
-    list_runners,
-    main,
-    member_online,
-    member_runners,
-    probe_member,
-    reconcile,
-    require_hosted_runner,
 )
+from reconcile.ix_runners import main, reconcile, require_hosted_runner
+from reconcile.machines import MAX_PROBE_OUTPUT, probe_member
+from reconcile.model import machine_status
 
 REV = "a" * 40
 OLD_REV = "b" * 40
@@ -361,9 +359,9 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch.dict("os.environ", env, clear=True),
             mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
-            mock.patch("reconcile.ix_runners.github_api", ix.github_api),
-            mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
-            mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+            mock.patch("reconcile.github.github_api", ix.github_api),
+            mock.patch("reconcile.machines.create_options", lambda **kw: kw),
+            mock.patch("reconcile.github.DEREGISTER_PAUSE", 0.0),
         ):
             return await reconcile(ix)
 
@@ -689,7 +687,7 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             markers=set(),
         )
         env = dict(ENV, POOL_SIZE="8", MAX_REPLACEMENTS="0", CONCURRENCY="4")
-        with mock.patch("reconcile.ix_runners.probe_member") as probe:
+        with mock.patch("reconcile.snapshot.probe_member") as probe:
             in_flight = 0
             peak = 0
 
@@ -944,9 +942,9 @@ async def run_reconcile(ix, env):
     with (
         mock.patch.dict("os.environ", env, clear=True),
         mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
-        mock.patch("reconcile.ix_runners.github_api", ix.github_api),
-        mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
-        mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+        mock.patch("reconcile.github.github_api", ix.github_api),
+        mock.patch("reconcile.machines.create_options", lambda **kw: kw),
+        mock.patch("reconcile.github.DEREGISTER_PAUSE", 0.0),
         contextlib.redirect_stdout(io.StringIO()),
     ):
         return await reconcile(ix)
@@ -1310,9 +1308,9 @@ class OrderingTest(unittest.IsolatedAsyncioTestCase):
             with (
                 mock.patch.dict("os.environ", env, clear=True),
                 mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
-                mock.patch("reconcile.ix_runners.github_api", ix.github_api),
-                mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
-                mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+                mock.patch("reconcile.github.github_api", ix.github_api),
+                mock.patch("reconcile.machines.create_options", lambda **kw: kw),
+                mock.patch("reconcile.github.DEREGISTER_PAUSE", 0.0),
             ):
                 await reconcile(ix)
         line = next(
@@ -1478,7 +1476,7 @@ class DemandScanTest(unittest.TestCase):
                     return body
             raise AssertionError(f"unexpected path {path}")
 
-        with mock.patch("reconcile.ix_runners.github_api", api):
+        with mock.patch("reconcile.github.github_api", api):
             return run_ids("tok", "example/baml", "queued", MAX_DEMAND_RUNS), seen
 
     def runs(self, n):
@@ -1626,7 +1624,7 @@ class ListRunnersTest(unittest.TestCase):
             start = (page - 1) * 2
             return {"total_count": len(rows), "runners": rows[start : start + 2]}
 
-        with mock.patch("reconcile.ix_runners.github_api", api):
+        with mock.patch("reconcile.github.github_api", api):
             self.assertEqual(list_runners("pat", "example/baml"), rows)
         self.assertEqual(len(seen), 3)
 
@@ -1634,7 +1632,7 @@ class ListRunnersTest(unittest.TestCase):
         def api(pat, repo, path, *, method="GET"):
             return {"total_count": 9, "runners": []}
 
-        with mock.patch("reconcile.ix_runners.github_api", api):
+        with mock.patch("reconcile.github.github_api", api):
             with self.assertRaises(SystemExit):
                 list_runners("pat", "example/baml")
 
@@ -1653,14 +1651,14 @@ class DesiredRevTest(unittest.TestCase):
         # A grafted HEAD diffs against the empty tree, so `git log -- <paths>`
         # names HEAD for every commit and the fleet rolls on every push.
         with mock.patch(
-            "reconcile.ix_runners.subprocess.run", self.fake_git("true", REV)
+            "reconcile.config.subprocess.run", self.fake_git("true", REV)
         ):
             with self.assertRaises(SystemExit):
                 desired_rev()
 
     def test_a_full_checkout_resolves_the_config_rev(self):
         with mock.patch(
-            "reconcile.ix_runners.subprocess.run", self.fake_git("false", REV)
+            "reconcile.config.subprocess.run", self.fake_git("false", REV)
         ):
             self.assertEqual(desired_rev(), REV)
 
@@ -1718,7 +1716,7 @@ class GithubApiTest(unittest.TestCase):
         opener.open.return_value.__enter__.return_value.read.return_value = b"{}"
         with (
             mock.patch.dict("os.environ", {}, clear=True),
-            mock.patch("reconcile.ix_runners.OPENER", opener),
+            mock.patch("reconcile.github.OPENER", opener),
         ):
             self.assertEqual(github_api("pat", "example/baml", "/x"), {})
         request = opener.open.call_args.args[0]
@@ -1731,7 +1729,7 @@ class GithubApiTest(unittest.TestCase):
         opener.open.side_effect = http_error(302, "Found")
         with (
             mock.patch.dict("os.environ", {}, clear=True),
-            mock.patch("reconcile.ix_runners.OPENER", opener),
+            mock.patch("reconcile.github.OPENER", opener),
         ):
             with self.assertRaises(RuntimeError) as caught:
                 github_api("pat", "example/baml", "/x")
@@ -1795,7 +1793,7 @@ class DeregisterTest(unittest.TestCase):
             calls.append((method, path))
             return {}
 
-        with mock.patch("reconcile.ix_runners.github_api", api):
+        with mock.patch("reconcile.github.github_api", api):
             self.assertFalse(deregister_member("pat", "r", runners, "baml", 1))
         self.assertEqual(calls, [])
 
@@ -1809,8 +1807,8 @@ class DeregisterTest(unittest.TestCase):
 
         out = io.StringIO()
         with (
-            mock.patch("reconcile.ix_runners.github_api", api),
-            mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+            mock.patch("reconcile.github.github_api", api),
+            mock.patch("reconcile.github.DEREGISTER_PAUSE", 0.0),
             contextlib.redirect_stdout(out),
         ):
             self.assertFalse(deregister_member("pat", "r", runners, "baml", 1))
@@ -1825,7 +1823,7 @@ class DeregisterTest(unittest.TestCase):
         def api(pat, repo, path, *, method="GET"):
             raise http_error(422, "You have exceeded a secondary rate limit")
 
-        with mock.patch("reconcile.ix_runners.github_api", api):
+        with mock.patch("reconcile.github.github_api", api):
             with self.assertRaises(RuntimeError) as caught:
                 deregister_member("pat", "r", runners, "baml", 1)
         # It raises (a failure, not a defer) and names the status and runner,
@@ -1842,8 +1840,8 @@ class DeregisterTest(unittest.TestCase):
             raise http_error(404, "Not Found")
 
         with (
-            mock.patch("reconcile.ix_runners.github_api", api),
-            mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+            mock.patch("reconcile.github.github_api", api),
+            mock.patch("reconcile.github.DEREGISTER_PAUSE", 0.0),
         ):
             self.assertTrue(deregister_member("pat", "r", runners, "baml", 1))
 
@@ -1901,6 +1899,104 @@ class HostedRunnerTest(unittest.TestCase):
             clear=True,
         ):
             require_hosted_runner()
+
+
+class ConfigTest(unittest.TestCase):
+    """The knob surface, resolved once and validated as a whole."""
+
+    def load(self, env):
+        with mock.patch.dict("os.environ", env, clear=True):
+            return Config.from_env()
+
+    def test_defaults_leave_autoscaling_off(self):
+        # min_warm defaults to the pool size, so the floor meets the ceiling
+        # and demand cannot move the answer. This is what makes adopting the
+        # scaler a no-op until somebody dials it down.
+        config = self.load(ENV | {"POOL_SIZE": "8"})
+        self.assertEqual((config.min_warm, config.max_online), (8, 8))
+        self.assertFalse(config.autoscaling)
+
+    def test_a_refusal_is_what_turns_scaling_off(self):
+        # `autoscaling` is DERIVED from the range rather than being a second
+        # flag that has to be kept in step with it, so collapsing the range
+        # is the whole of switching scaling off. If that ever stops being
+        # true, a refused config keeps scaling with the operator's numbers.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            config = self.load(
+                {k: v for k, v in (AUTO_ENV | {"MIN_WARM": "2", "MAX_ONLINE": "4"}).items()
+                 if k != "RUNNER_LABEL"}
+            )
+        self.assertTrue(config.refusals)
+        self.assertFalse(config.autoscaling)
+        self.assertEqual((config.min_warm, config.max_online), (6, 6))
+        self.assertIn("::error::", out.getvalue())
+
+    def test_an_impossible_range_is_refused_before_the_label_is_blamed(self):
+        # Reporting "no RUNNER_LABEL" for a config whose real problem is an
+        # inverted range sends the reader to the wrong knob.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            config = self.load(AUTO_ENV | {"MIN_WARM": "4", "MAX_ONLINE": "2"})
+        self.assertEqual(len(config.refusals), 1)
+        self.assertIn("MIN_WARM", config.refusals[0])
+
+    def test_the_tick_mode_follows_the_trigger(self):
+        for event, mode in [
+            ("schedule", "scheduled"),
+            ("workflow_dispatch", "scheduled"),
+            ("workflow_run", "event"),
+            ("push", "event"),
+        ]:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    self.load(ENV | {"GITHUB_EVENT_NAME": event}).tick_mode, mode
+                )
+
+    def test_secrets_are_not_carried_on_the_config(self):
+        # A dataclass has a repr and a repr ends up in tracebacks. The admin
+        # PAT and the workflow token are passed separately for that reason.
+        config = self.load(ENV)
+        rendered = repr(config)
+        self.assertNotIn(ENV["RUNNER_PAT"], rendered)
+        self.assertNotIn(ENV["IX_TOKEN"], rendered)
+
+
+class EntrypointTest(unittest.TestCase):
+    """The file the composite action actually runs.
+
+    Nothing else in this suite touches it: the tests import the package
+    directly, so a broken entrypoint would be invisible here and visible in
+    production, holding a repo-admin PAT. It resolves the package by putting
+    its own PARENT on sys.path, which is exactly the kind of thing that
+    works from the repo root and fails from anywhere else - so this runs it
+    from an unrelated directory, as Actions does.
+    """
+
+    def run_entrypoint(self, cwd, env):
+        script = pathlib.Path(__file__).resolve().parent.parent / "ix-runners"
+        return subprocess.run(
+            [sys.executable, str(script)],
+            cwd=cwd,
+            env={"PATH": os.environ.get("PATH", ""), **env},
+            capture_output=True,
+            text=True,
+        )
+
+    def test_the_entrypoint_imports_and_reaches_main(self):
+        # Refusing a non-hosted runner is the FIRST thing main does, so
+        # seeing that refusal proves the whole import chain resolved and
+        # main() ran - without needing the SDK, which is x86_64-only.
+        for cwd in ("/", tempfile.gettempdir()):
+            with self.subTest(cwd=cwd):
+                done = self.run_entrypoint(cwd, {})
+                self.assertIn("not 'github-hosted'", done.stdout)
+
+    def test_the_entrypoint_gets_past_the_gate_with_a_hosted_runner(self):
+        # One step further in, so a package that imports but is missing a
+        # name cannot pass the test above by refusing early.
+        done = self.run_entrypoint("/", {"RUNNER_ENVIRONMENT": "github-hosted"})
+        self.assertIn("IX_TOKEN is required", done.stdout + done.stderr)
 
 
 class MainTest(unittest.TestCase):
