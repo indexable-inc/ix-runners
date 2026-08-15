@@ -47,6 +47,7 @@ let
   idx = toString poolIndex;
   runnerNames = map (i: "${cfg.poolName}-r${idx}-${toString i}") (range 1 cfg.slots);
   runnerUnits = map (name: "github-runner-${name}") runnerNames;
+  tokenPermsUnit = "ix-runner-token-perms";
 
   # One UNIX user per slot, named after the slot. A shared uid would make the
   # per-slot HOME/TMPDIR cosmetic: any job could read a co-tenant slot's
@@ -390,8 +391,44 @@ in
       # at create, so it is present from the first boot.
       genAttrs runnerUnits (_: {
         unitConfig.ConditionPathExists = cfg.tokenFile;
+        # Requires, not just After: an ordering edge alone would let the
+        # slots start anyway when the permission check fails. A check that
+        # condition-skips (no token) still satisfies this.
+        requires = [ "${tokenPermsUnit}.service" ];
+        after = [ "${tokenPermsUnit}.service" ];
       })
       // {
+        # The registration token is delivered root-only by the platform; a
+        # job-readable one would let any slot re-register this whole pool
+        # somewhere else, so verify rather than trust. Refusing here keeps
+        # the slots down instead of starting them around a leaked secret.
+        ${tokenPermsUnit} = {
+          description = "verify the runner registration token is root-only";
+          wantedBy = [ "multi-user.target" ];
+          before = map (unit: "${unit}.service") runnerUnits;
+          # Same skip-not-fail contract as the runner units: a boot without
+          # the secret switches cleanly.
+          unitConfig.ConditionPathExists = cfg.tokenFile;
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = pkgs.writeShellScript "ix-runner-token-perms" ''
+              set -euo pipefail
+              perms=$(${pkgs.coreutils}/bin/stat -c '%U %G %a' ${cfg.tokenFile})
+              case "$perms" in
+                'root root 600' | 'root root 400') ;;
+                *)
+                  echo "REFUSING TO START THE RUNNER POOL: ${cfg.tokenFile} is [$perms]," >&2
+                  echo "expected [root root 600] (or 400). The GitHub registration token must be" >&2
+                  echo "readable by root only - anything else exposes it to job code, which can" >&2
+                  echo "then register runners for this repository on any machine it controls." >&2
+                  exit 1
+                  ;;
+              esac
+            '';
+          };
+        };
+
         # /tmp is a tmpfs sized off BOOT-time RAM (1.5G observed, 100% full
         # under concurrent jobs) and closure tmpfs settings do not reach
         # image boots - a live remount does (ix platform, see issue #2).
