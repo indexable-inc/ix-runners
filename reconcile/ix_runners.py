@@ -1,12 +1,13 @@
 """Reconcile the self-hosted ix runner pool to this repo's runner config.
 
-Runs from CI on GITHUB-HOSTED runners only (never self-hosted: a runner VM
-must never see IX_TOKEN) - refused at startup, see require_hosted_runner.
-Secrets: IX_TOKEN (the ix account the VMs bill
-to), RUNNER_PAT (fine-grained, "administration" repo rw). The PAT never
-leaves that runner: it mints SHORT-LIVED (1 h) registration tokens and
-reads runner status; a VM only ever receives a registration token, which
-can do nothing but register a runner and is dead within the hour.
+Runs from CI on GITHUB-HOSTED runners only - never self-hosted, since a
+runner VM must never see IX_TOKEN, and require_hosted_runner refuses at
+startup rather than trusting the caller. Secrets: IX_TOKEN (the ix account
+the VMs bill to), RUNNER_PAT (fine-grained, "administration" repo rw). The
+PAT never leaves that runner: it mints SHORT-LIVED (1 h) registration tokens
+and reads runner status, over a host-pinned, redirect-refusing opener; a VM
+only ever receives a registration token, which can do nothing but register a
+runner and is dead within the hour.
 
 Provisioning is pure ix Python SDK (ix-sdk on PyPI, pinned in the
 entrypoint's inline metadata) - no CLI, no output parsing. The
