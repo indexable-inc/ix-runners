@@ -348,6 +348,15 @@ in
         # and pid namespaces. The VM is the isolation boundary here.
         RestrictNamespaces = mkForce false;
         PrivateUsers = mkForce false;
+        # ... and the sandbox setup also drops capabilities via capset, which
+        # upstream's SystemCallFilter denies: every renderer died SIGSYS
+        # (kernel audit type=1326, syscall 126) - "Target crashed" /
+        # "browser has been closed" in every vitest browser suite, while the
+        # same chromium ran clean outside the unit. Arbitrary job toolchains
+        # cannot run under a daemon-grade syscall policy; same boundary
+        # argument as above.
+        SystemCallFilter = mkForce [ ];
+        NoNewPrivileges = mkForce false;
         # dockerd resolves `-v /tmp/...` in the host namespace, so a private
         # /tmp silently hands the container an empty directory. The VM is the
         # boundary, and TMPDIR points elsewhere anyway.
