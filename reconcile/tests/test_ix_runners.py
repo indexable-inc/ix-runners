@@ -3,18 +3,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import email.message
+import http.server
 import io
 import json
 import subprocess
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from unittest import mock
 
 from reconcile.ix_runners import (
+    OPENER,
+    api_url,
     deregister_member,
     desired_rev,
     extra_members,
+    github_api,
     list_runners,
     main,
     member_online,
@@ -709,6 +715,113 @@ class DesiredRevTest(unittest.TestCase):
             "reconcile.ix_runners.subprocess.run", self.fake_git("false", REV)
         ):
             self.assertEqual(desired_rev(), REV)
+
+
+class GithubApiTest(unittest.TestCase):
+    """RUNNER_PAT carries Administration rw - repo takeover. Every rule here
+    is about it never reaching a host that is not GitHub."""
+
+    def test_the_base_is_pinned_whatever_the_environment_says(self):
+        # $GITHUB_ENV lets any earlier step in the caller's job rewrite
+        # GITHUB_API_URL, which would aim the Bearer PAT at its own host.
+        with mock.patch.dict(
+            "os.environ", {"GITHUB_API_URL": "https://evil.example"}, clear=True
+        ):
+            self.assertEqual(
+                api_url("example/baml", "/actions/runners"),
+                "https://api.github.com/repos/example/baml/actions/runners",
+            )
+
+    def test_ghes_opts_in_to_its_own_https_base(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "GITHUB_API_URL": "https://ghe.example/api/v3",
+                "IX_RUNNERS_ALLOW_NON_HOSTED": "1",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                api_url("example/baml", "/x"),
+                "https://ghe.example/api/v3/repos/example/baml/x",
+            )
+
+    def test_a_non_https_base_is_refused(self):
+        out = io.StringIO()
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "GITHUB_API_URL": "http://evil.example",
+                    "IX_RUNNERS_ALLOW_NON_HOSTED": "1",
+                },
+                clear=True,
+            ),
+            contextlib.redirect_stdout(out),
+        ):
+            with self.assertRaises(SystemExit):
+                api_url("example/baml", "/x")
+        self.assertIn("::error::", out.getvalue())
+
+    def test_every_call_goes_through_the_no_redirect_opener(self):
+        # urlopen uses the default opener, which follows redirects: reaching
+        # for it bypasses the refusal entirely.
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b"{}"
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("reconcile.ix_runners.OPENER", opener),
+        ):
+            self.assertEqual(github_api("pat", "example/baml", "/x"), {})
+        request = opener.open.call_args.args[0]
+        self.assertEqual(
+            request.full_url, "https://api.github.com/repos/example/baml/x"
+        )
+
+    def test_a_redirect_is_reported_as_a_refusal(self):
+        opener = mock.MagicMock()
+        opener.open.side_effect = http_error(302, "Found")
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("reconcile.ix_runners.OPENER", opener),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                github_api("pat", "example/baml", "/x")
+        self.assertIn("redirect", str(caught.exception))
+
+    def test_a_redirect_is_never_followed_and_the_pat_is_not_resent(self):
+        # urllib keeps the Authorization header across a 30x, unlike requests
+        # and urllib3: one redirect would hand the PAT to the Location host.
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/redirect",
+            headers={"Authorization": "Bearer PAT"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            OPENER.open(request, timeout=5)
+        self.assertEqual(caught.exception.code, 302)
+        self.assertEqual(hits, ["/redirect"])
 
 
 class DeregisterTest(unittest.TestCase):

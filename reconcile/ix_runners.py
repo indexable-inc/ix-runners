@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -113,21 +114,93 @@ def error_body(error: urllib.error.HTTPError) -> str:
         return ""
 
 
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect on a PAT-bearing request.
+
+    urllib keeps the Authorization header across a 30x (requests and urllib3
+    strip it on a cross-host hop; urllib does not), so one redirect on any of
+    these calls hands RUNNER_PAT - Administration rw, which is repo takeover -
+    to whatever host the Location names. None of the endpoints we call
+    legitimately redirects.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # None means "not handled": urllib then raises the 30x as an HTTPError
+        # instead of chasing it, which github_api turns into a clear failure.
+        return None
+
+
+# One opener for every GitHub call, so the refusal cannot be bypassed by
+# reaching for urlopen (which uses the default, redirect-following opener).
+OPENER = urllib.request.build_opener(RefuseRedirects)
+GITHUB_API_DEFAULT = "https://api.github.com"
+
+
+def api_base() -> str:
+    """The GitHub REST base URL, pinned to api.github.com.
+
+    GITHUB_API_URL is only an environment variable, and any earlier step in
+    the caller's job can rewrite the environment through $GITHUB_ENV: honored
+    unconditionally, it aims the Bearer PAT at a host of that step's
+    choosing. On github.com the value is always api.github.com, so pinning it
+    costs nothing. A GHES/ARC deployment is exactly the deployment that
+    already had to set IX_RUNNERS_ALLOW_NON_HOSTED, so its base is honored
+    there - https only.
+    """
+    if os.environ.get("IX_RUNNERS_ALLOW_NON_HOSTED") == "1":
+        return (os.environ.get("GITHUB_API_URL") or GITHUB_API_DEFAULT).rstrip("/")
+    return GITHUB_API_DEFAULT
+
+
+def api_url(repo: str, path: str) -> str:
+    """The absolute REST URL for a repo path, with the host pinned.
+
+    The resolved request host must be exactly the base's: nothing assembled
+    from a repo name or a path may move a PAT-bearing call to another host.
+    """
+    base = api_base()
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme != "https" or not parsed.hostname:
+        log_error(
+            f"GITHUB_API_URL is {base!r}, which is not an https URL."
+            " Refusing to send RUNNER_PAT to it."
+        )
+        raise SystemExit(1)
+    url = f"{base}/repos/{repo}{path}"
+    resolved = urllib.parse.urlsplit(url)
+    if resolved.scheme != parsed.scheme or resolved.netloc != parsed.netloc:
+        log_error(
+            f"a GitHub API request resolved to {resolved.scheme}://{resolved.netloc},"
+            f" not the configured {parsed.scheme}://{parsed.netloc}."
+            " Refusing to send RUNNER_PAT to it."
+        )
+        raise SystemExit(1)
+    return url
+
+
 def github_api(
     pat: str, repo: str, path: str, *, method: str = "GET"
 ) -> dict[str, Any]:
     """Call the GitHub REST API with the PAT; return the parsed JSON body."""
-    api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
     request = urllib.request.Request(
-        f"{api}/repos/{repo}{path}",
+        api_url(repo, path),
         method=method,
         headers={"Authorization": f"Bearer {pat}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with OPENER.open(request, timeout=30) as response:
             body = response.read()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as error:
+        # A 30x reaches here because RefuseRedirects declined it; say why,
+        # rather than leaving a bare "HTTP Error 302" in the log.
+        if 300 <= error.code < 400:
+            raise RuntimeError(
+                f"GitHub answered {method} {path} with HTTP {error.code}, a"
+                " redirect. Refusing to follow it: urllib re-sends the"
+                " Authorization header, which would hand RUNNER_PAT to the"
+                " redirect target."
+            ) from error
         # Fine-grained PATs expire, and the whole reconcile is dead until one
         # is minted again; say that, rather than leaving a bare 401 in a log.
         if error.code == 401:
