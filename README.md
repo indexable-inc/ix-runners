@@ -154,7 +154,32 @@ what happened to each member.
   hunting a status code.
 - Machines are disposable by design and rev-anchored: a hand-edited or
   wedged VM converges away on the next reconcile.
+- The runners are persistent and shared across jobs: any job that runs on
+  the pool owns the machine and its warm state (caches, toolchains) until the
+  reconcile replaces it. Point only trusted events at the pool's labels -
+  never `pull_request` from forks on a public repo, and gate
+  `workflow_dispatch`-driven runs the same way.
+- Persistent-not-ephemeral is deliberate: warm toolchains and compile caches
+  are the product. If you want per-job isolation (ARC-style ephemeral
+  runners), this is not that tool.
 - Everything that runs your CI is in this repository, readable.
+
+## What differs from ubuntu-latest
+
+The runner VM is NixOS, tuned for parity where it is cheap and honest where
+it is not:
+
+- Foreign dynamically linked binaries (rustup/mise toolchains, prebuilt
+  node, playwright browsers) run via nix-ld + envfs with a generous library
+  set; a missing library fails at load time - file an issue, additions are
+  one line.
+- No sudo: the job user cannot elevate (`NoNewPrivileges`). Install into
+  `$HOME` or ship the package in the pool's nix policy instead.
+- `$HOME` is per-slot and persists across jobs and reboots; the checkout
+  directory is wiped on every runner restart.
+- Preinstalled tooling comes from the pool's nix policy, not from a hosted
+  image: anything a job expects "to just be there" (Go, docker, protoc)
+  must be listed there.
 
 ## Development
 
