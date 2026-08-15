@@ -4,6 +4,9 @@ description: >
   create missing members, repair offline ones, replace stale or dead ones.
   Run on GITHUB-HOSTED runners only - a runner VM must never see IX_TOKEN.
 
+# Every input below defaults to empty on purpose: the reconcile script owns
+# the default values, so they cannot drift between here and there. The value
+# each one falls back to is named in its description.
 inputs:
   ix-token:
     description: ix API token the runner VMs bill to
@@ -15,30 +18,47 @@ inputs:
       reads runner status; VMs only ever receive a registration token.
     required: true
   region:
-    description: ix region the pool lives in
-    default: us-west-1
+    description: ix region the pool lives in (default us-west-1)
+    default: ""
+  pool-name:
+    description: >
+      Pool name; everything derives from it (VM names <pool>-runner-<N>,
+      runner names <pool>-r<N>-<slot>, the secret key). MUST equal the
+      `services.ix-runner.poolName` in your nix policy. Defaults to this
+      repository's name.
+    default: ""
+  attr-prefix:
+    description: >
+      Flake attribute prefix for pool members, `<prefix>-<N>`. Must equal
+      mkPool's attrPrefix (default ci-runner).
+    default: ""
   pool-size:
-    description: Number of pool VMs (must match the flake's mkPool size)
-    default: "8"
+    description: >
+      Number of pool VMs; must match the flake's mkPool size (default 8).
+      Lowering it prunes the members above the new size.
+    default: ""
   max-replacements:
     description: >
-      Per-run cap on creations+replacements. A bad config rev stalls loudly
-      after N boots instead of thrashing the pool; a config roll converges
-      across runs like a rolling update. Raise for first bootstrap.
-    default: "2"
+      Per-run cap on creations+replacements (default 2). A bad config rev
+      stalls loudly after N boots instead of thrashing the pool; a config
+      roll converges across runs like a rolling update. An empty pool
+      raises the cap to pool-size on its own.
+    default: ""
   concurrency:
     description: >
-      Creations/replacements executed at once. Guest boots dominate a
-      roll's wall clock and overlap safely; each concurrent first boot of a
-      new rev is also a concurrent template build, so keep this within the
-      region's build appetite.
-    default: "4"
+      Creations/replacements executed at once (default 4). Guest boots
+      dominate a roll's wall clock and overlap safely; each concurrent
+      first boot of a new rev is also a concurrent template build, so keep
+      this within the region's build appetite.
+    default: ""
 
 runs:
   using: composite
   steps:
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      # Pinned by commit: this job holds both secrets, so a mutable tag here
+      # is a supply-chain hole straight into IX_TOKEN and RUNNER_PAT.
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
     - name: Reconcile runner pool
       shell: bash
@@ -46,7 +66,11 @@ runs:
         IX_TOKEN: ${{ inputs.ix-token }}
         RUNNER_PAT: ${{ inputs.runner-pat }}
         IX_REGION: ${{ inputs.region }}
+        POOL_NAME: ${{ inputs.pool-name }}
+        ATTR_PREFIX: ${{ inputs.attr-prefix }}
         POOL_SIZE: ${{ inputs.pool-size }}
         MAX_REPLACEMENTS: ${{ inputs.max-replacements }}
         CONCURRENCY: ${{ inputs.concurrency }}
-      run: ${{ github.action_path }}/reconcile/ix-runners
+      # --locked: install exactly the hash-pinned ix-sdk in ix-runners.lock,
+      # never whatever the index resolves to today.
+      run: uv run --locked --script "${{ github.action_path }}/reconcile/ix-runners"
