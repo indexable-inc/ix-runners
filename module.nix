@@ -179,6 +179,16 @@ in
         # need; see also the sysctl pins below.
         TasksMax = "infinity";
         LimitNPROC = "infinity";
+        # Per-slot fairness: without an explicit weight the cpu/io
+        # controllers stay off and threads compete GLOBALLY, so one job
+        # spawning hundreds of compiler threads starves a co-tenant slot's
+        # few threads for whole seconds (observed live: upstream-green
+        # wall-clock test bounds missed only under slot contention).
+        # Equal weights guarantee every busy slot its 1/slots share of the
+        # guest - the dedicated-runner envelope jobs were tuned for - while
+        # a lone job still bursts to every vCPU the guest advertises.
+        CPUWeight = "100";
+        IOWeight = "100";
         Environment = [
           # Disk-backed job temp, off the small boot-path /tmp (issue #2);
           # wiped by the tmpfiles age rule below.
