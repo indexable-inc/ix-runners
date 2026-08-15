@@ -8,8 +8,12 @@
 #
 # Design: the VM is PERSISTENT. Jobs run directly on the host, so everything
 # the first run pays for - mise toolchains, rustup, ~/.cargo registry,
-# sccache - stays warm for every later run. That persistence is the entire
-# point vs stateless runners; do not make these runners ephemeral. Foreign
+# sccache - stays warm for every later run. That warmth lives in a per-slot
+# HOME under /var/lib/ix-runner-home, which nothing in the boot or restart
+# path clears: the upstream unit wipes its workDir on EVERY start, so a cache
+# under HOME=workDir (the upstream default) would survive nothing, not even
+# the reconcile restarting a slot. That persistence is the entire point vs
+# stateless runners; do not make these runners ephemeral. Foreign
 # dynamically-linked FHS binaries (mise, rustup toolchains, prebuilt node,
 # cargo-binstall downloads) run unmodified via nix-ld + envfs.
 {
@@ -21,36 +25,50 @@
 }:
 let
   inherit (lib)
+    genAttrs
+    makeOverridable
     mkDefault
     mkEnableOption
+    mkForce
     mkIf
     mkOption
+    range
     types
     ;
   cfg = config.services.ix-runner;
   idx = toString poolIndex;
-  runnerNames = map (i: "${cfg.poolName}-r${idx}-${toString i}") (lib.range 1 cfg.slots);
+  runnerNames = map (i: "${cfg.poolName}-r${idx}-${toString i}") (range 1 cfg.slots);
+  runnerUnits = map (name: "github-runner-${name}") runnerNames;
 
-  # The Ubuntu-ish userland FHS-assuming job steps expect on PATH. Jobs
-  # inherit the runner UNIT's PATH - on image-booted template guests
-  # /run/current-system/sw/bin is empty (ix platform, see issue #1), so
-  # systemPackages alone never reaches job steps.
-  basePackages = with pkgs; [
+  # Per-slot, off the workDir the upstream unit wipes on every start.
+  homeOf = name: "/var/lib/ix-runner-home/${name}";
+  tmpOf = name: "/var/lib/ix-runner-tmp/${name}";
+
+  # Already on the upstream unit's PATH (bashInteractive coreutils git gnutar
+  # gzip), so job steps get them without us re-listing them per runner.
+  upstreamUnitPackages = with pkgs; [
     bashInteractive
     coreutils
+    git
+    gnutar
+    gzip
+  ];
+
+  # The rest of the Ubuntu-ish userland FHS-assuming job steps expect on PATH.
+  # Jobs inherit the runner UNIT's PATH - on image-booted template guests
+  # /run/current-system/sw/bin is empty (ix platform, see issue #1), so
+  # systemPackages alone never reaches job steps.
+  extraUserland = with pkgs; [
     findutils
     gnugrep
     gnused
     gawk
     which
     file
-    git
     curl
     wget
     jq
     rsync
-    gnutar
-    gzip
     unzip
     zip
     zstd
@@ -58,53 +76,86 @@ let
     bzip2
   ];
 
+  basePackages = upstreamUnitPackages ++ extraUserland;
+
+  # nix-ld exports these through environment.sessionVariables, which rides PAM
+  # and therefore never reaches a system unit; without them the loader falls
+  # back to its compiled-in /run/current-system/sw path, the very tree issue #1
+  # says is unreliable at unit start. Same values, resolved to the store.
+  nixLdEnvironment = {
+    NIX_LD = "${config.system.path}/share/nix-ld/lib/ld.so";
+    NIX_LD_LIBRARY_PATH = "${config.system.path}/share/nix-ld/lib";
+  };
+
   # GitHub's runner hardcodes node20 as its internal runtime; nixpkgs ships
   # node24 only (node20 is EOL), which breaks every hashFiles() expression.
   # Serve node24 under the node20 name inside a copied package: a copy keeps
   # the binary-cache hit (an override would rebuild the runner from source),
-  # and the bin-wrapper rewrite makes the copy the runner's root so it finds
+  # and the base-path rewrite makes the copy the runner's root so it finds
   # the shim. makeOverridable because the NixOS module calls `pkg.override`.
-  runnerPackage = lib.makeOverridable (
+  runnerPackage = makeOverridable (
     {
       nodeRuntimes ? [ "node24" ],
     }:
     let
       base = pkgs.github-runner.override { inherit nodeRuntimes; };
     in
-    pkgs.runCommand "github-runner-with-node20" { } ''
-      cp -a ${base} $out
-      chmod -R u+w $out
-      for f in $out/bin/*; do
-        sed -i "s|${base}|$out|g" "$f"
-      done
-      ln -sfn ${pkgs.nodejs_24} $out/lib/externals/node20
-    ''
+    pkgs.runCommand "github-runner-with-node20"
+      {
+        # A local copy of an already-substituted closure: shipping it through a
+        # remote builder and a cache costs more than the `cp` it replaces.
+        preferLocalBuild = true;
+        allowSubstitutes = false;
+      }
+      ''
+        cp -a ${base} $out
+        chmod -R u+w $out
+        # Every reference, not just $out/bin: one missed path sends the runner
+        # back into ${base}, where lib/externals/node20 does not exist.
+        grep -rlIZ -- "${base}" $out | xargs -0r sed -i "s|${base}|$out|g" \
+          || { echo "rewriting ${base} references failed (nothing matched, or sed did)" >&2; exit 1; }
+        if grep -rqI -- "${base}" $out; then
+          echo "github-runner copy still references ${base}" >&2
+          exit 1
+        fi
+        ln -sfn ${pkgs.nodejs_24} $out/lib/externals/node20
+        # A nixpkgs layout change must fail the build here, not at hashFiles().
+        test -x $out/lib/externals/node20/bin/node \
+          || { echo "no node20 shim at $out/lib/externals/node20/bin/node" >&2; exit 1; }
+      ''
   ) { };
 in
 {
   options.services.ix-runner = {
-    enable = mkEnableOption "persistent GitHub Actions runner pool on this ix VM";
+    enable = mkEnableOption "the persistent GitHub Actions runner pool on this ix VM";
 
     url = mkOption {
       type = types.str;
+      example = "https://github.com/indexable-inc/ix-runners";
       description = "Repository URL the runners register against.";
     };
 
     poolName = mkOption {
       type = types.str;
+      example = "ix-runners";
       description = ''
         Pool name, usually the repository name. Everything derives from it:
         VM hostname `<poolName>-runner-<N>`, runner names
         `<poolName>-r<N>-<slot>`. Runner names must be unique fleet-wide -
         GitHub rejects duplicates, and `replace = true` would otherwise let
-        one VM silently steal another's registration.
+        one VM silently steal another's registration. Must be hostname-safe.
       '';
     };
 
     slots = mkOption {
       type = types.ints.positive;
       default = 4;
-      description = "Runner daemons on this VM = concurrent job slots.";
+      description = ''
+        Runner daemons on this VM = concurrent job slots. Growing this is
+        safe; shrinking it leaves the removed slots registered on GitHub as
+        permanently offline runners, which must be deleted by hand (or by
+        replacing the VM, which deregisters everything it registered).
+      '';
     };
 
     labels = mkOption {
@@ -124,6 +175,13 @@ in
         only happens at configure time, so nothing long-lived sits on the
         VM. Units condition-skip while the file is absent, so a boot
         without the secret still switches cleanly.
+
+        The file must exist with UNCHANGED content for the whole life of the
+        VM. The upstream unit purges runner state and re-registers whenever
+        the token content or any registration input (url, labels, name,
+        workDir) changes, and by then the 1 h token has expired, so the slot
+        cannot come back. Reconfiguring a live runner VM is therefore
+        unsupported: replace the VM instead.
       '';
     };
 
@@ -145,60 +203,100 @@ in
     };
 
     jobEnvironment = mkOption {
-      type = types.listOf types.str;
-      default = [ ];
-      description = "Extra Environment= lines for every runner unit.";
+      type = types.attrsOf types.str;
+      default = { };
+      example = {
+        CARGO_INCREMENTAL = "0";
+      };
+      description = "Extra environment variables set for every runner unit, and so for every job step.";
     };
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?" cfg.poolName != null;
+        message = ''
+          services.ix-runner.poolName is "${cfg.poolName}", which is not
+          hostname-safe. It becomes this VM's hostname and every runner name,
+          so it must be lowercase alphanumerics and hyphens, starting and
+          ending with an alphanumeric.
+        '';
+      }
+    ];
+
     networking.hostName = mkDefault "${cfg.poolName}-runner-${idx}";
 
-    services.github-runners = lib.genAttrs runnerNames (name: {
+    services.github-runners = genAttrs runnerNames (name: {
       enable = true;
       package = runnerPackage;
       inherit (cfg) url tokenFile;
       # Persistence is the point (see header).
       ephemeral = false;
       replace = true;
-      # Persistent disk, not the module's /run tmpfs default: checkouts and
-      # target dirs live here between jobs; HOME carries the caches.
+      # Persistent disk, not the module's /run tmpfs default: the checkout and
+      # its build outputs live here. Only the checkout - upstream wipes this
+      # directory on every service start, so caches live in HOME instead.
       workDir = "/var/lib/ix-runner-work/${name}";
       extraLabels = cfg.labels;
-      extraPackages = basePackages ++ cfg.extraPackages;
+      extraPackages = extraUserland ++ cfg.extraPackages;
       user = "ci-runner";
       group = "ci-runner";
+      extraEnvironment = {
+        # Upstream defaults HOME to workDir, which it wipes on every start;
+        # a warm toolchain/registry cache needs a directory nothing clears.
+        HOME = homeOf name;
+        # Disk-backed job temp, off the small boot-path /tmp (issue #2);
+        # aged out by the tmpfiles rule below.
+        TMPDIR = tmpOf name;
+      }
+      // nixLdEnvironment
+      // cfg.jobEnvironment;
       serviceOverrides = {
-        # A stable writable HOME keeps toolchains and caches warm across
-        # runs; the nixpkgs unit hardens it away.
-        DynamicUser = lib.mkForce false;
-        ProtectHome = lib.mkForce false;
-        # ProtectSystem=strict: the shared TMPDIR must stay writable.
-        ReadWritePaths = [ "/var/lib/ix-runner-tmp" ];
-        # Defaults cap thread creation below what concurrent build jobs
-        # need; see also the sysctl pins below.
-        TasksMax = "infinity";
+        # ProtectHome=true masks /home entirely, and tooling that resolves ~
+        # from passwd rather than $HOME lands in /home/ci-runner.
+        ProtectHome = mkForce false;
+        # ProtectSystem=strict: this slot's HOME and TMPDIR must stay
+        # writable (upstream already BindPaths= its workDir).
+        ReadWritePaths = [
+          (homeOf name)
+          (tmpOf name)
+        ];
+        # The kernel OOM-killing one compiler process must not take the slot
+        # down with it; systemd's default stop policy plus upstream's
+        # Restart="no" for non-ephemeral runners made that permanent, and
+        # invisibly so - the reconcile reads any-slot-online as healthy.
+        OOMPolicy = "continue";
+        Restart = mkForce "always";
+        RestartSec = "10s";
+        # Hosted runners give jobs 65536; the systemd default is 1024.
+        LimitNOFILE = 1048576;
+        # One runaway job must not exhaust system PIDs and take the
+        # co-tenant slots with it. LimitNPROC is per-UID and every slot runs
+        # as ci-runner, so it cannot bound a single slot - TasksMax can.
+        TasksMax = 65536;
         LimitNPROC = "infinity";
-        # Per-slot fairness: without an explicit weight the cpu/io
-        # controllers stay off and threads compete GLOBALLY, so one job
-        # spawning hundreds of compiler threads starves a co-tenant slot's
-        # few threads for whole seconds (observed live: upstream-green
-        # wall-clock test bounds missed only under slot contention).
-        # Equal weights guarantee every busy slot its 1/slots share of the
-        # guest - the dedicated-runner envelope jobs were tuned for - while
-        # a lone job still bursts to every vCPU the guest advertises.
+        # Turns the cpu controller ON for the slice, so busy slots get fair
+        # shares instead of competing globally (observed live: upstream-green
+        # wall-clock test bounds missed only under slot contention). 100 is
+        # systemd's default weight - this line is here for the controller,
+        # not for the number.
         CPUWeight = "100";
-        IOWeight = "100";
-        Environment = [
-          # Disk-backed job temp, off the small boot-path /tmp (issue #2);
-          # wiped by the tmpfiles age rule below.
-          "TMPDIR=/var/lib/ix-runner-tmp"
-        ]
-        ++ cfg.jobEnvironment;
+        # Hosted-runner parity: 0066 leaves job artifacts unreadable to other
+        # UIDs, which breaks containers and bind mounts reading the checkout.
+        UMask = "0022";
+        # chromium and playwright ship their own sandbox, which needs user
+        # and pid namespaces. The VM is the isolation boundary here.
+        RestrictNamespaces = mkForce false;
+        PrivateUsers = mkForce false;
+        # dockerd resolves `-v /tmp/...` in the host namespace, so a private
+        # /tmp silently hands the container an empty directory. The VM is the
+        # boundary, and TMPDIR points elsewhere anyway.
+        PrivateTmp = mkForce false;
       };
     });
 
-    environment.etc = lib.mkIf (cfg.configRev != null) {
+    environment.etc = mkIf (cfg.configRev != null) {
       "ix-runner/rev".text = cfg.configRev;
     };
 
@@ -212,16 +310,28 @@ in
     users.groups.ci-runner = { };
 
     systemd.tmpfiles.rules = [
+      # 0700 root: the reconcile's strike marker lives here, and job code
+      # must not be able to forge or clear it.
       "d /var/lib/ix-runner 0700 root root -"
-      "d /var/lib/ix-runner-tmp 1777 root root 3d"
+      "d /var/lib/ix-runner-home 0755 root root -"
+      "d /var/lib/ix-runner-tmp 0755 root root -"
     ]
-    ++ map (name: "d /var/lib/ix-runner-work/${name} 0750 ci-runner ci-runner -") runnerNames;
+    ++ map (name: "d /var/lib/ix-runner-work/${name} 0750 ci-runner ci-runner -") runnerNames
+    # Caches, so never aged out.
+    ++ map (name: "d ${homeOf name} 0700 ci-runner ci-runner -") runnerNames
+    # Per-slot rather than one shared 1777 dir: every slot runs as the same
+    # UID, so the sticky bit bought nothing, while per-slot dirs make a
+    # job's own cleanup step safe and bound what one leaking job fills.
+    ++ map (name: "d ${tmpOf name} 0700 ci-runner ci-runner 1d") runnerNames
+    # The runner's _diag logs (LogsDirectory=) are never rotated and this VM
+    # is long-lived. The dirs themselves are systemd's; only age the contents.
+    ++ map (name: "e /var/log/github-runner/${name} - - - 30d") runnerNames;
 
     systemd.services =
       # Without the token the units SKIP instead of FAIL: the first boot of a
       # fresh template rev switches cleanly. The reconcile attaches the token
       # at create, so it is present from the first boot.
-      lib.genAttrs (map (n: "github-runner-${n}") runnerNames) (_: {
+      genAttrs runnerUnits (_: {
         unitConfig.ConditionPathExists = cfg.tokenFile;
       })
       // {
@@ -233,7 +343,7 @@ in
         ix-runner-tmp-resize = {
           description = "resize the boot-path /tmp tmpfs";
           wantedBy = [ "multi-user.target" ];
-          before = map (n: "github-runner-${n}.service") runnerNames;
+          before = map (unit: "${unit}.service") runnerUnits;
           unitConfig.ConditionPathIsMountPoint = "/tmp";
           serviceConfig = {
             Type = "oneshot";
@@ -243,9 +353,6 @@ in
         };
       };
 
-    # /run defaults to 50% of BOOT-time RAM; ix VMs boot small and grow
-    # elastically. Virtual size: only used pages cost RAM.
-    boot.runSize = "16G";
     # kernel.threads-max (and the RLIMIT_NPROC default derived from it) is
     # computed from BOOT-time RAM and never recomputed when virtio-mem grows
     # the guest; concurrent cargo jobs seeing the elastic vCPU ceiling hit
@@ -254,7 +361,19 @@ in
       "kernel.threads-max" = 1048576;
       "kernel.pid_max" = 4194304;
     };
-    boot.tmp.cleanOnBoot = true;
+
+    # Guests boot small and grow elastically: a job that outruns virtio-mem
+    # should swap and slow down, not hard-OOM. Compressed swap also keeps
+    # resident (billed) RAM down between jobs.
+    zramSwap.enable = true;
+
+    # The store on a persistent VM only ever grows: every job's `nix build`
+    # output stays until something collects it.
+    nix.gc = {
+      automatic = true;
+      dates = "weekly";
+      options = "--delete-older-than 30d";
+    };
 
     programs.nix-ld = {
       enable = true;
@@ -265,36 +384,25 @@ in
       # replaces cost one runner-fleet debugging round per new binary.
       # Baseline: the community nix-ld set (wiki.nixos.org/wiki/Nix-ld)
       # minus desktop-app one-offs (SDL/game runtimes, gtk2/gnome2 legacy,
-      # EOL libpng12/glew110) plus the dotnet-runner set. The cost is image
-      # closure size only; the list dies when nixpkgs#354513 (nix-ld
-      # resolves against the whole system closure) lands.
+      # EOL libpng12/glew110) plus the dotnet-runner set, and minus what the
+      # nixos nix-ld module concatenates in on its own (zlib zstd
+      # stdenv.cc.cc curl openssl attr libssh bzip2 libxml2 acl libsodium
+      # util-linux xz systemd). The cost is image closure size only; the
+      # list dies when nixpkgs#354513 (nix-ld resolves against the whole
+      # system closure) lands.
       libraries = with pkgs; [
         # Core toolchain and compression
-        stdenv.cc.cc.lib # libstdc++
         libgcc
-        zlib
-        zstd
-        xz
-        bzip2
         libxcrypt
         libxcrypt-legacy
         gmp
         libelf
         # Crypto, TLS, network
-        openssl
-        curl
         expat
-        libxml2
-        libsodium
         libgcrypt
         libgpg-error
-        libssh
         krb5
         # System plumbing
-        attr
-        acl
-        util-linux # libuuid, libmount, libblkid
-        systemd # libudev
         dbus
         libcap
         libusb1
@@ -305,31 +413,31 @@ in
         lttng-ust
         libsecret
         # X11
-        xorg.libX11
-        xorg.libXext
-        xorg.libXcomposite
-        xorg.libXdamage
-        xorg.libXfixes
-        xorg.libXrandr
-        xorg.libXcursor
-        xorg.libXi
-        xorg.libXinerama
-        xorg.libXrender
-        xorg.libXScrnSaver
-        xorg.libXtst
-        xorg.libXt
-        xorg.libXmu
-        xorg.libXft
-        xorg.libSM
-        xorg.libICE
-        xorg.libxshmfence
-        xorg.libXxf86vm
-        xorg.libxcb
-        xorg.xcbutil
-        xorg.xcbutilwm
-        xorg.xcbutilimage
-        xorg.xcbutilkeysyms
-        xorg.xcbutilrenderutil
+        libx11
+        libxext
+        libxcomposite
+        libxdamage
+        libxfixes
+        libxrandr
+        libxcursor
+        libxi
+        libxinerama
+        libxrender
+        libxscrnsaver
+        libxtst
+        libxt
+        libxmu
+        libxft
+        libsm
+        libice
+        libxshmfence
+        libxxf86vm
+        libxcb
+        libxcb-util
+        libxcb-wm
+        libxcb-image
+        libxcb-keysyms
+        libxcb-render-util
         libxcb-cursor
         libxkbcommon
         # Graphics and rendering
@@ -393,10 +501,10 @@ in
         "nix-command"
         "flakes"
       ];
-      trusted-users = [
-        "root"
-        "ci-runner"
-      ];
+      # trusted-users is root-equivalent (it can point the daemon at any
+      # substituter or import any path). Job code runs as ci-runner on a
+      # machine that outlives the job, so it must not have it.
+      trusted-users = [ "root" ];
     };
   };
 }
