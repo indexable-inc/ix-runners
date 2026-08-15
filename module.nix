@@ -384,36 +384,25 @@ in
       # replaces cost one runner-fleet debugging round per new binary.
       # Baseline: the community nix-ld set (wiki.nixos.org/wiki/Nix-ld)
       # minus desktop-app one-offs (SDL/game runtimes, gtk2/gnome2 legacy,
-      # EOL libpng12/glew110) plus the dotnet-runner set. The cost is image
-      # closure size only; the list dies when nixpkgs#354513 (nix-ld
-      # resolves against the whole system closure) lands.
+      # EOL libpng12/glew110) plus the dotnet-runner set, and minus what the
+      # nixos nix-ld module concatenates in on its own (zlib zstd
+      # stdenv.cc.cc curl openssl attr libssh bzip2 libxml2 acl libsodium
+      # util-linux xz systemd). The cost is image closure size only; the
+      # list dies when nixpkgs#354513 (nix-ld resolves against the whole
+      # system closure) lands.
       libraries = with pkgs; [
         # Core toolchain and compression
-        stdenv.cc.cc.lib # libstdc++
         libgcc
-        zlib
-        zstd
-        xz
-        bzip2
         libxcrypt
         libxcrypt-legacy
         gmp
         libelf
         # Crypto, TLS, network
-        openssl
-        curl
         expat
-        libxml2
-        libsodium
         libgcrypt
         libgpg-error
-        libssh
         krb5
         # System plumbing
-        attr
-        acl
-        util-linux # libuuid, libmount, libblkid
-        systemd # libudev
         dbus
         libcap
         libusb1
