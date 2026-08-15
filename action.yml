@@ -14,12 +14,33 @@ inputs:
   ix-token:
     description: ix API token the runner VMs bill to
     required: true
+
+  # -- how this authenticates to GitHub to administer runners --
+  # A GitHub App, not a person. The installation token it mints is scoped to
+  # the installation, expires in an hour, and dies with the installation
+  # rather than with somebody's account.
+  github-app-id:
+    description: >
+      App ID of a GitHub App installed on this repo with Administration
+      read/write and Actions read. Not a secret - a repository variable is
+      the right home for it.
+    default: ""
+  github-app-private-key:
+    description: >
+      The App's private key (PEM). Never leaves the hosted runner: it is
+      exchanged for a 1-hour installation token that mints registration
+      tokens and reads runner status. A VM only ever receives a
+      registration token, which can do nothing but register a runner.
+    default: ""
+
   runner-pat:
     description: >
-      Fine-grained PAT, Administration rw on this repo. Never leaves the
-      hosted runner: it mints short-lived (1 h) registration tokens and
-      reads runner status; VMs only ever receive a registration token.
-    required: true
+      DEPRECATED, accepted for one release. Fine-grained PAT with
+      Administration rw on this repo, used when the App inputs are absent.
+      A PAT is bound to a person, outlives them on the repo, and carries
+      whatever else they granted it; the App path exists to end all three.
+      Migrate to github-app-id + github-app-private-key.
+    default: ""
   config-file:
     description: >
       Path to the pool spec, relative to the workspace. Defaults to
@@ -37,6 +58,45 @@ inputs:
 runs:
   using: composite
   steps:
+    # Fail before anything is created, and name both paths, rather than
+    # letting the reconcile die on a missing environment variable.
+    - name: Check the admin credential
+      shell: bash
+      env:
+        APP_ID: ${{ inputs.github-app-id }}
+        APP_KEY: ${{ inputs.github-app-private-key }}
+        PAT: ${{ inputs.runner-pat }}
+      run: |
+        if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+          exit 0
+        fi
+        if [ -n "$APP_ID" ] || [ -n "$APP_KEY" ]; then
+          echo "::error::github-app-id and github-app-private-key must be set together." >&2
+          exit 1
+        fi
+        if [ -n "$PAT" ]; then
+          echo "::warning::runner-pat is deprecated and will be removed in a" \
+               "future release. Create a GitHub App with Administration" \
+               "read/write and Actions read, then set github-app-id and" \
+               "github-app-private-key instead."
+          exit 0
+        fi
+        echo "::error::no admin credential: set github-app-id +" \
+             "github-app-private-key (preferred), or runner-pat." >&2
+        exit 1
+
+    - name: Mint an App installation token
+      id: app-token
+      if: inputs.github-app-id != ''
+      # Pinned by commit: this step turns a private key into a token with
+      # Administration rw on the repo, so a mutable tag here is a
+      # supply-chain hole into repo takeover. The action revokes the token in
+      # its own post step, so it never outlives this job.
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        app-id: ${{ inputs.github-app-id }}
+        private-key: ${{ inputs.github-app-private-key }}
+
     - name: Install uv
       # Pinned by commit: this job holds both secrets, so a mutable tag here
       # is a supply-chain hole straight into IX_TOKEN and RUNNER_PAT.
@@ -55,7 +115,10 @@ runs:
       shell: bash
       env:
         IX_TOKEN: ${{ inputs.ix-token }}
-        RUNNER_PAT: ${{ inputs.runner-pat }}
+        # The App token when there is one, else the deprecated PAT. The
+        # reconcile does not care which: an installation token is a bearer
+        # token, and every endpoint it calls accepts both.
+        GITHUB_ADMIN_TOKEN: ${{ steps.app-token.outputs.token || inputs.runner-pat }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         IX_POOL_SPEC: ${{ inputs.config-file }}
       # --locked: install exactly the hash-pinned ix-sdk in ix-runners.lock,

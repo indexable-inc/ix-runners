@@ -12,11 +12,26 @@ caches are the point. If you need per-job isolation, this is not that tool.
 
 Ten minutes, four steps.
 
-**1. Two Actions secrets.** `IX_TOKEN` (the ix account the VMs bill to) and
-`RUNNER_PAT` (a fine-grained PAT with Administration read/write on the repo).
-The built-in `GITHUB_TOKEN` cannot stand in for the PAT: workflow permissions
-have no `administration` scope, so it structurally cannot mint runner
-registration tokens.
+**1. A GitHub App and two secrets.** Create an App (owner-level, on the
+account that owns the repo) with exactly these permissions, install it on the
+repo, and leave its webhook **inactive** - this half of the integration is
+auth only, nothing listens:
+
+| permission | access |
+| --- | --- |
+| Repository → Administration | read and write |
+| Repository → Actions | read |
+| Repository → Metadata | read (GitHub forces this on) |
+
+Then set:
+
+- `IX_TOKEN` — Actions **secret**, the ix account the VMs bill to
+- `IX_APP_PRIVATE_KEY` — Actions **secret**, the App's private key (PEM)
+- `IX_APP_ID` — Actions **variable**, the App ID (it is not a secret)
+
+The built-in `GITHUB_TOKEN` cannot stand in: workflow permissions have no
+`administration` scope, so it structurally cannot mint runner registration
+tokens. That is the whole reason a second credential exists.
 
 **2. Describe the pool** in `nix/ix-pool.toml`:
 
@@ -80,7 +95,7 @@ concurrency:
 
 jobs:
   reconcile:
-    # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN or RUNNER_PAT.
+    # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN or the App key.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -91,7 +106,8 @@ jobs:
       - uses: indexable-inc/ix-runners@<rev>
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
-          runner-pat: ${{ secrets.RUNNER_PAT }}
+          github-app-id: ${{ vars.IX_APP_ID }}
+          github-app-private-key: ${{ secrets.IX_APP_PRIVATE_KEY }}
 ```
 
 `schedule` and `workflow_run` only fire from a workflow file on your
@@ -227,7 +243,14 @@ default branch. A workflow still on a feature branch never ticks.
 
 ## Security
 
-- `IX_TOKEN` and `RUNNER_PAT` never reach a runner VM. The reconcile refuses
+- **Runners are administered by a GitHub App, not by a person.** The App's
+  private key is exchanged, on the hosted runner, for an **installation
+  access token**: scoped to that one installation, valid for **one hour**,
+  and revoked by the token action in its own post step so it does not
+  outlive the job. Removing access is uninstalling the App - there is no
+  human account whose leaving, or whose other grants, matter. A PAT is the
+  opposite of each of those.
+- `IX_TOKEN` and the App key never reach a runner VM. The reconcile refuses
   to start unless `RUNNER_ENVIRONMENT` says GitHub-hosted - it is the control
   plane for the pool, so running it on the pool would hand both secrets to
   the machines they exist to control. On GHES/ARC set
@@ -242,8 +265,9 @@ default branch. A workflow still on a feature branch never ticks.
 - The demand signal uses the workflow's own `GITHUB_TOKEN`, never the PAT:
   listing runs needs the Actions permission, and repo administration has no
   business holding one.
-- An expired or revoked `RUNNER_PAT` presents as HTTP 401 and the reconcile
-  says exactly that, so you rotate a secret rather than hunt a status code.
+- A rejected admin credential presents as HTTP 401 and the reconcile says so
+  in those terms, naming both paths, so you check an installation or rotate a
+  secret rather than hunt a status code.
 - A pool VM is the least trusted party here. It is asked one question - which
   rev it was built from - and its answer is bounded and read as a string. A
   member that floods, hangs or fails is decided as unreachable and replaced,
@@ -271,8 +295,9 @@ it is not:
 
 ## Roadmap
 
-- An ix GitHub App with token vending replaces `RUNNER_PAT`; setup becomes
-  install-app plus one secret (#5).
+- `runner-pat` is **deprecated** and accepted for one more release; the App
+  path above replaces it. Token vending through the ix API (so the App is
+  ix's rather than yours) is the rest of #5.
 - v2 is an ix-hosted control plane: webhook-driven ephemeral runners from
   warm snapshots. The workflow file in consumer repos deletes; the policy
   file stays.

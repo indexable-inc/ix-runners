@@ -39,7 +39,7 @@ from reconcile.github import (
     run_ids,
     runner_label_sets,
 )
-from reconcile.ix_runners import main, reconcile, require_hosted_runner
+from reconcile.ix_runners import admin_token, main, reconcile, require_hosted_runner
 from reconcile.machines import MAX_PROBE_OUTPUT, probe_member
 from reconcile.model import machine_status
 
@@ -2112,11 +2112,91 @@ class ActionSurfaceTest(unittest.TestCase):
         self.assertIsNotNone(block, "config-file input lost its default")
         self.assertEqual(block.group(1), DEFAULT_SPEC_PATH)
 
-    def test_the_action_asks_for_only_two_secrets(self):
+    def test_only_the_ix_token_is_a_required_input(self):
         # The surface is the product here. A new required input is a change
-        # every consumer has to make, so it should be deliberate.
+        # every consumer has to make, so it should be deliberate. GitHub
+        # auth is no longer required-by-declaration because there are two
+        # ways to supply it; the action checks that itself, in a step that
+        # names both.
         required = re.findall(r"\n  ([a-z-]+):\n(?:.*\n)*?    required: true", self.action())
-        self.assertEqual(sorted(required), ["ix-token", "runner-pat"])
+        self.assertEqual(sorted(required), ["ix-token"])
+
+    def test_the_app_token_action_is_pinned_by_sha(self):
+        # This step turns a private key into a token with Administration
+        # read/write on the repo. A mutable tag here is a supply-chain hole
+        # straight into repo takeover.
+        uses = re.findall(r"uses: (\S+)", self.action())
+        app = [u for u in uses if "create-github-app-token" in u]
+        self.assertEqual(len(app), 1, uses)
+        self.assertRegex(app[0], r"@[0-9a-f]{40}$")
+
+    def test_every_third_party_action_is_pinned_by_sha(self):
+        # Same reasoning for all of them: this job holds IX_TOKEN and a
+        # credential that administers the pool.
+        for used in re.findall(r"uses: (\S+)", self.action()):
+            with self.subTest(uses=used):
+                self.assertRegex(used, r"@[0-9a-f]{40}$")
+
+    def test_the_admin_credential_reaches_the_script_either_way(self):
+        # The App token when there is one, the deprecated PAT otherwise -
+        # and the fallback has to be in the expression, not in the script,
+        # or the App path silently keeps using a PAT that is also set.
+        env = re.search(r"GITHUB_ADMIN_TOKEN: (.+)", self.action()).group(1)
+        self.assertIn("steps.app-token.outputs.token", env)
+        self.assertIn("inputs.runner-pat", env)
+        self.assertLess(env.index("app-token"), env.index("runner-pat"))
+
+
+class AdminCredentialTest(unittest.TestCase):
+    """Which credential the reconcile administers runners with."""
+
+    def resolve(self, env):
+        with mock.patch.dict("os.environ", env, clear=True):
+            return admin_token()
+
+    def test_the_app_token_is_preferred(self):
+        self.assertEqual(
+            self.resolve({"GITHUB_ADMIN_TOKEN": "ghs_app", "RUNNER_PAT": "github_pat"}),
+            "ghs_app",
+        )
+
+    def test_the_legacy_pat_still_works_alone(self):
+        # A workflow pinned to an older action rev sets only this one, and
+        # must keep working through the deprecation window.
+        self.assertEqual(self.resolve({"RUNNER_PAT": "github_pat"}), "github_pat")
+
+    def test_an_empty_value_is_not_a_credential(self):
+        # Actions sets an unprovided input to the empty string rather than
+        # leaving it unset, so "is it present" is the wrong question.
+        self.assertEqual(
+            self.resolve({"GITHUB_ADMIN_TOKEN": "", "RUNNER_PAT": "github_pat"}),
+            "github_pat",
+        )
+
+    def test_no_credential_at_all_is_refused_by_name(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.resolve({})
+        self.assertIn("GITHUB_ADMIN_TOKEN", str(raised.exception))
+        self.assertIn("RUNNER_PAT", str(raised.exception))
+
+    def test_main_refuses_before_doing_anything(self):
+        # Failing at first use would mean failing after machines had already
+        # been created this run.
+        # sys.stdout is mocked rather than redirected because main()
+        # reconfigures it for line buffering before doing anything else.
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"RUNNER_ENVIRONMENT": "github-hosted", "IX_TOKEN": "t",
+                 "GITHUB_REPOSITORY": "o/r"},
+                clear=True,
+            ),
+            mock.patch("reconcile.ix_runners.sys.stdout", mock.Mock()),
+            mock.patch("reconcile.ix_runners.client", lambda: object()),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                main()
+        self.assertIn("GITHUB_ADMIN_TOKEN", str(raised.exception))
 
 
 class EntrypointTest(unittest.TestCase):

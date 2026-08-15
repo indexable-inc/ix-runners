@@ -175,3 +175,42 @@ reconcile workflow exist because the pool is managed from the consumer's own
 CI; once the control plane runs it, adopting ix CI is choosing a `runs-on`
 label and nothing else, the way Blacksmith works today. The spec file is v1
 surface polish, and v1 surface is the part v2 deletes.
+
+
+## Why a GitHub App rather than a PAT
+
+The reconcile needs a credential that can mint runner registration tokens,
+and GitHub puts that behind the `administration` permission, which workflow
+`GITHUB_TOKEN` does not have and cannot be granted. So a second credential is
+structural, not a shortcut.
+
+The question is only what shape it takes. A fine-grained PAT is bound to a
+person: it carries whatever else that person granted it, it survives them
+leaving the org until somebody remembers it, and rotating it is a human task
+on a calendar. A GitHub App installation token is bound to an installation:
+scoped to the permissions in the App's manifest, valid for an hour, and
+removable by uninstalling the App.
+
+The endpoints were checked against GitHub's permissions reference before the
+work started, because a single unsupported one would have ended it - the
+registration-token mint in particular has a persistent reputation for being
+PAT-only. It is not:
+
+| endpoint | permission |
+| --- | --- |
+| `POST /actions/runners/registration-token` | Administration: write |
+| `GET /actions/runners` | Administration: read |
+| `DELETE /actions/runners/{id}` | Administration: write |
+| `GET /actions/runs` | Actions: read |
+| `GET /actions/runs/{id}/jobs` | Actions: read |
+
+All five list installation access tokens as supported. The folklore appears
+to come from the ENTERPRISE-level runner endpoints, which need
+`manage_runners:enterprise` and were not App-callable in older docs, and from
+organization-level runner management, which needs a different permission
+again. Neither applies to a repository-scoped pool.
+
+Nothing in the reconcile changed for this. An installation token is a bearer
+token in the same header as the PAT was, and the code that reads it now takes
+either - not as a choice, but because a workflow pinned to an older action
+rev keeps working through the deprecation window.

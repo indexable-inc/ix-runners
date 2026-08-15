@@ -134,9 +134,12 @@ def github_api(
         # is minted again; say that, rather than leaving a bare 401 in a log.
         if error.code == 401 and pat:
             log_error(
-                "RUNNER_PAT was rejected (HTTP 401): it has EXPIRED or been"
-                " revoked. Mint a new fine-grained PAT with Administration"
-                " read/write on this repo and update the RUNNER_PAT secret."
+                "the admin credential was rejected (HTTP 401): it has"
+                " EXPIRED or been revoked. On the App path, check the App is"
+                " still installed on this repo with Administration"
+                " read/write; on the deprecated PAT path, mint a new"
+                " fine-grained PAT with the same permission and update the"
+                " RUNNER_PAT secret."
             )
             raise SystemExit(1) from error
         raise
