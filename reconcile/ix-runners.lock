@@ -1,0 +1,14 @@
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[manifest]
+requirements = [{ name = "ix-sdk", specifier = "==0.7.1" }]
+
+[[package]]
+name = "ix-sdk"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/d2/f09a9eb63dc858470aa2bceb3714d767e9750276fb80e5d33b853c79bd5d/ix_sdk-0.7.1-cp313-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:49434f2d6394620bb210b18736a61f15d2bd06808fadcc0c8fde2362efdc0ac5", size = 3844314, upload-time = "2026-08-15T00:00:35.534Z" },
+]

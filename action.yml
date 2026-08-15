@@ -38,7 +38,9 @@ runs:
   using: composite
   steps:
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      # Pinned by commit: this job holds both secrets, so a mutable tag here
+      # is a supply-chain hole straight into IX_TOKEN and RUNNER_PAT.
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
     - name: Reconcile runner pool
       shell: bash
@@ -49,4 +51,6 @@ runs:
         POOL_SIZE: ${{ inputs.pool-size }}
         MAX_REPLACEMENTS: ${{ inputs.max-replacements }}
         CONCURRENCY: ${{ inputs.concurrency }}
-      run: ${{ github.action_path }}/reconcile/ix-runners
+      # --locked: install exactly the hash-pinned ix-sdk in ix-runners.lock,
+      # never whatever the index resolves to today.
+      run: uv run --locked --script "${{ github.action_path }}/reconcile/ix-runners"
