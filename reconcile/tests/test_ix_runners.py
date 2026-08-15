@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import email.message
+import enum
 import http.server
 import io
 import json
@@ -18,6 +19,8 @@ import urllib.request
 from unittest import mock
 
 from reconcile.ix_runners import (
+    IDLE_PATH,
+    MAX_DEMAND_RUNS,
     MAX_PROBE_OUTPUT,
     OPENER,
     api_url,
@@ -76,15 +79,37 @@ class FakeUnavailable(FakeIxError):
     """What the SDK raises when the guest agent cannot be reached."""
 
 
-class FakeInfo:
-    """Mirrors MachineInfo: created_at is Unix epoch MILLISECONDS."""
+class FakeStatus(enum.StrEnum):
+    """Mirrors MachineStatus, which is a StrEnum with LOWERCASE values and
+    exactly three states - there is no "starting": a machine coming up
+    already reports RUNNING, which is why warming is read off started_at."""
 
-    def __init__(self, name, *, created_at=None, status="Running", failure_reason=None):
+    RUNNING = "running"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+class FakeInfo:
+    """Mirrors MachineInfo: every timestamp is Unix epoch MILLISECONDS, and
+    started_at/stopped_at are None on a machine that never has."""
+
+    def __init__(
+        self,
+        name,
+        *,
+        created_at=None,
+        status=FakeStatus.RUNNING,
+        failure_reason=None,
+        started_at=None,
+        stopped_at=None,
+    ):
         self.name = name
         self.id = f"id-{name}"
         self.created_at = now_ms() - DAY_MS if created_at is None else created_at
         self.status = status
         self.failure_reason = failure_reason
+        self.started_at = started_at
+        self.stopped_at = stopped_at
 
 
 class FakeExec:
@@ -118,6 +143,9 @@ class FakeMachine:
         out = self.platform.revs[self.name] + "\n"
         if self.name in self.platform.markers:
             out += "ix-runner-strike\n"
+        # The real probe always prints the count, falling back to 0, so a
+        # machine built before the file existed answers 0 rather than nothing.
+        out += f"idle={self.platform.idle.get(self.name, 0)}\n"
         if f"rm -f {MARKER}" in script:
             self.platform.markers.discard(self.name)
         return FakeExec(0, out)
@@ -128,6 +156,18 @@ class FakeMachine:
 
     async def delete(self):
         self.platform.calls.append((self.name, ("delete",)))
+
+    async def start(self):
+        # start() waits for the platform to report Running, then returns the
+        # machine's row - it does NOT wait for a runner to register.
+        self.platform.calls.append((self.name, ("start",)))
+        self.platform.started.append(self.name)
+        return FakeInfo(self.name, status=FakeStatus.RUNNING, started_at=now_ms())
+
+    async def stop(self):
+        self.platform.calls.append((self.name, ("stop",)))
+        self.platform.stopped_by_run.append(self.name)
+        return FakeInfo(self.name, status=FakeStatus.STOPPED, stopped_at=now_ms())
 
 
 class FakeMachines:
@@ -193,6 +233,10 @@ class FakeIx:
         connect_errors=None,
         probe_errors=None,
         page_size=100,
+        idle=None,
+        jobs=None,
+        busy_at_stop=frozenset(),
+        demand_error=None,
     ):
         self.vms = vms  # existing VM names
         self.revs = revs  # name -> baked config rev (missing = unreachable)
@@ -215,7 +259,18 @@ class FakeIx:
         self.connect_errors = connect_errors or {}  # name -> exception
         self.probe_errors = probe_errors or {}  # name -> exception from shell()
         self.page_size = page_size
+        self.idle = dict(idle or {})  # name -> consecutive-idle count on the VM
+        # (labels, status) per active job, the shape the demand scan counts.
+        self.jobs = list(jobs or [])
+        # members that take a job between the scan and the stop: idle in the
+        # first listing, busy in the fresh one the stop path re-reads.
+        self.busy_at_stop = set(busy_at_stop)
+        self.runner_listings = 0
+        self.demand_tokens = []  # which credential read the job queue
+        self.demand_error = demand_error
         self.calls = []
+        self.started = []  # names started by this run
+        self.stopped_by_run = []  # names stopped by this run
         self.created = []  # names whose create ran to completion
         self.create_delay = 0.0
         self.in_flight = 0
@@ -231,28 +286,50 @@ class FakeIx:
     def secrets(self):
         return FakeSecrets(self)
 
-    def runner_rows(self):
+    def runner_rows(self, busy):
         return [
             {
                 "id": 1000 + member * 10 + slot,
                 "name": f"baml-r{member}-{slot}",
                 "status": "online" if member in self.online else "offline",
-                "busy": member in self.busy,
+                "busy": member in busy,
             }
             for member in sorted(self.registered)
             for slot in range(1, self.slots + 1)
         ]
 
-    def github_api(self, pat, repo, path, *, method="GET"):
+    def github_api(self, token, repo, path, *, method="GET", pat=True):
         self.calls.append((None, (method, path)))
         if path.startswith("/actions/runners?"):
-            rows = self.runner_rows()
             page = int(path.rsplit("page=", 1)[1])
+            if page == 1:
+                self.runner_listings += 1
+            # The stop path re-lists moments before pulling the power; from
+            # the second listing on, busy_at_stop members are mid-job.
+            busy = self.busy | (
+                self.busy_at_stop if self.runner_listings > 1 else set()
+            )
+            rows = self.runner_rows(busy)
             start = (page - 1) * self.page_size
             return {
                 "total_count": len(rows),
                 "runners": rows[start : start + self.page_size],
             }
+        if path.startswith("/actions/runs?"):
+            self.demand_tokens.append(token)
+            if self.demand_error is not None:
+                raise self.demand_error
+            status = path.split("status=", 1)[1].split("&", 1)[0]
+            # One run per active job, which is the worst case for the scan.
+            runs = [
+                {"id": 500 + i}
+                for i, job in enumerate(self.jobs)
+                if job["status"] == status
+            ]
+            return {"total_count": len(runs), "workflow_runs": runs}
+        if path.startswith("/actions/runs/") and "/jobs" in path:
+            run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+            return {"total_count": 1, "jobs": [self.jobs[run_id - 500]]}
         if path == "/actions/runners/registration-token":
             return {"token": "REGTOKEN"}
         if method == "DELETE" and path.startswith("/actions/runners/"):
@@ -774,6 +851,351 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ix.created, ["baml-runner-2"])
 
 
+AUTO_ENV = ENV | {
+    "POOL_SIZE": "6",
+    "MIN_WARM": "1",
+    "SCALE_HEADROOM": "0",
+    "RUNNER_LABEL": "ix",
+    "GITHUB_TOKEN": "ghs_workflow_token",
+}
+
+
+def job(status="queued", label="ix"):
+    """One active job, in the shape the demand scan reads: `labels` is the
+    job's `runs-on` set."""
+    return {"status": status, "labels": ["self-hosted", label]}
+
+
+def autoscale_pool(*, running=(), stopped=(), failed=(), online=(), **kwargs):
+    """A pool whose members are in the given power states.
+
+    Every running member is on the current rev. Only running members get a
+    rev at all: a stopped one that gets probed anyway raises out of the fake
+    guest, reads as unreachable, and is replaced - which is precisely the
+    failure these tests exist to catch, so it must not be papered over here.
+
+    Every member that exists is registered on GitHub, stopped ones included:
+    a stop keeps the disk, so the registration credentials survive and the
+    runner shows up offline rather than vanishing.
+    """
+    def names(members):
+        return {f"baml-runner-{m}" for m in members}
+
+    info = {
+        f"baml-runner-{m}": {"status": FakeStatus.STOPPED, "stopped_at": now_ms()}
+        for m in stopped
+    }
+    info |= {
+        f"baml-runner-{m}": {
+            "status": FakeStatus.FAILED,
+            "failure_reason": "the host lost the guest",
+        }
+        for m in failed
+    }
+    # Merged per member, not per dict: an override that adds a timestamp must
+    # not silently drop the status this helper just set for it.
+    for name, extra in kwargs.pop("info", {}).items():
+        info[name] = info.get(name, {}) | extra
+    return FakeIx(
+        vms=names(running) | names(stopped) | names(failed),
+        revs={f"baml-runner-{m}": REV for m in running},
+        online=set(online),
+        markers=set(),
+        registered=set(running) | set(stopped) | set(failed),
+        info=info,
+        **kwargs,
+    )
+
+
+async def run_reconcile(ix, env):
+    with (
+        mock.patch.dict("os.environ", env, clear=True),
+        mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
+        mock.patch("reconcile.ix_runners.github_api", ix.github_api),
+        mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
+        mock.patch("reconcile.ix_runners.DEREGISTER_PAUSE", 0.0),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        return await reconcile(ix)
+
+
+class AutoscaleTest(unittest.IsolatedAsyncioTestCase):
+    """Power state is the only dynamic axis: the member set is declarative,
+    and every test here is about which of those members are switched on."""
+
+    async def test_an_unconfigured_pool_never_scales_and_never_asks_demand(self):
+        # MIN_WARM defaults to POOL_SIZE, so desired is pinned to the whole
+        # pool and no clamp can move it. Asking GitHub for a demand number
+        # that cannot change the answer is a wasted scan on every tick, and
+        # it would make RUNNER_LABEL mandatory for pools that never scale.
+        ix = autoscale_pool(running=[1, 2], online=[1, 2])
+        self.assertEqual(await run_reconcile(ix, ENV | {"POOL_SIZE": "2"}), 0)
+        self.assertEqual(ix.started, [])
+        self.assertEqual(ix.stopped_by_run, [])
+        self.assertEqual(
+            [c for _, c in ix.calls if c[0] == "GET" and "/actions/runs" in c[1]], []
+        )
+
+    async def test_a_stopped_member_is_never_probed_and_never_replaced(self):
+        # The whole feature stands on this. The decide loop reads an
+        # unanswered probe as "unreachable -> replace", so probing a machine
+        # that is switched off would delete and rebuild every member
+        # autoscaling had just parked - at a template build each.
+        ix = autoscale_pool(running=[1], online=[1], stopped=[2, 3, 4, 5, 6])
+        self.assertEqual(await run_reconcile(ix, AUTO_ENV), 0)
+        probed = {name for name, call in ix.calls if call[0] == "shell"}
+        self.assertEqual(probed, {"baml-runner-1"})
+        self.assertEqual([c for _, c in ix.calls if c[0] == "create"], [])
+        self.assertEqual([n for n, c in ix.calls if c == ("delete",)], [])
+        self.assertEqual(ix.started, [])
+        self.assertEqual(ix.stopped_by_run, [])
+
+    async def test_a_surplus_stops_the_highest_indexed_idle_members(self):
+        # Highest index first, so the warm core is always the same low
+        # members and their template and toolchain caches stay hot.
+        ix = autoscale_pool(running=[1, 2, 3, 4], online=[1, 2, 3, 4])
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(
+            ix.stopped_by_run, ["baml-runner-4", "baml-runner-3", "baml-runner-2"]
+        )
+
+    async def test_a_busy_member_is_passed_over_for_the_next_idle_one(self):
+        # Two layers protect a running job, and this pins the FIRST one: the
+        # busy member is never even planned for a stop. Asserting only that
+        # it stays up proves nothing, because the execute-time re-read would
+        # catch it anyway - and then the scale-down slot is spent on a member
+        # that was never stoppable, so the pool never actually shrinks.
+        # Member 3 is the highest index, so it is the one the stop order
+        # reaches for first.
+        ix = autoscale_pool(
+            running=[1, 2, 3], online=[1, 2, 3], busy={3}, jobs=[job("in_progress")]
+        )
+        await run_reconcile(ix, AUTO_ENV | {"MIN_WARM": "2"})
+        self.assertEqual(ix.stopped_by_run, ["baml-runner-2"])
+
+    async def test_min_warm_is_a_floor_under_the_scale_down(self):
+        ix = autoscale_pool(running=[1, 2, 3], online=[1, 2, 3])
+        await run_reconcile(ix, AUTO_ENV | {"MIN_WARM": "2"})
+        self.assertEqual(ix.stopped_by_run, ["baml-runner-3"])
+
+    async def test_scale_up_starts_a_stopped_member_rather_than_creating(self):
+        # A start is seconds; a create is a template build. Preferring the
+        # start is most of the latency story.
+        ix = autoscale_pool(
+            running=[1], online=[1], stopped=[2, 3, 4, 5, 6], jobs=[job()] * 3
+        )
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(ix.started, ["baml-runner-2", "baml-runner-3"])
+        self.assertEqual(ix.created, [])
+
+    async def test_a_warming_member_counts_as_online_and_is_left_alone(self):
+        # A machine reports Running the moment it comes up, so a member
+        # started seconds ago looks exactly like a healthy one whose runners
+        # died. Repairing it restarts units mid-registration, and not
+        # counting it starts a second machine for the same job.
+        ix = autoscale_pool(
+            running=[1, 2],
+            online=[1],
+            jobs=[job()] * 2,
+            info={"baml-runner-2": {"started_at": now_ms() - 10_000}},
+        )
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(ix.started, [])
+        self.assertEqual(ix.stopped_by_run, [])
+        self.assertNotIn(
+            ("baml-runner-2", ("systemctl", "restart", "github-runner-*")), ix.calls
+        )
+
+    async def test_a_failed_machine_is_replaced_without_waiting_out_the_grace(self):
+        # BOOT_GRACE exists because a young machine's SILENCE says nothing.
+        # A machine reporting failed is not silent - it has said it is dead -
+        # so waiting the grace out is half an hour of a member that is never
+        # coming back.
+        ix = autoscale_pool(
+            running=[1],
+            online=[1],
+            failed=[2],
+            info={"baml-runner-2": {"created_at": now_ms() - 30_000}},
+        )
+        await run_reconcile(ix, AUTO_ENV | {"POOL_SIZE": "2"})
+        self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
+        self.assertEqual(ix.created, ["baml-runner-2"])
+
+    async def test_the_power_cap_bounds_one_run(self):
+        # A thundering herd of stops is as bad as one of creates: the cap
+        # makes a wrong scaling decision converge slowly instead of at once.
+        ix = autoscale_pool(running=[1, 2, 3, 4, 5, 6], online=[1, 2, 3, 4, 5, 6])
+        await run_reconcile(ix, AUTO_ENV | {"MAX_POWER_ACTIONS": "2"})
+        self.assertEqual(ix.stopped_by_run, ["baml-runner-6", "baml-runner-5"])
+
+    async def test_a_member_that_takes_a_job_before_the_stop_is_left_running(self):
+        # The scan snapshot is tens of seconds old by execute time, and
+        # nothing on GitHub's side locks a stop the way a 422 locks a
+        # deregister. Re-reading the registrations right before pulling the
+        # power is what narrows the window.
+        ix = autoscale_pool(running=[1, 2], online=[1, 2], busy_at_stop={2})
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(ix.stopped_by_run, [])
+
+    async def test_idle_grace_counts_consecutive_scans_on_the_vm(self):
+        # First scan: idle, but one short of the grace, so the count is
+        # written to the machine rather than the power pulled.
+        ix = autoscale_pool(running=[1, 2], online=[1, 2])
+        await run_reconcile(ix, AUTO_ENV | {"IDLE_GRACE_TICKS": "2"})
+        self.assertEqual(ix.stopped_by_run, [])
+        self.assertIn(
+            (
+                "baml-runner-2",
+                ("sh", "-c", "mkdir -p /var/lib/ix-runner && echo 1 > " + IDLE_PATH),
+            ),
+            ix.calls,
+        )
+
+    async def test_idle_grace_stops_once_the_count_is_reached(self):
+        ix = autoscale_pool(
+            running=[1, 2], online=[1, 2], idle={"baml-runner-2": 1}
+        )
+        await run_reconcile(ix, AUTO_ENV | {"IDLE_GRACE_TICKS": "2"})
+        self.assertEqual(ix.stopped_by_run, ["baml-runner-2"])
+
+    async def test_a_member_that_took_a_job_has_its_idle_count_reset(self):
+        # Grace means CONSECUTIVE idle scans. Without the reset a machine
+        # that went busy and idle again over many scans accumulates its way
+        # to a stop it never earned.
+        ix = autoscale_pool(
+            running=[1, 2],
+            online=[1, 2],
+            busy={2},
+            idle={"baml-runner-2": 1},
+            jobs=[job("in_progress")] * 2,
+        )
+        await run_reconcile(ix, AUTO_ENV | {"IDLE_GRACE_TICKS": "3"})
+        self.assertEqual(ix.stopped_by_run, [])
+        self.assertIn(
+            (
+                "baml-runner-2",
+                ("sh", "-c", "mkdir -p /var/lib/ix-runner && echo 0 > " + IDLE_PATH),
+            ),
+            ix.calls,
+        )
+
+    async def test_demand_counts_only_jobs_targeting_this_pools_label(self):
+        # A repo's other jobs run on GitHub-hosted runners and must not size
+        # this pool: counting them would keep the whole fleet warm for work
+        # that never lands on it.
+        ix = autoscale_pool(
+            running=[1],
+            online=[1],
+            stopped=[2, 3, 4, 5, 6],
+            jobs=[job()] * 3 + [job(label="ubuntu-latest")] * 5,
+        )
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(ix.started, ["baml-runner-2", "baml-runner-3"])
+
+    async def test_demand_counts_queued_and_in_progress_jobs(self):
+        # A wave is usually a fan-out inside a run that is already
+        # in_progress; counting only queued work misses exactly the demand
+        # the pool exists to absorb.
+        ix = autoscale_pool(
+            running=[1],
+            online=[1],
+            stopped=[2, 3, 4, 5, 6],
+            jobs=[job(), job("in_progress")],
+        )
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(ix.started, ["baml-runner-2"])
+
+    async def test_slots_divide_jobs_into_members(self):
+        # Demand is jobs; the pool is machines. With four slots per machine,
+        # eight jobs need two machines, not eight.
+        ix = autoscale_pool(
+            running=[1], online=[1], stopped=[2, 3, 4, 5, 6], slots=4, jobs=[job()] * 8
+        )
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(ix.started, ["baml-runner-2"])
+
+    async def test_headroom_is_added_on_top_of_demand(self):
+        ix = autoscale_pool(
+            running=[1], online=[1], stopped=[2, 3, 4, 5, 6], jobs=[job()]
+        )
+        await run_reconcile(ix, AUTO_ENV | {"SCALE_HEADROOM": "2"})
+        self.assertEqual(ix.started, ["baml-runner-2", "baml-runner-3"])
+
+    async def test_max_online_caps_the_scale_up(self):
+        ix = autoscale_pool(
+            running=[1], online=[1], stopped=[2, 3, 4, 5, 6], jobs=[job()] * 5
+        )
+        await run_reconcile(ix, AUTO_ENV | {"MAX_ONLINE": "2"})
+        self.assertEqual(ix.started, ["baml-runner-2"])
+
+    async def test_an_untrustworthy_demand_number_scales_up_not_down(self):
+        # Past the cap the count is not to be believed, and the safe
+        # direction is up: guessing low strands a queue behind a parked pool.
+        ix = autoscale_pool(
+            running=[1],
+            online=[1],
+            stopped=[2, 3, 4, 5, 6],
+            jobs=[job()] * (MAX_DEMAND_RUNS + 1),
+        )
+        await run_reconcile(ix, AUTO_ENV | {"MAX_POWER_ACTIONS": "99"})
+        self.assertEqual(len(ix.started), 5)
+
+    async def test_the_job_queue_is_read_with_the_workflow_token_not_the_pat(self):
+        # Listing workflow runs needs the Actions permission. The admin PAT
+        # does not have it and must never be given it: repo administration
+        # is registration-token minting and runner deletion, and a demand
+        # scan is neither.
+        ix = autoscale_pool(running=[1, 2], online=[1, 2], jobs=[job()])
+        await run_reconcile(ix, AUTO_ENV)
+        self.assertEqual(set(ix.demand_tokens), {"ghs_workflow_token"})
+        self.assertNotIn(ENV["RUNNER_PAT"], ix.demand_tokens)
+
+    async def test_a_forbidden_demand_read_scales_up_rather_than_dying(self):
+        # A token missing `actions: read` must not stop the pool being
+        # reconciled, and must not park it either: no view of the queue means
+        # keep the machines on.
+        ix = autoscale_pool(
+            running=[1],
+            online=[1],
+            stopped=[2, 3, 4, 5, 6],
+            demand_error=http_error(403, "Resource not accessible by integration"),
+        )
+        await run_reconcile(ix, AUTO_ENV | {"MAX_POWER_ACTIONS": "99"})
+        self.assertEqual(len(ix.started), 5)
+
+    async def test_a_missing_label_turns_scaling_off_loudly_but_still_heals(self):
+        # A broken scaling config must not stop the pool being repaired: a
+        # pool nobody heals is worse than a pool that is briefly too big. So
+        # the run goes red, scaling is off, and the replace still happens.
+        ix = autoscale_pool(running=[1, 2], online=[1], stopped=[3])
+        del ix.revs["baml-runner-2"]  # unreachable -> replace
+        env = AUTO_ENV | {"MIN_WARM": "1", "POOL_SIZE": "3"}
+        del env["RUNNER_LABEL"]
+        with self.assertRaises(SystemExit):
+            await run_reconcile(ix, env)
+        self.assertEqual(ix.created, ["baml-runner-2"])
+        # Scaling off means desired is the whole pool, so the parked member
+        # is switched back on rather than left dark.
+        self.assertEqual(ix.started, ["baml-runner-3"])
+        self.assertEqual(ix.stopped_by_run, [])
+
+    async def test_an_impossible_range_turns_scaling_off_loudly(self):
+        ix = autoscale_pool(running=[1, 2], online=[1, 2])
+        with self.assertRaises(SystemExit):
+            await run_reconcile(ix, AUTO_ENV | {"MIN_WARM": "4", "MAX_ONLINE": "2"})
+        self.assertEqual(ix.stopped_by_run, [])
+
+    async def test_a_hand_stopped_member_is_started_not_rebuilt(self):
+        # Before autoscaling, a machine someone stopped read as unreachable
+        # and was deleted and rebuilt from its template. Starting it is the
+        # same outcome in seconds instead of half an hour.
+        ix = autoscale_pool(running=[1], online=[1], stopped=[2])
+        await run_reconcile(ix, ENV | {"POOL_SIZE": "2"})
+        self.assertEqual(ix.started, ["baml-runner-2"])
+        self.assertEqual(ix.created, [])
+        self.assertEqual([n for n, c in ix.calls if c == ("delete",)], [])
+
+
 class ProbeMemberTest(unittest.IsolatedAsyncioTestCase):
     """The guest is the least trusted party in the system: it answers with
     whatever it likes, and nothing it says may end the run."""
@@ -786,7 +1208,9 @@ class ProbeMemberTest(unittest.IsolatedAsyncioTestCase):
             async def shell(self, script):
                 raise MemoryError("the guest answered with gigabytes")
 
-        self.assertEqual(await probe_member(Hostile(), clear_marker=False), (None, False))
+        self.assertEqual(
+            await probe_member(Hostile(), clear_marker=False), (None, False, 0)
+        )
 
     async def test_an_oversized_reply_is_not_trusted(self):
         # A reply that opens with a plausible rev and then floods reads
@@ -798,7 +1222,7 @@ class ProbeMemberTest(unittest.IsolatedAsyncioTestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(
-                await probe_member(Flood(), clear_marker=False), (None, False)
+                await probe_member(Flood(), clear_marker=False), (None, False, 0)
             )
         self.assertIn("::warning::", out.getvalue())
 
