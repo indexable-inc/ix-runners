@@ -180,12 +180,11 @@ def admin_token() -> str:
     or the legacy PAT.
 
     Two names because they are two eras, not two options. The action sets
-    GITHUB_ADMIN_TOKEN from whichever the caller configured; RUNNER_PAT is
-    still read so a workflow pinned to an older action rev keeps working
-    through the deprecation window.
+    GITHUB_ADMIN_TOKEN from whichever source the caller chose; RUNNER_PAT is
+    still read so a workflow pinned to an older action rev keeps working.
 
-    Nothing downstream cares which it is - an installation token is a bearer
-    token like the PAT, and every endpoint this uses accepts both.
+    Nothing downstream cares which it is - a vended installation token is a
+    bearer token like the PAT, and every endpoint this uses accepts both.
     """
     for name in ADMIN_TOKEN_VARS:
         value = os.environ.get(name)
@@ -193,8 +192,8 @@ def admin_token() -> str:
             return value
     raise SystemExit(
         "no admin credential: set GITHUB_ADMIN_TOKEN (the action does this"
-        " from github-app-id + github-app-private-key) or, on the deprecated"
-        " path, RUNNER_PAT"
+        " from the token it vends, or from runner-pat) or, when driving this"
+        " script directly, RUNNER_PAT"
     )
 
 
