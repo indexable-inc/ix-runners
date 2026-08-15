@@ -7,17 +7,12 @@ leaves that runner: it mints SHORT-LIVED (1 h) registration tokens and
 reads runner status; a VM only ever receives a registration token, which
 can do nothing but register a runner and is dead within the hour.
 
-Provisioning goes through the ix Python SDK (ix-sdk on PyPI, pinned in the
-entrypoint's inline metadata), not CLI output parsing: typed results, and
-the registration token rides ``secrets().set()`` plus a ``--secret-file``
+Provisioning is pure ix Python SDK (ix-sdk on PyPI, pinned in the
+entrypoint's inline metadata) - no CLI, no output parsing. The
+registration token rides ``secrets().set()`` plus a ``secret_files``
 attach at CREATE time, so it is present at first boot as a root-only file
-and no post-boot seeding step exists. The one CLI call left is ``ix new``
-itself: server-side first-boot template builds landed platform-side but
-need the ix-sdk >= 0.7.0 client, not yet on PyPI (issue #3 on this repo).
-The moment 0.7.0 publishes, ``ix_new`` below swaps to
-``machines().create`` (note: ``idempotency_key`` is refused for
-flake-ref templates - the build pipeline is single-flight per pinned
-rev) and the CLI install step disappears.
+and no post-boot seeding step exists; unbuilt templates compile
+server-side on first boot.
 
 Per pool member:
     missing VM                      -> create
@@ -175,27 +170,12 @@ async def guest(machine, *command: str) -> bool:
         return False
 
 
-def ix_new(template: str, name: str, secret: str) -> None:
-    """Boot one pool member via `ix new`; a seam so tests fake the CLI.
+def create_options(**kwargs):
+    """Construct CreateMachineOptions; a seam so tests never import the SDK
+    (the wheel is x86_64-only; the fakes stand in for it anyway)."""
+    from ix_sdk import CreateMachineOptions
 
-    The CLI, not `machines().create`: first-boot builds need the ix-sdk
-    0.7.0 client, not yet published (issue #3 on this repo). The secret is
-    referenced by store NAME on argv; the value never is.
-    """
-    subprocess.run(
-        [
-            "ix",
-            "new",
-            template,
-            "--name",
-            name,
-            "--no-shell",
-            "--secret-file",
-            f"{secret}=runner-token:root:0400",
-        ],
-        check=True,
-        timeout=CREATE_TIMEOUT,
-    )
+    return CreateMachineOptions(**kwargs)
 
 
 async def create(
@@ -205,14 +185,22 @@ async def create(
 
     A fresh 1 h registration token goes into the ix secret store (an API
     body, never argv) and reaches the VM as a root-only file via the
-    --secret-file attach; nothing durable ever lands on a VM. The runner
+    secret_files attach; nothing durable ever lands on a VM. The runner
     units read it as root at configure time and skip cleanly while it is
-    absent.
+    absent. An unbuilt (rev, attr) template compiles server-side on first
+    boot (single-flight per pinned rev; idempotency_key is refused for
+    flake-ref templates, so none is sent).
     """
     secret = os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token"
     token = github_api(pat, repo, "/actions/runners/registration-token", method="POST")
     await ix.secrets().set(secret, token["token"])
-    ix_new(f"github:{repo}/{rev}#ci-runner-{member}", name, secret)
+    options = create_options(
+        template=f"github:{repo}/{rev}#ci-runner-{member}",
+        name=name,
+        region=os.environ.get("IX_REGION") or "us-west-1",
+        secret_files={secret: "runner-token"},
+    )
+    await asyncio.wait_for(ix.machines().create(options), CREATE_TIMEOUT)
 
 
 async def reconcile(ix) -> int:
@@ -229,6 +217,12 @@ async def reconcile(ix) -> int:
     rev = desired_rev()
     runners = github_api(pat, repo, "/actions/runners?per_page=100")["runners"]
     vms = {info.name: info.id for info in await ix.machines().list()}
+    # Empty pool = first bootstrap: nothing exists to thrash, so the cap
+    # protects nothing - raise it and build the whole pool in one run.
+    empty = not any(f"{pool}-runner-{m}" in vms for m in range(1, pool_size + 1))
+    if empty and max_replacements < pool_size:
+        print(f"empty pool -> bootstrap: raising the cap to {pool_size}")
+        max_replacements = pool_size
     replaced = 0
 
     def budget() -> bool:
@@ -249,7 +243,7 @@ async def reconcile(ix) -> int:
         replaced += 1
         try:
             await create(ix, pat, repo, rev, pool, member, name)
-        except (TimeoutError, OSError, RuntimeError, subprocess.SubprocessError) as e:
+        except (TimeoutError, OSError, RuntimeError) as e:
             failures += 1
             print(f"{name}: create FAILED ({e}); reconciling again next run")
 

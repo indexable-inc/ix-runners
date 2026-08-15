@@ -33,15 +33,6 @@ runs:
     - name: Install uv
       uses: astral-sh/setup-uv@v7
 
-    # Needed for exactly one verb: `ix new` (first-boot template builds need
-    # the ix-sdk 0.7.0 client, not yet on PyPI - issue #3). This step
-    # disappears when the reconcile's pinned ix-sdk bumps to 0.7.0.
-    - name: Install ix CLI
-      shell: bash
-      run: |
-        curl -fsSL https://ix.dev/install.sh | sh
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
     - name: Reconcile runner pool
       shell: bash
       env:

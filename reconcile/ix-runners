@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["ix-sdk==0.6.0"]
+# dependencies = ["ix-sdk==0.7.1"]
 # ///
 """Reconcile the self-hosted ix runner pool; see ix_runners.py."""
 

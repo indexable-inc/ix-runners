@@ -54,10 +54,10 @@ one flake input.
 
 ## Roadmap
 
-- When `ix-sdk` 0.7.0 publishes, the reconcile's one remaining CLI call
-  (`ix new`, for first-boot template builds) becomes a pure SDK call and
-  the CLI install step disappears (issue #3). Consumers pick it up by
-  bumping the action pin - zero diff in their repo.
+- ~~Drop the ix CLI~~ (#3): done - provisioning is pure `ix-sdk`, including
+  server-side first-boot template builds. Nothing is installed by `curl`.
+- An official ix GitHub App + token vending via the ix API (#5) replaces
+  `RUNNER_PAT`: customer setup becomes install-app + one secret.
 - The scheduled-reconcile model is the v1. The v2 is an ix-hosted control
   plane (webhook-driven, ephemeral runners booted from warm snapshots), at
   which point the workflow file in consumer repos deletes too.

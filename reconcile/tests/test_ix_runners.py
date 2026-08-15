@@ -75,6 +75,8 @@ class FakeMachines:
 
     async def create(self, options):
         self.platform.calls.append((None, ("create", options)))
+        if self.platform.broken:
+            raise RuntimeError("template build failed")
 
 
 class FakeSecrets:
@@ -107,13 +109,8 @@ class FakeIx:
         # members that pick up a job AFTER the scan snapshot: idle in the
         # runners listing, but GitHub 422s the registration delete.
         self.busy_at_delete = busy_at_delete
-        self.broken = broken  # every ix new fails (bad template rev)
+        self.broken = broken  # every create fails (bad template rev)
         self.calls = []
-
-    def ix_new(self, template, name, secret):
-        self.calls.append((None, ("ix-new", template, name, secret)))
-        if self.broken:
-            raise RuntimeError("template build failed")
 
     def machines(self):
         return FakeMachines(self)
@@ -151,7 +148,7 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             mock.patch.dict("os.environ", env),
             mock.patch("reconcile.ix_runners.desired_rev", return_value=REV),
             mock.patch("reconcile.ix_runners.github_api", ix.github_api),
-            mock.patch("reconcile.ix_runners.ix_new", ix.ix_new),
+            mock.patch("reconcile.ix_runners.create_options", lambda **kw: kw),
         ):
             return await reconcile(ix)
 
@@ -164,15 +161,15 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(secret_sets), 2)
         for call in secret_sets:
             self.assertEqual(call[1:], ("baml_runner_reg_token", "REGTOKEN"))
-        creates = [c for _, c in ix.calls if c[0] == "ix-new"]
+        creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(
-            creates[0],
-            (
-                "ix-new",
-                f"github:example/baml/{REV}#ci-runner-1",
-                "baml-runner-1",
-                "baml_runner_reg_token",
-            ),
+            creates[0][1],
+            {
+                "template": f"github:example/baml/{REV}#ci-runner-1",
+                "name": "baml-runner-1",
+                "region": "us-east-1",
+                "secret_files": {"baml_runner_reg_token": "runner-token"},
+            },
         )
 
     async def test_stale_rev_is_replaced(self):
@@ -267,11 +264,25 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_replacement_budget_caps_work_per_run(self):
-        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        # A non-empty stale pool rolls at most MAX_REPLACEMENTS per run.
+        vms = {f"baml-runner-{m}" for m in range(1, 9)}
+        ix = FakeIx(
+            vms=vms,
+            revs={name: OLD_REV for name in vms},
+            online=set(),
+            markers=set(),
+        )
         env = dict(ENV, POOL_SIZE="8", MAX_REPLACEMENTS="2")
         self.assertEqual(await self.reconcile_with(ix, env=env), 2)
-        creates = [c for _, c in ix.calls if c[0] == "ix-new"]
+        creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(len(creates), 2)
+
+    async def test_empty_pool_bootstraps_past_the_cap(self):
+        # First bootstrap: nothing exists to thrash, so the cap self-raises
+        # and the whole pool builds in one run (no manual dispatch needed).
+        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        env = dict(ENV, POOL_SIZE="8", MAX_REPLACEMENTS="2")
+        self.assertEqual(await self.reconcile_with(ix, env=env), 8)
 
     async def test_stale_but_busy_member_is_deferred(self):
         # A config roll must never kill a running job: the busy member is
@@ -293,7 +304,7 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         ix = FakeIx(vms=set(), revs={}, online=set(), markers=set(), broken=True)
         with self.assertRaises(SystemExit):
             await self.reconcile_with(ix)
-        creates = [c for _, c in ix.calls if c[0] == "ix-new"]
+        creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(len(creates), 2)
 
 
