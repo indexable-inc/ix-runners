@@ -282,6 +282,10 @@ in
         dbus
         libdrm
         mesa
+        # libgbm was split out of mesa in nixpkgs; chromium's headless shell
+        # dlopens libgbm.so.1 (its absence was the one failure after browsers
+        # started executing from HOME).
+        libgbm
         pango
         cairo
         libxkbcommon
