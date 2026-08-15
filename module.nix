@@ -454,6 +454,11 @@ in
     boot.kernel.sysctl = {
       "kernel.threads-max" = 1048576;
       "kernel.pid_max" = 4194304;
+      # Defense in depth for the co-tenant slots: without Yama scope, one
+      # slot's job could ptrace-attach to another slot's steps. ix guests do
+      # not get the closure's lsm= kernel cmdline, so Yama may be inactive
+      # and this sysctl is the only place its scope is guaranteed.
+      "kernel.yama.ptrace_scope" = 1;
     };
 
     # Guests boot small and grow elastically: a job that outruns virtio-mem
