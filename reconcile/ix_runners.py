@@ -54,6 +54,16 @@ EXEC_TIMEOUT = 60
 CREATE_TIMEOUT = 1800
 
 
+def log_error(message: str) -> None:
+    """An Actions error annotation - surfaced on the run, not buried in logs."""
+    print(f"::error::{message}")
+
+
+def log_warning(message: str) -> None:
+    """An Actions warning annotation."""
+    print(f"::warning::{message}")
+
+
 def client():
     """The ix API client; resolves IX_TOKEN from the environment."""
     from ix_sdk import Client
@@ -69,9 +79,56 @@ def github_api(pat: str, repo: str, path: str, *, method: str = "GET") -> dict:
         method=method,
         headers={"Authorization": f"Bearer {pat}"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = response.read()
-        return json.loads(body) if body else {}
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as error:
+        # Fine-grained PATs expire, and the whole reconcile is dead until one
+        # is minted again; say that, rather than leaving a bare 401 in a log.
+        if error.code == 401:
+            log_error(
+                "RUNNER_PAT was rejected (HTTP 401): it has EXPIRED or been"
+                " revoked. Mint a new fine-grained PAT with Administration"
+                " read/write on this repo and update the RUNNER_PAT secret."
+            )
+            raise SystemExit(1) from error
+        raise
+
+
+def list_runners(pat: str, repo: str) -> list[dict]:
+    """Every self-hosted runner registered on the repo, across ALL pages.
+
+    A short read is not merely incomplete, it is destructive: a member whose
+    runners fall off the end of page one reads offline and gets replaced, so
+    an unpaginated listing mass-replaces the pool the moment it passes 100
+    registrations (POOL_SIZE x slots).
+    """
+    runners: list[dict] = []
+    total = 0
+    page = 1
+    while True:
+        body = github_api(pat, repo, f"/actions/runners?per_page=100&page={page}")
+        total = int(body.get("total_count") or 0)
+        batch = body.get("runners") or []
+        runners.extend(batch)
+        if not batch or len(runners) >= total:
+            break
+        page += 1
+    if len(runners) < total:
+        log_error(
+            f"runner listing is short: {len(runners)} of {total} runners."
+            " Refusing to reconcile - every unlisted member would read"
+            " offline and be replaced."
+        )
+        raise SystemExit(1)
+    return runners
+
+
+def git(*args: str) -> str:
+    """Run git in the checkout; return its stdout, stripped."""
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
+    return result.stdout.strip()
 
 
 def desired_rev() -> str:
@@ -80,15 +137,24 @@ def desired_rev() -> str:
     Unrelated merges must not roll the fleet, and the template cache is
     keyed by exact rev (never provision from a branch name: it re-resolves).
     """
-    result = subprocess.run(
-        ["git", "log", "-1", "--format=%H", "--", *CONFIG_PATHS],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    rev = result.stdout.strip()
+    # A shallow checkout's grafted boundary commit diffs against the empty
+    # tree, so `git log -- <paths>` names HEAD for EVERY commit and the whole
+    # fleet rolls on every push - silently, because the rev looks plausible.
+    if git("rev-parse", "--is-shallow-repository") == "true":
+        log_error(
+            "the checkout is shallow, so the runner-config rev cannot be"
+            " resolved (a grafted history makes every commit look like a"
+            " config change and rolls the whole pool). Set `fetch-depth: 0`"
+            " on actions/checkout."
+        )
+        raise SystemExit(1)
+    rev = git("log", "-1", "--format=%H", "--", *CONFIG_PATHS)
     if not rev:
-        raise SystemExit("could not resolve the runner-config rev (shallow checkout?)")
+        log_error(
+            "could not resolve the runner-config rev: no commit in this"
+            f" history touches {' '.join(CONFIG_PATHS)}"
+        )
+        raise SystemExit(1)
     return rev
 
 
@@ -217,7 +283,7 @@ async def reconcile(ix) -> int:
     secret = os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token"
 
     rev = desired_rev()
-    runners = github_api(pat, repo, "/actions/runners?per_page=100")["runners"]
+    runners = list_runners(pat, repo)
     vms = {info.name: info.id for info in await ix.machines().list()}
     # Empty pool = first bootstrap: nothing exists to thrash, so the cap
     # protects nothing - raise it and build the whole pool in one run.

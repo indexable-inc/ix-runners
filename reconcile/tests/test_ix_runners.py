@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-
+import subprocess
 import unittest
 import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from reconcile.ix_runners import member_online, reconcile
+from reconcile.ix_runners import desired_rev, list_runners, member_online, reconcile
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -108,6 +108,7 @@ class FakeIx:
         busy=frozenset(),
         busy_at_delete=frozenset(),
         broken=False,
+        page_size=100,
     ):
         self.vms = vms  # existing VM names
         self.revs = revs  # name -> baked config rev (missing = unreachable)
@@ -118,6 +119,7 @@ class FakeIx:
         # runners listing, but GitHub 422s the registration delete.
         self.busy_at_delete = busy_at_delete
         self.broken = broken  # every create fails (bad template rev)
+        self.page_size = page_size  # runner listing page size
         self.calls = []
         self.create_delay = 0.0
         self.in_flight = 0
@@ -139,9 +141,13 @@ class FakeIx:
                     "status": "online",
                     "busy": member in self.busy,
                 }
-                for member in self.online | self.busy
+                for member in sorted(self.online | self.busy)
             ]
-            return {"runners": runners}
+            start = (int(path.rsplit("page=", 1)[1]) - 1) * self.page_size
+            return {
+                "total_count": len(runners),
+                "runners": runners[start : start + self.page_size],
+            }
         if path == "/actions/runners/registration-token":
             return {"token": "REGTOKEN"}
         if method == "DELETE" and path.startswith("/actions/runners/"):
@@ -333,6 +339,61 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             await self.reconcile_with(ix)
         creates = [c for _, c in ix.calls if c[0] == "create"]
         self.assertEqual(len(creates), 2)
+
+
+class ListRunnersTest(unittest.TestCase):
+    def test_every_page_is_read(self):
+        # Past 100 registrations an unpaginated listing reads the tail as
+        # offline and mass-replaces the pool.
+        rows = [
+            {"id": i, "name": f"baml-r{i}-1", "status": "online", "busy": False}
+            for i in range(1, 6)
+        ]
+        seen = []
+
+        def api(pat, repo, path, *, method="GET"):
+            seen.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            start = (page - 1) * 2
+            return {"total_count": len(rows), "runners": rows[start : start + 2]}
+
+        with mock.patch("reconcile.ix_runners.github_api", api):
+            self.assertEqual(list_runners("pat", "example/baml"), rows)
+        self.assertEqual(len(seen), 3)
+
+    def test_a_short_listing_refuses_to_reconcile(self):
+        def api(pat, repo, path, *, method="GET"):
+            return {"total_count": 9, "runners": []}
+
+        with mock.patch("reconcile.ix_runners.github_api", api):
+            with self.assertRaises(SystemExit):
+                list_runners("pat", "example/baml")
+
+
+class DesiredRevTest(unittest.TestCase):
+    @staticmethod
+    def fake_git(shallow: str, rev: str):
+        def run(args, **kwargs):
+            if args[1:3] == ["rev-parse", "--is-shallow-repository"]:
+                return subprocess.CompletedProcess(args, 0, f"{shallow}\n", "")
+            return subprocess.CompletedProcess(args, 0, f"{rev}\n", "")
+
+        return run
+
+    def test_a_shallow_checkout_is_refused(self):
+        # A grafted HEAD diffs against the empty tree, so `git log -- <paths>`
+        # names HEAD for every commit and the fleet rolls on every push.
+        with mock.patch(
+            "reconcile.ix_runners.subprocess.run", self.fake_git("true", REV)
+        ):
+            with self.assertRaises(SystemExit):
+                desired_rev()
+
+    def test_a_full_checkout_resolves_the_config_rev(self):
+        with mock.patch(
+            "reconcile.ix_runners.subprocess.run", self.fake_git("false", REV)
+        ):
+            self.assertEqual(desired_rev(), REV)
 
 
 class MemberOnlineTest(unittest.TestCase):
