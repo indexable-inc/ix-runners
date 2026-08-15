@@ -43,6 +43,7 @@ let
     escapeShellArgs
     genAttrs
     listToAttrs
+    mkDefault
     mkEnableOption
     mkIf
     mkOption
@@ -253,6 +254,16 @@ let
     printf '%s\n' "$index" > ${publishedIndexFile}.tmp
     chmod 0444 ${publishedIndexFile}.tmp
     mv -f ${publishedIndexFile}.tmp ${publishedIndexFile}
+
+    # Nothing names this guest today (see networking.hostName below), so the
+    # pool names it after itself once it knows who it is: job logs, `hostname`
+    # and the ix machine name then agree, as they did when the index was
+    # baked. Cosmetic - never worth failing the pool over.
+    want="${cfg.poolName}-runner-$index"
+    if [[ "$host" != "$want" ]]; then
+      printf '%s' "$want" > /proc/sys/kernel/hostname \
+        || echo "could not set the hostname to $want" >&2
+    fi
     echo "pool member index $index"
   '';
 
@@ -723,6 +734,14 @@ in
       only as safe as the workflow runs-on gating that keeps untrusted events
       off it.
     '';
+
+    # Empty, not unset: nixpkgs defaults this to "nixos" and then writes
+    # /etc/hostname, which systemd applies at every boot - that would clobber
+    # a name the platform assigned before systemd started, and with it the
+    # hostname source the member index can be read from. "" is the documented
+    # way to leave the hostname to something outside the closure. The identity
+    # unit sets one once it knows the member index.
+    networking.hostName = mkDefault "";
 
     environment.etc = mkIf (cfg.configRev != null) {
       "ix-runner/rev".text = cfg.configRev;
