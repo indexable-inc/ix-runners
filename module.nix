@@ -258,48 +258,128 @@ in
 
     programs.nix-ld = {
       enable = true;
+      # Deliberately GENEROUS. Every entry is one less loader failure for a
+      # foreign FHS binary a job downloads at runtime (mise/rustup
+      # toolchains, prebuilt node, cargo-binstall artifacts, playwright
+      # browsers, AppImages) - the reactive add-a-lib-per-failure loop this
+      # replaces cost one runner-fleet debugging round per new binary.
+      # Baseline: the community nix-ld set (wiki.nixos.org/wiki/Nix-ld)
+      # minus desktop-app one-offs (SDL/game runtimes, gtk2/gnome2 legacy,
+      # EOL libpng12/glew110) plus the dotnet-runner set. The cost is image
+      # closure size only; the list dies when nixpkgs#354513 (nix-ld
+      # resolves against the whole system closure) lands.
       libraries = with pkgs; [
-        stdenv.cc.cc.lib
+        # Core toolchain and compression
+        stdenv.cc.cc.lib # libstdc++
+        libgcc
         zlib
+        zstd
+        xz
+        bzip2
+        libxcrypt
+        libxcrypt-legacy
+        gmp
+        libelf
+        # Crypto, TLS, network
         openssl
         curl
         expat
-        libgcc
-        icu
         libxml2
-        libsecret
+        libsodium
+        libgcrypt
+        libgpg-error
+        libssh
         krb5
+        # System plumbing
+        attr
+        acl
+        util-linux # libuuid, libmount, libblkid
+        systemd # libudev
+        dbus
+        libcap
+        libusb1
+        fuse # AppImages
+        e2fsprogs
+        icu
+        # dotnet-based tools (the Actions runner itself, omnisharp class)
         lttng-ust
-        xz
-        bzip2
+        libsecret
+        # X11
+        xorg.libX11
+        xorg.libXext
+        xorg.libXcomposite
+        xorg.libXdamage
+        xorg.libXfixes
+        xorg.libXrandr
+        xorg.libXcursor
+        xorg.libXi
+        xorg.libXinerama
+        xorg.libXrender
+        xorg.libXScrnSaver
+        xorg.libXtst
+        xorg.libXt
+        xorg.libXmu
+        xorg.libXft
+        xorg.libSM
+        xorg.libICE
+        xorg.libxshmfence
+        xorg.libXxf86vm
+        xorg.libxcb
+        xorg.xcbutil
+        xorg.xcbutilwm
+        xorg.xcbutilimage
+        xorg.xcbutilkeysyms
+        xorg.xcbutilrenderutil
+        libxcb-cursor
+        libxkbcommon
+        # Graphics and rendering
+        libGL
+        libGLU
+        vulkan-loader
+        mesa
+        # libgbm was split out of mesa in nixpkgs; chromium's headless shell
+        # dlopens libgbm.so.1 (its absence was the one failure after
+        # browsers started executing from HOME).
+        libgbm
+        libdrm
+        libva
+        libvdpau
+        pixman
+        libjpeg
+        libpng
+        libtiff
+        librsvg
+        fontconfig
+        freetype
+        harfbuzz
+        fribidi
+        gdk-pixbuf
+        # GUI toolkits (electron, prebuilt GUI test tools)
+        glib
+        gtk3
+        pango
+        cairo
+        atk
+        at-spi2-atk
+        at-spi2-core
+        gsettings-desktop-schemas
+        libnotify
         # Playwright-downloaded chromium/firefox/webkit runtime set: jobs
         # install browsers into their persistent HOME exactly as on Ubuntu
         # images, and nix-ld makes them executable here.
-        glib
         nss
         nspr
-        atk
-        at-spi2-atk
         cups
-        dbus
-        libdrm
-        mesa
-        # libgbm was split out of mesa in nixpkgs; chromium's headless shell
-        # dlopens libgbm.so.1 (its absence was the one failure after browsers
-        # started executing from HOME).
-        libgbm
-        pango
-        cairo
-        libxkbcommon
         alsa-lib
-        systemd # libudev
-        xorg.libX11
-        xorg.libXcomposite
-        xorg.libXdamage
-        xorg.libXext
-        xorg.libXfixes
-        xorg.libXrandr
-        xorg.libxcb
+        # Audio and media
+        libpulseaudio
+        pipewire
+        flac
+        libvorbis
+        libogg
+        speex
+        libsamplerate
+        ffmpeg
       ];
     };
     services.envfs.enable = true;
