@@ -1,13 +1,15 @@
 name: ix runner pool reconcile
 description: >
-  Converge a self-hosted ix runner pool to this repository's runner config:
+  Converge a self-hosted ix runner pool to this repository's pool spec:
   create missing members, repair offline ones, replace stale or dead ones,
   and switch members on and off to follow the job queue.
   Run on GITHUB-HOSTED runners only - a runner VM must never see IX_TOKEN.
 
-# Every input below defaults to empty on purpose: the reconcile script owns
-# the default values, so they cannot drift between here and there. The value
-# each one falls back to is named in its description.
+# Two secrets and a path. Everything else about the pool - its name, size,
+# region, and every autoscaling dial - lives in the spec file, which the
+# flake reads too. There is deliberately no way to set a pool's size here:
+# doing that once meant the workflow and the flake could disagree, and the
+# only symptom was every run going red until somebody spotted it.
 inputs:
   ix-token:
     description: ix API token the runner VMs bill to
@@ -18,94 +20,18 @@ inputs:
       hosted runner: it mints short-lived (1 h) registration tokens and
       reads runner status; VMs only ever receive a registration token.
     required: true
-  region:
-    description: ix region the pool lives in (default us-west-1)
-    default: ""
-  pool-name:
+  config-file:
     description: >
-      Pool name; everything derives from it (VM names <pool>-runner-<N>,
-      runner names <pool>-r<N>-<slot>, the secret key). MUST equal the
-      `services.ix-runner.poolName` in your nix policy. Defaults to this
-      repository's name.
-    default: ""
-  attr-prefix:
-    description: >
-      Flake attribute prefix for pool members, `<prefix>-<N>`. Must equal
-      mkPool's attrPrefix (default ci-runner).
-    default: ""
-  pool-size:
-    description: >
-      Number of pool VMs; must match the flake's mkPool size (default 8).
-      Lowering it prunes the members above the new size.
-    default: ""
-  max-replacements:
-    description: >
-      Per-run cap on creations+replacements (default 2). A bad config rev
-      stalls loudly after N boots instead of thrashing the pool; a config
-      roll converges across runs like a rolling update. An empty pool
-      raises the cap to pool-size on its own.
-    default: ""
-  concurrency:
-    description: >
-      Creations/replacements executed at once (default 4). Guest boots
-      dominate a roll's wall clock and overlap safely; each concurrent
-      first boot of a new rev is also a concurrent template build, so keep
-      this within the region's build appetite.
-    default: ""
-
-  # -- autoscaling: the pool's member set stays fixed, only power moves --
-  min-warm:
-    description: >
-      Members kept ON no matter how quiet it is - the floor that decides
-      how much of a wave starts instantly instead of waiting for a boot.
-      Defaults to pool-size, which is autoscaling OFF and exactly the
-      pre-autoscaling behaviour; set it lower to turn scaling on.
-    default: ""
-  max-online:
-    description: >
-      Ceiling on members powered on at once (default pool-size).
-    default: ""
-  scale-headroom:
-    description: >
-      Members kept on ABOVE current demand, so the next job finds a warm
-      runner rather than a boot (default 2).
-    default: ""
-  runner-label:
-    description: >
-      The label your jobs target, e.g. the first of
-      `services.ix-runner.labels`. Demand is matched against what each
-      runner ACTUALLY advertises, read off its registration, so this is only
-      the fallback for a pool that has not registered anything yet - but it
-      is required once min-warm is below max-online, because a bootstrap
-      pool would otherwise match no job at all.
-    default: ""
-  idle-grace-seconds:
-    description: >
-      How long a member must have been idle before it is switched off
-      (default 600). Derived from GitHub's own job timestamps - the last
-      completion recorded against that runner - so it is a real duration
-      and does not change length when the cron does.
-    default: ""
-  max-stops:
-    description: >
-      Per-tick cap on stops (default 4). Starts are deliberately NOT capped:
-      being short of capacity is the state with a queue behind it, while
-      being long of it merely costs money and can wait for the next tick.
-    default: ""
-  tick-mode:
-    description: >
-      `scheduled` or `event`. Only a scheduled tick may switch machines OFF.
-      Defaults from the triggering event, which is almost always what you
-      want: a workflow_run tick fires when a run is REQUESTED, before its
-      jobs reach the queue, so it sees an idle pool at the exact moment a
-      wave is landing.
-    default: ""
+      Path to the pool spec, relative to the workspace. Defaults to
+      nix/ix-pool.json, which is where the flake looks for it too.
+    default: nix/ix-pool.json
   github-token:
     description: >
-      Token used ONLY to read the job queue for the demand signal. The
+      Reads the job queue for the demand signal, and nothing else. The
       workflow's own GITHUB_TOKEN, which needs `permissions: actions: read`.
       Deliberately not the PAT: listing runs needs the Actions permission,
-      and repo administration has no business holding it.
+      and repo administration has no business holding it. You should not
+      need to set this.
     default: ${{ github.token }}
 
 runs:
@@ -130,20 +56,8 @@ runs:
       env:
         IX_TOKEN: ${{ inputs.ix-token }}
         RUNNER_PAT: ${{ inputs.runner-pat }}
-        IX_REGION: ${{ inputs.region }}
-        POOL_NAME: ${{ inputs.pool-name }}
-        ATTR_PREFIX: ${{ inputs.attr-prefix }}
-        POOL_SIZE: ${{ inputs.pool-size }}
-        MAX_REPLACEMENTS: ${{ inputs.max-replacements }}
-        CONCURRENCY: ${{ inputs.concurrency }}
-        MIN_WARM: ${{ inputs.min-warm }}
-        MAX_ONLINE: ${{ inputs.max-online }}
-        SCALE_HEADROOM: ${{ inputs.scale-headroom }}
-        RUNNER_LABEL: ${{ inputs.runner-label }}
-        IDLE_GRACE_SECONDS: ${{ inputs.idle-grace-seconds }}
-        MAX_STOPS: ${{ inputs.max-stops }}
-        TICK_MODE: ${{ inputs.tick-mode }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        IX_POOL_SPEC: ${{ inputs.config-file }}
       # --locked: install exactly the hash-pinned ix-sdk in ix-runners.lock,
       # never whatever the index resolves to today.
       run: uv run --locked --script "${{ github.action_path }}/reconcile/ix-runners"

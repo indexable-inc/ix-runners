@@ -1,0 +1,331 @@
+"""Every knob, resolved once, and the rules that decide a knob is wrong.
+
+Config is frozen because the rest of the run treats it as a fact. It is
+built once, at the top, and the awkward part - a scaling range that does not
+make sense - is resolved HERE rather than being re-checked at every use:
+`refusals` carries what was wrong, and the values are already corrected to
+the safe reading by the time anything reads them.
+
+SECRETS ARE DELIBERATELY NOT IN HERE. A dataclass has a repr, and a repr
+ends up in tracebacks; the admin PAT and the workflow token are passed
+separately so no accident can print them.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import pathlib
+import subprocess
+
+from .report import log_error
+
+# Paths whose last-touching commit defines the desired runner-config rev.
+CONFIG_PATHS = ["nix/", "flake.nix", "flake.lock"]
+
+def git(*args: str) -> str:
+    """Run git in the checkout; return its stdout, stripped."""
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def desired_rev() -> str:
+    """Last commit touching the runner config, NOT GITHUB_SHA.
+
+    Unrelated merges must not roll the fleet, and the template cache is
+    keyed by exact rev (never provision from a branch name: it re-resolves).
+    """
+    # A shallow checkout's grafted boundary commit diffs against the empty
+    # tree, so `git log -- <paths>` names HEAD for EVERY commit and the whole
+    # fleet rolls on every push - silently, because the rev looks plausible.
+    if git("rev-parse", "--is-shallow-repository") == "true":
+        log_error(
+            "the checkout is shallow, so the runner-config rev cannot be"
+            " resolved (a grafted history makes every commit look like a"
+            " config change and rolls the whole pool). Set `fetch-depth: 0`"
+            " on actions/checkout."
+        )
+        raise SystemExit(1)
+    rev = git("log", "-1", "--format=%H", "--", *CONFIG_PATHS)
+    if not rev:
+        log_error(
+            "could not resolve the runner-config rev: no commit in this"
+            f" history touches {' '.join(CONFIG_PATHS)}"
+        )
+        raise SystemExit(1)
+    return rev
+
+
+def pool_name() -> str:
+    """The pool's name: POOL_NAME env, or the repository's name.
+
+    Everything derives from it, matching the nix module's poolName option:
+    VM names `<pool>-runner-<N>`, runner names `<pool>-r<N>-<slot>`, and the
+    secret store key `<pool>_runner_reg_token`.
+    """
+    explicit = os.environ.get("POOL_NAME")
+    if explicit:
+        return explicit
+    return os.environ["GITHUB_REPOSITORY"].split("/")[1].lower()
+
+
+def attr_prefix() -> str:
+    """Flake attribute prefix for pool members, matching mkPool's attrPrefix."""
+    return os.environ.get("ATTR_PREFIX") or "ci-runner"
+
+
+# Knobs that only exist so a test can drive them, never documented on the
+# action: the trigger normally speaks for itself.
+SCALE_DOWN_EVENTS = (None, "", "schedule", "workflow_dispatch")
+
+
+# The pool spec's whole vocabulary. Anything else in the file is a typo, and
+# a typo that silently defaults is a pool quietly running someone else's
+# numbers - `mniWarm` would read as "autoscaling off" and cost real money.
+# Same reasoning as a deny-unknown-fields deserializer.
+SPEC_KEYS = {
+    "pool-name": str,
+    "region": str,
+    "attr-prefix": str,
+    "runner-label": str,
+    "pool-size": int,
+    "min-warm": int,
+    "max-online": int,
+    "scale-headroom": int,
+    "idle-grace-seconds": int,
+    "max-stops": int,
+    "max-replacements": int,
+    "concurrency": int,
+}
+
+# Where the spec lives unless the action is told otherwise. Under nix/ on
+# purpose: that directory is already one of CONFIG_PATHS, so a change to the
+# pool's shape rolls the fleet the same way any other config change does.
+DEFAULT_SPEC_PATH = "nix/ix-pool.json"
+
+
+def load_spec(path: str) -> dict[str, object]:
+    """Read the pool spec, refusing anything it does not understand."""
+    file = pathlib.Path(path)
+    if not file.is_file():
+        log_error(
+            f"no pool spec at {path}. This file is the pool's definition and"
+            " both sides read it - the flake builds the members from it and"
+            " this reconcile manages them from it. A minimal one is"
+            ' {"pool-name": "<name>", "region": "<region>", "pool-size": 8}.'
+        )
+        raise SystemExit(1)
+    try:
+        spec = json.loads(file.read_text())
+    except (OSError, ValueError) as error:
+        log_error(f"{path} could not be read as JSON: {error}")
+        raise SystemExit(1) from error
+    if not isinstance(spec, dict):
+        log_error(f"{path} must contain a JSON object, not a {type(spec).__name__}")
+        raise SystemExit(1)
+
+    problems = []
+    for key, value in spec.items():
+        want = SPEC_KEYS.get(key)
+        if want is None:
+            near = [known for known in SPEC_KEYS if known.replace("-", "") == str(key).replace("-", "").lower()]
+            hint = f" (did you mean {near[0]!r}?)" if near else ""
+            problems.append(f"unknown key {key!r}{hint}")
+        # bool is an int subclass, and `"pool-size": true` is not a size.
+        elif want is int and (isinstance(value, bool) or not isinstance(value, int)):
+            problems.append(f"{key!r} must be a whole number, got {value!r}")
+        elif want is str and not isinstance(value, str):
+            problems.append(f"{key!r} must be a string, got {value!r}")
+    if problems:
+        for problem in problems:
+            log_error(f"{path}: {problem}")
+        log_error(f"{path}: known keys are {', '.join(sorted(SPEC_KEYS))}")
+        raise SystemExit(1)
+    return spec
+
+
+def spec_from_env() -> dict[str, object]:
+    """The same shape, assembled from the environment.
+
+    Every value the action used to pass as its own input. Kept because the
+    ambient half of the configuration (which repo, which run, which event)
+    can only come from the environment anyway, and because it lets the test
+    suite drive a Config without writing a file for every case. Production
+    reads the spec file; this is what fills the gaps around it.
+    """
+    spec: dict[str, object] = {}
+    for key, want in SPEC_KEYS.items():
+        raw = os.environ.get(key.upper().replace("-", "_"))
+        if raw:
+            spec[key] = int(raw) if want is int else raw
+    return spec
+
+
+def _int(name: str, default: int) -> int:
+    return int(os.environ.get(name) or default)
+
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    """One tick's settings, already validated and already corrected."""
+
+    repo: str
+    pool: str
+    attr_prefix: str
+    region: str
+    secret_name: str
+    pool_size: int
+    max_replacements: int
+    concurrency: int
+    # -- autoscaling --
+    min_warm: int
+    max_online: int
+    headroom: int
+    idle_grace: float
+    max_stops: int
+    runner_label: str
+    tick_mode: str
+    # Rotated per run so one permanently-broken low-numbered member cannot
+    # own the whole replacement budget forever.
+    run_number: int
+    # What was misconfigured. Non-empty means the run reports failure, but
+    # the values above are already the safe reading, so it still reconciles.
+    refusals: tuple[str, ...] = ()
+
+    @property
+    def autoscaling(self) -> bool:
+        """Can demand move the answer at all?
+
+        When the floor meets the ceiling the clamp pins desired to
+        max_online whatever the queue says, so there is nothing to ask
+        GitHub. That is the default, and it is why an unconfigured pool
+        never pays for a scan and never needs a label.
+        """
+        return self.min_warm < self.max_online
+
+    @property
+    def may_scale_down(self) -> bool:
+        """Only a scheduled tick may switch machines off."""
+        return self.tick_mode == "scheduled"
+
+    def member_name(self, member: int) -> str:
+        return f"{self.pool}-runner-{member}"
+
+    @classmethod
+    def load(cls) -> "Config":
+        """The one entry point: the spec file when there is one, else env.
+
+        IX_POOL_SPEC is set by the composite action and points at the
+        repo's pool spec. Without it - which in practice means the test
+        suite - the same shape is assembled from the environment, so there
+        is exactly ONE implementation of every default and every rule
+        below, whichever way the values arrived.
+        """
+        path = os.environ.get("IX_POOL_SPEC")
+        return cls.from_spec(load_spec(path) if path else spec_from_env())
+
+    @classmethod
+    def from_spec(cls, spec: dict[str, object]) -> "Config":
+        """Fill in the defaults, then validate the whole thing at once.
+
+        Validation is one pass at the end because the rules are RELATIONS -
+        a min_warm is only wrong relative to a max_online and a pool_size -
+        and checking a relation while its other side is still unread is how
+        a validator ends up disagreeing with itself.
+        """
+
+        def number(key: str, default: int) -> int:
+            value = spec.get(key)
+            return default if value is None else int(value)  # type: ignore[arg-type]
+
+        def text(key: str, default: str) -> str:
+            value = spec.get(key)
+            return default if value is None else str(value)
+
+        pool = text("pool-name", pool_name())
+        # POOL_SIZE x `slots` runner daemons each = the concurrent job budget.
+        # The flake's mkPool reads this SAME key, which is what stopped the
+        # two from drifting: a larger pool here used to ask for flake attrs
+        # that did not exist, and every run was red until someone noticed.
+        pool_size = number("pool-size", 8)
+        # min-warm defaults to the whole pool: unset, every member stays on
+        # and this is exactly the pre-autoscaling reconcile.
+        min_warm = number("min-warm", pool_size)
+        max_online = number("max-online", pool_size)
+        refusals: list[str] = []
+
+        if not 0 <= min_warm <= max_online <= pool_size:
+            refusals.append(
+                f"min-warm={min_warm}, max-online={max_online} and"
+                f" pool-size={pool_size} must satisfy"
+                " 0 <= min-warm <= max-online <= pool-size"
+            )
+
+        runner_label = text("runner-label", "")
+        # The workflow's own token, which needs `actions: read` and nothing
+        # else. Falling back to the PAT would work only if someone had
+        # granted it the Actions permission, and the whole point is that it
+        # must not have one.
+        demand_token = os.environ.get("GITHUB_TOKEN") or ""
+        if not refusals and min_warm < max_online:
+            if not runner_label:
+                refusals.append(
+                    "runner-label is unset, so there is no demand signal. Set"
+                    " it in the pool spec to the label your jobs target (one"
+                    " of `services.ix-runner.labels`). It is what a bootstrap"
+                    " pool matches jobs against before any runner has"
+                    " registered a label set of its own; without it a pool"
+                    " with nothing registered can serve no job it can see."
+                )
+            elif not demand_token:
+                refusals.append(
+                    "GITHUB_TOKEN is unset, so the job queue cannot be read."
+                    " Pass the workflow's own token (github-token on the"
+                    " action) and give the job `permissions: actions: read`."
+                )
+
+        if refusals:
+            # Off means the WHOLE pool stays on. Leaving a hand-set
+            # max-online in place would keep stopping machines while the run
+            # announced that scaling was off.
+            for why in refusals:
+                log_error(f"autoscaling is off for this run: {why}")
+            min_warm = max_online = pool_size
+
+        return cls(
+            repo=os.environ["GITHUB_REPOSITORY"],
+            pool=pool,
+            attr_prefix=text("attr-prefix", "ci-runner"),
+            region=text("region", os.environ.get("IX_REGION") or "us-west-1"),
+            secret_name=os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token",
+            pool_size=pool_size,
+            max_replacements=number("max-replacements", 2),
+            concurrency=number("concurrency", 4),
+            min_warm=min_warm,
+            max_online=max_online,
+            headroom=number("scale-headroom", 2),
+            # Seconds, not ticks: idle time is derived from GitHub's own job
+            # timestamps, so it is a real duration and does not depend on
+            # how often this runs. A tick counter meant the grace silently
+            # changed length whenever the cron did.
+            idle_grace=float(number("idle-grace-seconds", 600)),
+            # Only stops are capped. Being SHORT of capacity is the state
+            # with a queue behind it, so a start is never rationed; being
+            # long of it costs money, which can wait for the next tick.
+            max_stops=number("max-stops", 4),
+            runner_label=runner_label,
+            # Which trigger this is. NOT a spec key: the trigger already
+            # says, and an operator pinning it in a file would be pinning it
+            # for the cron too. TICK_MODE exists for tests.
+            tick_mode=(
+                os.environ.get("TICK_MODE")
+                or (
+                    "scheduled"
+                    if os.environ.get("GITHUB_EVENT_NAME") in SCALE_DOWN_EVENTS
+                    else "event"
+                )
+            ).lower(),
+            run_number=_int("GITHUB_RUN_NUMBER", 0),
+            refusals=tuple(refusals),
+        )

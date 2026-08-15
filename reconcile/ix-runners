@@ -3,9 +3,21 @@
 # requires-python = ">=3.13"
 # dependencies = ["ix-sdk==0.7.1"]
 # ///
-"""Reconcile the self-hosted ix runner pool; see ix_runners.py."""
+"""Reconcile the self-hosted ix runner pool; see reconcile/ix_runners.py.
 
-from ix_runners import main
+The parent directory goes on sys.path so this imports the `reconcile`
+PACKAGE rather than a loose module. uv puts THIS file's directory on the
+path, which would make the package's own `from .x import y` unresolvable -
+and the test suite imports the same package, so both entry points have to
+agree on what the package is called.
+"""
+
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from reconcile.ix_runners import main  # noqa: E402
 
 if __name__ == "__main__":
     main()
