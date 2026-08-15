@@ -65,6 +65,10 @@ REPAIRED_MARKER = "/var/lib/ix-runner/repaired"
 STRIKE = "ix-runner-strike"
 # A wedged VM must not hang the reconcile.
 EXEC_TIMEOUT = 60
+# The probe's whole legitimate answer is a 40-char rev plus a marker word.
+# Anything past this is a fault or a hostile guest, and machine.shell()
+# buffers the lot in this process, so the cap has to be here, client-side.
+MAX_PROBE_OUTPUT = 4096
 # Bounds a create: a first boot of a new rev builds the template in-guest.
 CREATE_TIMEOUT = 1800
 # A machine this young is still compiling its template or booting, so its
@@ -399,16 +403,31 @@ async def probe_member(machine: Any, *, clear_marker: bool) -> tuple[str | None,
     on every healthy member, for a file that is almost never there. Exit
     status is deliberately ignored: `test -f` sets it whenever the marker is
     absent, which is the ordinary case.
+
+    Every failure reads as "unreachable", which is a state the decide loop
+    already handles. The guest is the least trusted thing here: it answers
+    with whatever it likes, so nothing it says may end the run.
     """
     script = f"cat {REV_PATH}; test -f {REPAIRED_MARKER} && echo {STRIKE}"
     if clear_marker:
         script += f"; rm -f {REPAIRED_MARKER}"
     try:
         result = await asyncio.wait_for(machine.shell(script), EXEC_TIMEOUT)
-    # IxError subclasses RuntimeError; TimeoutError covers the wait_for bound.
-    except (TimeoutError, OSError, RuntimeError):
+    # Broad on purpose: IxError subclasses RuntimeError and TimeoutError
+    # covers the wait_for bound, but a MemoryError from a huge reply is
+    # neither, and one member must never take the whole reconcile down.
+    except Exception:
         return None, False
-    tokens = result.stdout.split()
+    stdout = result.stdout or ""
+    if len(stdout) > MAX_PROBE_OUTPUT:
+        # A `head -c` inside the script bounds nothing - the guest chooses
+        # what it sends, and machine.shell() buffers all of it here.
+        log_warning(
+            f"a pool member answered the probe with {len(stdout)} bytes"
+            f" (cap {MAX_PROBE_OUTPUT}); treating it as unreachable"
+        )
+        return None, False
+    tokens = stdout.split()
     rev = next((token for token in tokens if token != STRIKE), None)
     return rev, STRIKE in tokens
 
@@ -491,21 +510,48 @@ async def reconcile(ix: Any) -> int:
     gate = asyncio.Semaphore(concurrency)
 
     # -- probe (concurrent) --
+    members = list(range(1, pool_size + 1))
+
     async def probe(member: int) -> tuple[int, str | None, bool]:
         info = vms.get(f"{pool}-runner-{member}")
         if info is None:
             return member, None, False
         async with gate:
-            # The marker clear rides the probe, so a healthy member costs one
-            # round-trip; it is only ever sent to a member with a live runner.
-            found, struck = await probe_member(
-                ix.machines().connect(info.id),
-                clear_marker=member_online(runners, pool, member),
-            )
+            try:
+                # connect() and the marker decision are inside the try too:
+                # outside it, a member that could not even be connected to
+                # cancelled every sibling probe.
+                machine = ix.machines().connect(info.id)
+                # The marker clear rides the probe, so a healthy member costs
+                # one round-trip; only a member with a live runner is sent it.
+                found, struck = await probe_member(
+                    machine, clear_marker=member_online(runners, pool, member)
+                )
+            except Exception as error:
+                log_warning(
+                    f"{pool}-runner-{member}: probe failed ({error!r})"
+                    " -> reading it as unreachable"
+                )
+                return member, None, False
         return member, found, struck
 
-    probed = await asyncio.gather(*(probe(m) for m in range(1, pool_size + 1)))
-    state = {member: (found, struck) for member, found, struck in probed}
+    # return_exceptions: one member's failure decides that member, never the
+    # whole run. An escaping exception cancelled every sibling probe and left
+    # the pool - including a security rev bump - unconverged forever.
+    probed = await asyncio.gather(
+        *(probe(member) for member in members), return_exceptions=True
+    )
+    state: dict[int, tuple[str | None, bool]] = {}
+    for member, outcome in zip(members, probed):
+        if isinstance(outcome, BaseException):
+            log_warning(
+                f"{pool}-runner-{member}: probe raised past the handler"
+                f" ({outcome!r}) -> reading it as unreachable"
+            )
+            state[member] = (None, False)
+            continue
+        _, found, struck = outcome
+        state[member] = (found, struck)
 
     replaced = 0
     failures = 0

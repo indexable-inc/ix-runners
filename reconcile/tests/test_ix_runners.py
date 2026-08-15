@@ -15,6 +15,7 @@ import urllib.request
 from unittest import mock
 
 from reconcile.ix_runners import (
+    MAX_PROBE_OUTPUT,
     OPENER,
     api_url,
     deregister_member,
@@ -25,6 +26,7 @@ from reconcile.ix_runners import (
     main,
     member_online,
     member_runners,
+    probe_member,
     reconcile,
     require_hosted_runner,
 )
@@ -105,6 +107,9 @@ class FakeMachine:
 
     async def shell(self, script, working_dir=None):
         self.platform.calls.append((self.name, ("shell", script)))
+        error = self.platform.probe_errors.get(self.name)
+        if error is not None:
+            raise error
         if self.name not in self.platform.revs:
             raise FakeUnavailable("guest agent did not answer")
         out = self.platform.revs[self.name] + "\n"
@@ -130,7 +135,13 @@ class FakeMachines:
         return [FakeInfo(name, **self.platform.info.get(name, {})) for name in sorted(self.platform.vms)]
 
     def connect(self, vm_id):
-        return FakeMachine(self.platform, vm_id.removeprefix("id-"))
+        name = vm_id.removeprefix("id-")
+        # One-shot: the scripted failure belongs to the probe that provoked
+        # it, so the later execute-phase connect for the same member works.
+        error = self.platform.connect_errors.pop(name, None)
+        if error is not None:
+            raise error
+        return FakeMachine(self.platform, name)
 
     async def create(self, options):
         name = options["name"]
@@ -176,6 +187,8 @@ class FakeIx:
         broken=False,
         create_error=None,
         create_errors=None,
+        connect_errors=None,
+        probe_errors=None,
         page_size=100,
     ):
         self.vms = vms  # existing VM names
@@ -196,6 +209,8 @@ class FakeIx:
             else (FakeIxError("template build failed") if broken else None)
         )
         self.create_errors = create_errors or {}  # name -> exception
+        self.connect_errors = connect_errors or {}  # name -> exception
+        self.probe_errors = probe_errors or {}  # name -> exception from shell()
         self.page_size = page_size
         self.calls = []
         self.created = []  # names whose create ran to completion
@@ -620,6 +635,24 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("baml-runner-1", ("delete",)), ix.calls)
         self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
 
+    async def test_one_hostile_member_does_not_cancel_the_other_probes(self):
+        # A probe that raises anything but the three expected types used to
+        # escape the gather, cancel every sibling probe, and kill the run -
+        # freezing the pool, including a security rev bump, until a human
+        # noticed. Every other member must still be decided.
+        ix = FakeIx(
+            vms={"baml-runner-1", "baml-runner-2"},
+            revs={"baml-runner-1": REV, "baml-runner-2": OLD_REV},
+            online={1, 2},
+            markers=set(),
+            connect_errors={"baml-runner-1": MemoryError("guest flooded the read")},
+        )
+        self.assertEqual(await self.reconcile_with(ix), 2)
+        # Member 1 reads unreachable (the decision the loop already has for
+        # a member that says nothing), member 2 still converges.
+        self.assertIn(("baml-runner-2", ("delete",)), ix.calls)
+        self.assertEqual(sorted(ix.created), ["baml-runner-1", "baml-runner-2"])
+
     async def test_one_failed_create_does_not_abort_the_run(self):
         # A bad template rev spends the budget and exits non-zero, but every
         # member in budget is still attempted (no half-scanned pool).
@@ -660,6 +693,35 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(SystemExit):
             await self.reconcile_with(ix, env=env)
         self.assertEqual(ix.created, ["baml-runner-2"])
+
+
+class ProbeMemberTest(unittest.IsolatedAsyncioTestCase):
+    """The guest is the least trusted party in the system: it answers with
+    whatever it likes, and nothing it says may end the run."""
+
+    async def test_an_unforeseen_exception_reads_as_unreachable(self):
+        # The old except tuple caught TimeoutError/OSError/RuntimeError only,
+        # so a MemoryError from an oversized reply escaped and, through a
+        # gather with no return_exceptions, cancelled every sibling probe.
+        class Hostile:
+            async def shell(self, script):
+                raise MemoryError("the guest answered with gigabytes")
+
+        self.assertEqual(await probe_member(Hostile(), clear_marker=False), (None, False))
+
+    async def test_an_oversized_reply_is_not_trusted(self):
+        # A reply that opens with a plausible rev and then floods reads
+        # HEALTHY without a cap - the flood is the part that costs memory.
+        class Flood:
+            async def shell(self, script):
+                return FakeExec(0, f"{REV}\n" + "x" * (MAX_PROBE_OUTPUT + 1))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                await probe_member(Flood(), clear_marker=False), (None, False)
+            )
+        self.assertIn("::warning::", out.getvalue())
 
 
 class ListRunnersTest(unittest.TestCase):
