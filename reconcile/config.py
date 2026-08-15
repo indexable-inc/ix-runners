@@ -14,10 +14,10 @@ separately so no accident can print them.
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
 import pathlib
 import subprocess
+import tomllib
 
 from .report import log_error
 
@@ -102,7 +102,14 @@ SPEC_KEYS = {
 # Where the spec lives unless the action is told otherwise. Under nix/ on
 # purpose: that directory is already one of CONFIG_PATHS, so a change to the
 # pool's shape rolls the fleet the same way any other config change does.
-DEFAULT_SPEC_PATH = "nix/ix-pool.json"
+#
+# TOML rather than JSON because this file is read far more often than it is
+# written, and every key in it wants a line saying what it does - which JSON
+# has nowhere to put. tomllib has been stdlib since 3.11 and the entrypoint
+# pins >=3.13, so reading it adds no dependency to a job holding a repo-admin
+# PAT. TOML also keeps its types honest: an int stays an int and a bool stays
+# a bool, which is what the checks below rely on.
+DEFAULT_SPEC_PATH = "nix/ix-pool.toml"
 
 
 def load_spec(path: str) -> dict[str, object]:
@@ -112,18 +119,19 @@ def load_spec(path: str) -> dict[str, object]:
         log_error(
             f"no pool spec at {path}. This file is the pool's definition and"
             " both sides read it - the flake builds the members from it and"
-            " this reconcile manages them from it. A minimal one is"
-            ' {"pool-name": "<name>", "region": "<region>", "pool-size": 8}.'
+            " this reconcile manages them from it. A minimal one is three"
+            ' lines: pool-name = "<name>" / region = "<region>" /'
+            " pool-size = 8."
         )
         raise SystemExit(1)
     try:
-        spec = json.loads(file.read_text())
+        # Binary, because tomllib insists on it: TOML is defined as UTF-8 and
+        # it decodes rather than trusting the platform's locale.
+        with file.open("rb") as handle:
+            spec = tomllib.load(handle)
     except (OSError, ValueError) as error:
-        log_error(f"{path} could not be read as JSON: {error}")
+        log_error(f"{path} could not be read as TOML: {error}")
         raise SystemExit(1) from error
-    if not isinstance(spec, dict):
-        log_error(f"{path} must contain a JSON object, not a {type(spec).__name__}")
-        raise SystemExit(1)
 
     problems = []
     for key, value in spec.items():
@@ -132,7 +140,9 @@ def load_spec(path: str) -> dict[str, object]:
             near = [known for known in SPEC_KEYS if known.replace("-", "") == str(key).replace("-", "").lower()]
             hint = f" (did you mean {near[0]!r}?)" if near else ""
             problems.append(f"unknown key {key!r}{hint}")
-        # bool is an int subclass, and `"pool-size": true` is not a size.
+        # bool is an int subclass, and `pool-size = true` is not a size.
+        # TOML parses a real bool here rather than coercing, so this check is
+        # doing exactly as much work as it was.
         elif want is int and (isinstance(value, bool) or not isinstance(value, int)):
             problems.append(f"{key!r} must be a whole number, got {value!r}")
         elif want is str and not isinstance(value, str):
