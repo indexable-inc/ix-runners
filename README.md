@@ -266,6 +266,12 @@ it is not:
   package in the pool's nix policy.
 - `$HOME` is per-slot and persists across jobs and reboots; the checkout
   directory is wiped on every runner restart.
+- `/tmp` is the slot's own directory, on disk, and is the same directory as
+  `$TMPDIR`. Nothing else on the VM can see it. The one consequence: a
+  container gets its bind mounts resolved by dockerd, which is outside the
+  slot's namespace, so `-v /tmp/x:/x` does not name the `/tmp` the job sees -
+  mount `-v "$TMPDIR/x:/x"` instead, which names the same directory on both
+  sides.
 - Preinstalled tooling comes from your nix policy, not a hosted image.
   Anything a job expects "to just be there" must be listed there.
 

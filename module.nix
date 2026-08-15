@@ -297,7 +297,9 @@ in
         # a warm toolchain/registry cache needs a directory nothing clears.
         HOME = homeOf name;
         # Disk-backed job temp, off the small boot-path /tmp (issue #2);
-        # aged out by the tmpfiles rule below.
+        # aged out by the tmpfiles rule below. The unit's /tmp is this same
+        # directory (see BindPaths), so a job has one temp space under two
+        # names - and only this name resolves the same way for dockerd.
         TMPDIR = tmpOf name;
       }
       // nixLdEnvironment
@@ -336,9 +338,6 @@ in
         CPUWeight = "100";
         # Hosted-runner parity: 0066 leaves job artifacts unreadable to other
         # UIDs, which breaks containers and bind mounts reading the checkout.
-        # /tmp is read-only under ProtectSystem=strict and $TMPDIR is the
-        # per-slot writable temp; do not add /tmp to ReadWritePaths (a shared
-        # writable /tmp would reintroduce a cross-slot channel).
         UMask = "0022";
         # systemd's 0755 default would publish this slot's runner _diag logs
         # and runtime dir to every other slot's user.
@@ -357,9 +356,45 @@ in
         # argument as above.
         SystemCallFilter = mkForce [ ];
         NoNewPrivileges = mkForce false;
-        # dockerd resolves `-v /tmp/...` in the host namespace, so a private
-        # /tmp silently hands the container an empty directory. The VM is the
-        # boundary, and TMPDIR points elsewhere anyway.
+        # /tmp inside the unit IS this slot's temp directory. TMPDIR alone is
+        # not enough: toolchains write cross-process state to a COMPILED-IN
+        # /tmp. .NET is the proven case - coreclr's PAL builds its named-mutex
+        # and shared-memory root from TEMP_DIRECTORY_PATH "/tmp/"
+        # (pal/src/include/pal/palinternal.h, consumed by INIT_SharedFilesPath)
+        # and never reads TMPDIR (dotnet/runtime#49822 asked for exactly that
+        # and was closed with no fix), so under ProtectSystem=strict every
+        # csharp job dies in its first dotnet invocation on
+        # `mkdtemp("/tmp/.dotnet.XXXXXX") == nullptr; errno == EROFS`. No job
+        # env can fix a path the runtime does not read.
+        #
+        # Measured on systemd 261: a BindPaths= destination is read-WRITE under
+        # ProtectSystem=strict with no ReadWritePaths entry of its own, and a
+        # slot's namespace sees only its own directory.
+        #
+        # This RAISES isolation. Today the read-only /tmp is still the host's,
+        # so a job can read every temp file on the VM; after this it sees only
+        # the 0700 directory it owns. Keep that directory 0700 and never 1777:
+        # it is reachable on the host as $TMPDIR, where world-writable would be
+        # the cross-slot channel this pool must not have.
+        #
+        # What it does change is docker. dockerd resolves `-v /tmp/...` in the
+        # HOST namespace, so a container bind of a /tmp path no longer names
+        # the directory the job sees. That is not a regression of anything that
+        # works: the write half is impossible today (a read-only /tmp cannot be
+        # populated by the job). And it cannot be designed away at slots > 1 -
+        # a /tmp that dockerd and every slot agree on is by construction one
+        # shared writable directory. Jobs that must hand a directory to a
+        # container mount $TMPDIR paths, which name the same directory inside
+        # and outside the namespace.
+        #
+        # Why not upstream's PrivateTmp=true (the default this turns off): its
+        # tmpfs is RAM-backed, and job temp on this pool is deliberately
+        # disk-backed (issue #2 - the boot-path /tmp tmpfs is sized off boot
+        # RAM and observed full at 1.5G). The bind keeps the disk and makes
+        # /tmp and $TMPDIR one directory, so a single tmpfiles age rule bounds
+        # both and a job's own cleanup covers both. /var/tmp stays read-only
+        # until something needs it.
+        BindPaths = [ "${tmpOf name}:/tmp" ];
         PrivateTmp = mkForce false;
       };
     });
@@ -395,7 +430,9 @@ in
     ++ map (name: "d ${homeOf name} 0700 ${name} ${name} -") runnerNames
     # Per-slot rather than one shared 1777 dir: a shared temp is a cross-slot
     # channel that the sticky bit does not close, while per-slot dirs make a
-    # job's own cleanup step safe and bound what one leaking job fills.
+    # job's own cleanup step safe and bound what one leaking job fills. This
+    # is also the slot's /tmp, so the mode is load-bearing twice over - it is
+    # the only thing keeping a co-tenant out of it by the host path.
     ++ map (name: "d ${tmpOf name} 0700 ${name} ${name} 1d") runnerNames
     # The runner's _diag logs (LogsDirectory=) are never rotated and this VM
     # is long-lived. The dirs themselves are systemd's; only age the contents.
