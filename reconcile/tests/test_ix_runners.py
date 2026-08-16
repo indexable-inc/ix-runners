@@ -1640,6 +1640,22 @@ class ListRunnersTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 list_runners("pat", "example/baml")
 
+    def test_a_listing_without_total_count_is_refused(self):
+        # total_count absent must not read as "complete": a full page with no
+        # count would otherwise stop after page one and leave the tail
+        # unlisted, and every unlisted member reads offline and is replaced.
+        rows = [
+            {"id": i, "name": f"baml-r{i}-1", "status": "online", "busy": False}
+            for i in range(1, 4)
+        ]
+
+        def api(pat, repo, path, *, method="GET"):
+            return {"runners": rows}
+
+        with mock.patch("reconcile.github.github_api", api):
+            with self.assertRaises(SystemExit):
+                list_runners("pat", "example/baml")
+
 
 class DesiredRevTest(unittest.TestCase):
     @staticmethod

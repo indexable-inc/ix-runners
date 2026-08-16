@@ -18,7 +18,9 @@ from reconcile import vending
 
 IX_MODE = {"IX_TOKEN_SOURCE": "ix"}
 OIDC_ENV = {
-    "ACTIONS_ID_TOKEN_REQUEST_URL": "https://actions.example/token?x=1",
+    "ACTIONS_ID_TOKEN_REQUEST_URL": (
+        "https://token.actions.githubusercontent.com/token?x=1"
+    ),
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer",
 }
 
@@ -33,6 +35,7 @@ def scrubbed(extra: dict[str, str]) -> mock._patch_dict:
             "RUNNER_PAT",
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "IX_RUNNERS_ALLOW_NON_HOSTED",
         )
     }
     return mock.patch.dict(os.environ, cleared | extra)
@@ -65,15 +68,20 @@ class FakeClient:
 
 
 def fake_oidc_endpoint(body: bytes = b'{"value": "jwt-abc"}'):
-    """Patch urlopen with a stub that records the request it served."""
+    """Patch the OIDC opener with a stub that records the request it served.
+
+    Patches ``vending.OPENER.open`` rather than ``urllib.request.urlopen``:
+    the fetch goes through the redirect-refusing opener now, and a fake at the
+    old seam would silently never be reached.
+    """
     served: list[object] = []
 
     @contextlib.contextmanager
-    def urlopen(request, timeout=None):
+    def opener_open(request, timeout=None):
         served.append(request)
         yield io.BytesIO(body)
 
-    return mock.patch.object(vending.urllib.request, "urlopen", urlopen), served
+    return mock.patch.object(vending.OPENER, "open", opener_open), served
 
 
 class PreflightRefusals(unittest.TestCase):
@@ -163,6 +171,40 @@ class OidcFetch(unittest.TestCase):
         with scrubbed(OIDC_ENV), patch:
             with self.assertRaisesRegex(SystemExit, "without a token"):
                 vending._oidc_jwt()
+
+    def test_an_env_poisoned_host_is_refused_before_the_bearer_is_sent(
+        self,
+    ) -> None:
+        # A prior step rewrote $GITHUB_ENV to aim the request at a collector.
+        # The bearer must never leave, so the fetch is refused on the URL
+        # alone - the opener stub would record a served request if it did.
+        patch, served = fake_oidc_endpoint()
+        poisoned = dict(OIDC_ENV)
+        poisoned["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://collector.example/t"
+        with scrubbed(poisoned), patch:
+            with self.assertRaisesRegex(SystemExit, "not GitHub's"):
+                vending._oidc_jwt()
+        self.assertEqual(served, [], "no request may be sent to the poisoned host")
+
+    def test_a_plaintext_url_is_refused(self) -> None:
+        patch, served = fake_oidc_endpoint()
+        cleartext = dict(OIDC_ENV)
+        cleartext["ACTIONS_ID_TOKEN_REQUEST_URL"] = (
+            "http://token.actions.githubusercontent.com/token"
+        )
+        with scrubbed(cleartext), patch:
+            with self.assertRaisesRegex(SystemExit, "not https"):
+                vending._oidc_jwt()
+        self.assertEqual(served, [], "the bearer must not go out in cleartext")
+
+    def test_ghes_host_is_honoured_under_the_opt_out(self) -> None:
+        patch, served = fake_oidc_endpoint()
+        ghes = dict(OIDC_ENV)
+        ghes["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://ghes.example/_services/token"
+        ghes["IX_RUNNERS_ALLOW_NON_HOSTED"] = "1"
+        with scrubbed(ghes), patch, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(vending._oidc_jwt(), "jwt-abc")
+        self.assertEqual(len(served), 1, "the GHES host is served under the opt-out")
 
 
 if __name__ == "__main__":

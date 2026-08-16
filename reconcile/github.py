@@ -155,18 +155,39 @@ def list_runners(pat: str, repo: str) -> list[dict[str, Any]]:
     """
     runners: list[dict[str, Any]] = []
     total = 0
+    saw_total = False
     page = 1
     while True:
         body = github_api(pat, repo, f"/actions/runners?per_page=100&page={page}")
-        total = int(body.get("total_count") or 0)
+        raw_total = body.get("total_count")
+        if raw_total is not None:
+            saw_total = True
+            total = int(raw_total or 0)
         batch = body.get("runners") or []
         runners.extend(batch)
-        if not batch or len(runners) >= total:
+        if not batch:
+            break
+        # With a total_count, page until it is reached. Without one, a full
+        # page still means "there may be more" - but a listing that never
+        # carries total_count cannot be proven complete and is refused below,
+        # so stop paging once a short page shows we have drained what there is.
+        if saw_total and len(runners) >= total:
+            break
+        if not saw_total and len(batch) < 100:
             break
         page += 1
-    if len(runners) < total:
+    # No total_count is as dangerous as a short read: both leave members
+    # unlisted, and an unlisted member reads offline and gets replaced. The
+    # old guard trusted total_count implicitly, so a response that omitted it
+    # (total defaults to 0) sailed through with the whole pool unaccounted for.
+    if not saw_total or len(runners) < total:
+        detail = (
+            f"{len(runners)} of {total} runners"
+            if saw_total
+            else "the response carried no total_count"
+        )
         log_error(
-            f"runner listing is short: {len(runners)} of {total} runners."
+            f"runner listing is not trustworthy: {detail}."
             " Refusing to reconcile - every unlisted member would read"
             " offline and be replaced."
         )

@@ -20,7 +20,10 @@ surface can do that for us. Everything ix-facing goes through the SDK.
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
+
+from .github import OPENER
 
 # The audience the ix verifier matches exactly. A workflow asking for any
 # other audience gets a refusal that names this string.
@@ -29,6 +32,16 @@ AUDIENCE = "ix.dev"
 # GitHub's OIDC issuer answers in well under a second; a hung request here
 # should fail the run promptly, not hold it to the job timeout.
 OIDC_TIMEOUT = 30
+
+# The only host github.com's runtime issues an OIDC token from. The request
+# URL is read from the environment, so it is subject to the same $GITHUB_ENV
+# rewrite the rest of this package refuses to trust (github.api_base pins the
+# API host for exactly this reason; the README pins actions/checkout by SHA
+# because checkout runs first and can rewrite the environment we then read).
+# The bearer this request carries mints OIDC JWTs at any audience, which ix
+# trades for a GitHub App token with Administration read/write - so the host
+# is pinned, not taken on faith.
+OIDC_HOST_SUFFIX = ".actions.githubusercontent.com"
 
 
 def token_source() -> str:
@@ -132,13 +145,18 @@ def _oidc_jwt() -> str:
             "this job cannot request an OIDC token: add"
             " 'permissions: id-token: write' to the job that runs this action"
         )
+    _refuse_untrusted_oidc_url(url)
     separator = "&" if "?" in url else "?"
     request = urllib.request.Request(
         f"{url}{separator}audience={AUDIENCE}",
         headers={"Authorization": f"Bearer {bearer}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=OIDC_TIMEOUT) as response:
+        # OPENER refuses redirects: urllib re-sends the Authorization header
+        # across a 30x, which would hand the ID-token bearer to whatever host
+        # the pinned endpoint redirected to. None of this legitimately
+        # redirects, so refusing it costs nothing and closes the last hop.
+        with OPENER.open(request, timeout=OIDC_TIMEOUT) as response:
             payload = json.load(response)
     except (urllib.error.URLError, TimeoutError, ValueError) as error:
         raise SystemExit(
@@ -149,3 +167,35 @@ def _oidc_jwt() -> str:
         raise SystemExit("GitHub's OIDC token endpoint answered without a token")
     print(f"::add-mask::{jwt}", flush=True)
     return jwt
+
+
+def _refuse_untrusted_oidc_url(url: str) -> None:
+    """Send the ID-token bearer only to https on GitHub's OIDC host.
+
+    ``ACTIONS_ID_TOKEN_REQUEST_URL`` is an environment variable, so an earlier
+    step can rewrite it through ``$GITHUB_ENV``. Honoured unconditionally it
+    aims the bearer at a host of that step's choosing (a passive collector can
+    then mint ``ix.dev``-audience JWTs and trade them for an Administration
+    read/write App token), or over plaintext http. On github.com the value is
+    always ``token.actions.githubusercontent.com`` over https, so pinning it
+    costs nothing. GHES is the deployment that already had to set
+    ``IX_RUNNERS_ALLOW_NON_HOSTED`` (its issuer host differs); there the https
+    requirement still holds but the host is honoured.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https":
+        raise SystemExit(
+            f"ACTIONS_ID_TOKEN_REQUEST_URL is {url!r}, which is not https."
+            " Refusing to send the OIDC request bearer to it."
+        )
+    hosted = host == "token.actions.githubusercontent.com" or host.endswith(
+        OIDC_HOST_SUFFIX
+    )
+    if not hosted and os.environ.get("IX_RUNNERS_ALLOW_NON_HOSTED") != "1":
+        raise SystemExit(
+            f"ACTIONS_ID_TOKEN_REQUEST_URL points at {host!r}, not GitHub's"
+            " Actions OIDC host. Refusing to send the OIDC request bearer to"
+            " it (set IX_RUNNERS_ALLOW_NON_HOSTED=1 on GHES/ARC to accept a"
+            " different issuer host explicitly)."
+        )
