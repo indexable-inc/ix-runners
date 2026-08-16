@@ -1,330 +1,197 @@
 # ix-runners
 
-Self-hosted GitHub Actions runner pools on [ix](https://ix.dev) VMs,
-maintained by ix. Your repo declares a pool in one JSON file and adds a
-two-line action; this repository is the mechanism that creates the machines,
-keeps them healthy, and switches them on and off to follow your job queue.
+Self-hosted GitHub Actions runner pools on [ix](https://ix.dev) VMs.
 
-Runners are **persistent, not ephemeral** - warm toolchains and compile
-caches are the point. If you need per-job isolation, this is not that tool.
+[ix CI](https://ix.dev/blog/ci).
 
-## Quickstart
+This repository is the mechanism for a nix github action runner, maintained by ix. 
 
-Ten minutes, four steps.
+Runners are persistent, not ephemeral
 
-**1. Install the App, add one secret.** Install
-[ix-runners](https://github.com/apps/ix-runners) on your repository, then set
-one Actions secret:
+## Setup
 
-- `IX_TOKEN` — the ix account the VMs bill to.
+1. Add two Actions secrets to your repo: `IX_TOKEN` (the ix account the VMs
+   bill to) and `RUNNER_PAT` (fine-grained PAT, Administration read/write on
+   the repo).
 
-That is the whole credential story. The reconcile asks the ix API for a
-short-lived GitHub token scoped to *this* repository, proving which
-repository is asking with the runner's own OIDC identity, so there is nothing
-to store, rotate, or leak. Your workflow grants `id-token: write`; see the
-example below.
+   The built-in `GITHUB_TOKEN` cannot stand in for the PAT: workflow
+   permissions have no `administration` scope, so it structurally cannot mint
+   runner registration tokens.
 
-> **You are never asked for a GitHub App private key**, and you should refuse
-> any tool that does. An App's key is *app-global*: it mints installation
-> tokens for **every** installation of that App, so a key sitting in one repo
-> is a credential for every other pool the App serves. That is why the token
-> is vended rather than minted locally.
+2. Wire the pool into your `flake.nix`:
 
-The built-in `GITHUB_TOKEN` cannot do this job: workflow permissions have no
-`administration` scope, so it structurally cannot mint runner registration
-tokens. That is why a second credential exists at all.
+   ```nix
+   inputs.nixpkgs-ci.url = "github:NixOS/nixpkgs/nixos-unstable";
+   inputs.ix-runners.url = "github:indexable-inc/ix-runners/<rev>";
 
-<details>
-<summary>Fallback: a fine-grained PAT (<code>token-source: pat</code>)</summary>
+   # in outputs:
+   nixosConfigurations = ix-runners.lib.mkPool {
+     nixpkgs = nixpkgs-ci;
+     configRev = self.rev or null;
+     modules = [ ./nix/ci-runner.nix ];
+   };
+   ```
 
-Until the vending endpoint is deployed this is the default. Create a
-fine-grained PAT with **Administration: read and write** and **Actions:
-read** on the repo, store it as `RUNNER_PAT`, and pass
-`runner-pat: ${{ secrets.RUNNER_PAT }}`.
+3. Write your policy in `nix/ci-runner.nix`: `services.ix-runner` with your
+   repo URL, a pool name, and the packages your jobs expect on PATH.
 
-It works, and it is what the pools run on today. It is the fallback rather
-than the destination because a PAT is bound to a person: it carries whatever
-else they granted it, it outlives them on the repo until somebody remembers
-it, and rotating it is a human task on a calendar.
+   `services.ix-runner.poolName` MUST equal the action's `pool-name` input
+   (which defaults to your repository's name). 
+   The module derives runner daemon names from it and the reconcile matches on those names, so if they
+   disagree every member reads offline, gets repaired once, and is then replaced. 
 
-</details>
+4. Add the workflow below and merge.
 
-**2. Describe the pool** in `nix/ix-pool.toml`:
+[`action.yml`](./action.yml).
 
-```toml
-pool-name = "myrepo"
-region    = "us-east-1"
-pool-size = 8
-```
-
-Every key is optional and defaults in one place; the file's presence is what
-declares that this repo has a pool. Unknown keys are an error, not a default -
-a typo that silently defaults is a pool quietly running someone else's
-numbers. The [knobs](#knobs) table is the full list, and TOML means you can
-paste those one-liners in beside the keys.
-
-**3. Wire it into `flake.nix`:**
-
-```nix
-inputs.nixpkgs-ci.url = "github:NixOS/nixpkgs/nixos-unstable";
-inputs.ix-runners.url = "github:indexable-inc/ix-runners/<rev>";
-
-# in outputs:
-nixosConfigurations = ix-runners.lib.mkPool {
-  nixpkgs = nixpkgs-ci;
-  configRev = self.rev or null;
-  spec = builtins.fromTOML (builtins.readFile ./nix/ix-pool.toml);
-  modules = [ ./nix/ci-runner.nix ];
-};
-```
-
-Write your policy in `nix/ci-runner.nix`: `services.ix-runner` with your repo
-URL, the labels your jobs will target, and the packages they expect on PATH.
-The pool's name comes from the spec, so do not set `poolName` there too.
-
-**4. Add the workflow and merge:**
+### The workflow
 
 ```yaml
 name: ix runners
 
 on:
   schedule:
+    # Best effort: GitHub drops scheduled runs under load, and disables the
+    # schedule entirely after 60 days with no commit to the repo.
     - cron: "*/30 * * * *"
   workflow_dispatch:
-  # Wake the pool when a run is queued, so it warms while the first jobs run.
-  workflow_run:
-    workflows: ["CI"]          # your own workflow names
-    types: [requested]
   push:
     branches: [main]
-    # The desired state is the last commit touching these paths.
-    paths: [nix/**, flake.nix, flake.lock]
+    # The reconcile's desired state is the last commit touching these paths,
+    # so these are the only pushes that can change anything.
+    paths:
+      - nix/**
+      - flake.nix
+      - flake.lock
 
 permissions:
   contents: read
-  actions: read                # reads the job queue for the demand signal
-  id-token: write              # proves to ix which repo is asking for a token
 
-# One reconcile at a time, and never cancel one mid-create.
+# One reconcile at a time, and never cancel one mid-create: a cancelled run
+# can leave a VM created but not yet registered.
 concurrency:
   group: ix-runners
   cancel-in-progress: false
 
 jobs:
   reconcile:
-    # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN.
+    # GITHUB-HOSTED only. A runner VM must never see IX_TOKEN or RUNNER_PAT.
     runs-on: ubuntu-latest
     steps:
+      # Pinned by commit, not by tag: this job holds IX_TOKEN and a
+      # repo-admin PAT, and checkout runs before the reconcile does - it can
+      # rewrite the environment the reconcile then reads, through $GITHUB_ENV.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0       # a shallow checkout is refused, not guessed at
+          # The desired rev is the last commit touching the runner config, so
+          # the whole history has to be here. Under a shallow checkout the
+          # grafted boundary commit diffs against the empty tree, every commit
+          # looks like a config change, and the fleet rolls on every push. The
+          # reconcile detects this and refuses to run rather than roll.
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: indexable-inc/ix-runners@<rev>
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
-          # "ix" once the vending endpoint is deployed; "pat" until then,
-          # with runner-pat: ${{ secrets.RUNNER_PAT }} alongside it.
-          token-source: ix
+          runner-pat: ${{ secrets.RUNNER_PAT }}
+          pool-size: "8"
 ```
 
-`schedule` and `workflow_run` only fire from a workflow file on your
-**default branch** - merging is what starts the pool.
+Then swap `runs-on:` to `[self-hosted, ix]` in your other workflows at your leisure.
 
-Then swap `runs-on:` to `[self-hosted, ix]` in your other workflows.
+## How it works
 
-## How it behaves
+A scheduled reconcile - on GitHub-hosted runners, never on the pool it
+manages - converges reality to your git history: the last commit touching
+the runner config is the desired state, every VM image bakes the rev it was
+built from, and any member that drifts is replaced. Creation goes through
+the ix SDK; templates compile server-side on first boot and cache by rev.
 
-A reconcile runs on GitHub-hosted runners - never on the pool it manages -
-and converges the pool to your git history. The last commit touching `nix/`,
-`flake.nix` or `flake.lock` is the desired rev; every VM bakes the rev it was
-built from, and any member that drifts is replaced.
+- Missing member: created, with a fresh 1-hour registration token attached
+  as a root-only file at first boot. No post-boot seeding step exists.
+- Still booting: skipped. A first boot of a new rev compiles the template
+  in-guest, and a machine that young has nothing to say about its health.
+- Stale rev: replaced. Every runner slot's `busy` flag is checked on a
+  freshly-read listing first, and all of the member's registrations are
+  deleted before the VM is - GitHub refuses (422) to delete a runner that is
+  mid-job. That closes the wide window, not all of it: a job assigned in the
+  seconds between the listing and the delete is still lost, and costs that
+  job one retry. A member that is busy at every single scan defers its own
+  replacement indefinitely; past 30 days the run says so and asks you to
+  drain it by hand, rather than killing a job to make a point.
+- Offline: restarted once, replaced if still offline next run.
+- Above `pool-size`: deregistered and deleted. Shrinking the pool would
+  otherwise leave orphans billing and taking jobs.
+- Empty pool: the per-run replacement cap self-raises to `pool-size`, so a
+  first bootstrap builds every member in one run. If that run only partly
+  succeeds the pool is no longer empty, the cap drops back to
+  `max-replacements`, and the rest trickle in over the following runs.
+- Creations and replacements execute concurrently (bounded, one registration
+  token per run): a full-pool roll takes minutes, not one boot at a time.
 
-### Member lifecycle
+Failures are per member. One member's failure is logged as an Actions error,
+spends its budget, and the run continues; the job summary carries a table of
+what happened to each member.
 
-| member state | what happens |
-| --- | --- |
-| missing | created, with a 1-hour registration token present at first boot |
-| created in the last 30 min | skipped - it is still compiling its template |
-| started in the last 5 min | skipped - "no runner yet" is what a healthy boot looks like |
-| on a stale rev | deregistered, then replaced. Deferred while any of its runners is busy |
-| runners offline | units restarted once; replaced if still offline next run |
-| reported `failed` by ix | replaced at once, without waiting out the boot grace |
-| stopped | left alone and never probed; the scaler decides whether to wake it |
-| above `pool-size` | deregistered and deleted - a shrink's orphans keep billing |
+## Security model
 
-Failures are per member: one member's failure is logged, its budget stays
-spent, and the run continues. The job summary carries a table of what
-happened to each member.
-
-### Autoscaling
-
-The member set never moves. `pool-size` machines exist, and the only thing
-autoscaling changes is which are switched on. A stopped machine keeps its
-disk and bills storage alone. There is no scheduler here.
-
-```
-desired_online = clamp(ceil(servable_jobs / slots) + scale-headroom,
-                       min-warm, max-online)
-```
-
-Below the level, stopped members start - always before anything is created,
-and never rate-limited. Above it, idle members stop, highest index first, so
-the warm core is a stable set whose caches stay hot. The GitHub queue is the
-buffer: a job that finds no free runner waits.
-
-Three rules do most of the work:
-
-- **Servable is strict.** A job counts only if some runner advertises *every*
-  label in its `runs-on`. Jobs queued against labels your pool does not carry
-  contribute nothing - otherwise a permanently-stuck queue pins the pool at
-  maximum forever.
-- **Event ticks only scale up.** A `workflow_run` tick fires before its jobs
-  reach the queue, so it sees an idle pool exactly as a wave lands. Only the
-  cron may switch machines off.
-- **An unreadable queue makes no scaling decision.** Missing data is not zero
-  demand and not zero idleness. Healing still runs.
-
-Scale-down **deregisters before it cuts power** - GitHub's 422-on-busy is the
-only real lock available, so a running job can never be stopped out from
-under. The cost is that waking a member mints a fresh registration token.
-
-`min-warm` defaults to `pool-size`, so **autoscaling is off until you dial it
-down**, and an unconfigured pool never even reads the queue. Turning it on:
-
-```toml
-pool-size      = 32
-runner-label   = "ix"   # must be one of services.ix-runner.labels
-min-warm       = 3      # always warm, so a small wave starts instantly
-scale-headroom = 2
-max-online     = 32
-```
-
-Reasoning, trade-offs and the failures behind each rule:
-[docs/design.md](docs/design.md).
-
-## Knobs
-
-All of them live in `nix/ix-pool.toml`. All optional.
-
-| key | default | meaning |
-| --- | --- | --- |
-| `pool-name` | the repo's name | VM names `<pool>-runner-<N>`, runner names `<pool>-r<N>-<slot>` |
-| `region` | `us-west-1` | ix region the pool lives in |
-| `pool-size` | 8 | members, and the flake attrs `mkPool` generates |
-| `attr-prefix` | `ci-runner` | flake attribute prefix for members |
-| `max-replacements` | 2 | per-run cap on creations + replacements |
-| `concurrency` | 4 | creations/replacements executed at once |
-| `runner-label` | — | bootstrap demand match; required once `min-warm` < `max-online` |
-| `min-warm` | `pool-size` | always-on floor. **This is the autoscaling on/off switch** |
-| `max-online` | `pool-size` | ceiling on powered-on members |
-| `scale-headroom` | 2 | spare members kept above current demand |
-| `idle-grace-seconds` | 600 | idle time before a member is switched off |
-| `max-stops` | 4 | per-tick cap on stops; starts are uncapped |
-
-Which ticks may scale down is deliberately not configurable: the trigger
-already says, and pinning it would pin it for the cron too.
-
-## Operations
-
-**Bootstrap.** Merge the workflow to your default branch and wait for the
-first tick, or dispatch it. An empty pool raises the replacement cap to
-`pool-size` on its own, so the first run builds every member at once; if it
-only partly succeeds, the rest trickle in at `max-replacements` per run.
-
-**Kill switch.** Set `min-warm` equal to `pool-size`. Scaling stops
-immediately, every member that exists stays on, and no tick reads the queue.
-Nothing else changes - healing continues.
-
-**Reading a run.** Every tick prints one decision line:
-
-```
-DECISION [scheduled] powered_on=4 (online=4 warming=0 stopped=28) demand=6 -> desired=8 [6 servable job(s)/1 slot(s) = 6 +2 headroom, clamped [3,32]] | start [5, 6, 7, 8] stop []
-reconcile done: 0 creation(s)/replacement(s), 4 power change(s), 0 failed
-```
-
-Observed counts, the level they imply, and what was done - enough to
-reconstruct the decision without replaying the log. `demand=n/a` means the
-queue could not be read and no scaling was attempted.
-
-**The pool never scales down.** Check `permissions: actions: read` first - a
-403 on the queue read warns and leaves every member on, and the run stays
-green. Then check that `runner-label` is a label your runners actually
-advertise.
-
-**The pool never scales up.** Almost always the label rule: your jobs' full
-`runs-on` set must be carried by one runner. `mkPool` asserts the spec's
-`runner-label` is in `services.ix-runner.labels` at build time.
-
-**Nothing runs at all.** `schedule` and `workflow_run` only fire from the
-default branch. A workflow still on a feature branch never ticks.
-
-## Security
-
-- **Runners are administered by a GitHub App, and no key for it exists in
-  your repository.** The reconcile presents the runner's OIDC identity to the
-  ix API, which checks that the App is installed on the calling repository
-  and vends an installation token scoped to that one repository. The token
-  lives an hour. Removing access is uninstalling the App - there is no human
-  account whose leaving, or whose other grants, matter.
-- **No App private key is ever accepted as an input**, and a test enforces
-  that. An App's key is app-global: it mints installation tokens for every
-  installation of that App, so a key in one customer's repo is a credential
-  for every other pool. Only ix holds the key, and it never vends a token for
-  a repository other than the one whose OIDC claim it just verified.
-- `IX_TOKEN` and the vended GitHub token never reach a runner VM. The reconcile refuses
-  to start unless `RUNNER_ENVIRONMENT` says GitHub-hosted - it is the control
-  plane for the pool, so running it on the pool would hand both secrets to
-  the machines they exist to control. On GHES/ARC set
-  `IX_RUNNERS_ALLOW_NON_HOSTED=1` to accept that explicitly.
-- The API base is pinned to `api.github.com` (`GITHUB_API_URL` is an
-  environment variable any earlier step can rewrite), and no PAT-bearing
-  request follows a redirect - urllib re-sends the Authorization header
-  across a 30x, so one redirect would be enough.
-- The only credential a VM holds is a registration token. For its one-hour
-  life it can register a runner against your repo and steal its jobs: it is
-  short-lived, not harmless. It is masked in Actions logs.
-- The demand signal uses the workflow's own `GITHUB_TOKEN`, never the PAT:
-  listing runs needs the Actions permission, and repo administration has no
-  business holding one.
-- A rejected admin credential presents as HTTP 401 and the reconcile says so
-  in those terms, naming both paths, so you check an installation or rotate a
-  secret rather than hunt a status code.
-- A pool VM is the least trusted party here. It is asked one question - which
-  rev it was built from - and its answer is bounded and read as a string. A
-  member that floods, hangs or fails is decided as unreachable and replaced,
-  and can never end the run or stall the other members.
-- **Runners are shared across jobs.** Any job that runs on the pool owns the
-  machine and its warm state until the reconcile replaces it. Point only
-  trusted events at the pool's labels - never `pull_request` from forks on a
-  public repo.
+- `IX_TOKEN` and `RUNNER_PAT` live in GitHub Actions secrets and never
+  reach a runner VM. The reconcile refuses to start unless
+  `RUNNER_ENVIRONMENT` says it is on a GitHub-hosted runner: it is the
+  control plane for the pool, so running it on the pool would hand both
+  secrets to the machines they exist to control. On GHES or ARC, set
+  `IX_RUNNERS_ALLOW_NON_HOSTED=1` to accept that explicitly - which also
+  lets `GITHUB_API_URL` name your own https API base. Everywhere else the
+  API base is pinned to `api.github.com`, because `GITHUB_API_URL` is an
+  environment variable any earlier step in the job can rewrite.
+- No PAT-bearing request follows a redirect. urllib re-sends the
+  Authorization header across a 30x, so one redirect would be enough.
+- The only credential a VM ever holds is a registration token. For its
+  one-hour life that token can register a runner against your repo and steal
+  its jobs - it is short-lived, not harmless. It is masked in Actions logs
+  and deleted from the ix secret store at the end of the run that minted it.
+- A `RUNNER_PAT` that has expired or been revoked presents as HTTP 401; the
+  reconcile stops and says exactly that, so rotate the secret rather than
+  hunting a status code.
+- Machines are disposable by design and rev-anchored: a hand-edited or
+  wedged VM converges away on the next reconcile.
+- A pool VM is the least trusted party in the reconcile. It is asked one
+  question (which rev it was built from) and its answer is bounded and
+  read as a string; a member that floods, hangs, or fails in any way is
+  decided as unreachable and replaced, and can never end the run or stall
+  the other members' convergence.
+- The runners are persistent and shared across jobs: any job that runs on
+  the pool owns the machine and its warm state (caches, toolchains) until the
+  reconcile replaces it. Point only trusted events at the pool's labels -
+  never `pull_request` from forks on a public repo, and gate
+  `workflow_dispatch`-driven runs the same way.
+- Persistent-not-ephemeral is deliberate: warm toolchains and compile caches
+  are the product. If you want per-job isolation (ARC-style ephemeral
+  runners), this is not that tool.
 - Everything that runs your CI is in this repository, readable.
 
-## Differences from ubuntu-latest
+## What differs from ubuntu-latest
 
-The runner VM is NixOS, tuned for parity where that is cheap and honest where
+The runner VM is NixOS, tuned for parity where it is cheap and honest where
 it is not:
 
-- Foreign dynamically linked binaries (rustup/mise toolchains, prebuilt node,
-  playwright browsers) run via nix-ld + envfs. A missing library fails at
-  load time - file an issue, additions are one line.
-- No sudo: the job user cannot elevate. Install into `$HOME`, or ship the
-  package in the pool's nix policy.
+- Foreign dynamically linked binaries (rustup/mise toolchains, prebuilt
+  node, playwright browsers) run via nix-ld + envfs with a generous library
+  set; a missing library fails at load time - file an issue, additions are
+  one line.
+- No sudo: the job user cannot elevate (`NoNewPrivileges`). Install into
+  `$HOME` or ship the package in the pool's nix policy instead.
 - `$HOME` is per-slot and persists across jobs and reboots; the checkout
   directory is wiped on every runner restart.
-- `/tmp` is the slot's own directory, on disk, and is the same directory as
-  `$TMPDIR`. Nothing else on the VM can see it. The one consequence: a
-  container gets its bind mounts resolved by dockerd, which is outside the
-  slot's namespace, so `-v /tmp/x:/x` does not name the `/tmp` the job sees -
-  mount `-v "$TMPDIR/x:/x"` instead, which names the same directory on both
-  sides.
-- Preinstalled tooling comes from your nix policy, not a hosted image.
-  Anything a job expects "to just be there" must be listed there.
+- Preinstalled tooling comes from the pool's nix policy, not from a hosted
+  image: anything a job expects "to just be there" (Go, docker, protoc)
+  must be listed there.
 
 ## Roadmap
 
-- `token-source: ix` becomes the default once the vending endpoint is
-  deployed, and `runner-pat` becomes legacy at that point (#5).
-- v2 is an ix-hosted control plane: webhook-driven ephemeral runners from
-  warm snapshots. The workflow file in consumer repos deletes; the policy
-  file stays.
+- An official ix GitHub App with token vending through the ix API replaces
+  `RUNNER_PAT`; setup becomes install-app plus one secret (#5).
+- v2 is an ix-hosted control plane: webhook-driven ephemeral runners booted
+  from warm snapshots. The workflow file in consumer repos deletes; the
+  policy file stays.
