@@ -87,6 +87,12 @@ SCALE_DOWN_EVENTS = (None, "", "schedule", "workflow_dispatch")
 SPEC_KEYS = {
     "pool-name": str,
     "region": str,
+    # Alternative to `region`: a list the pool is spread across, member
+    # index modulo the list, so capacity and blast radius split evenly.
+    # One region's host trouble then takes a fraction of the pool, and a
+    # create that fails in a member's home region retries once in the next
+    # one the same tick. Set one of `region`/`regions`, never both.
+    "regions": list,
     "attr-prefix": str,
     "runner-label": str,
     "pool-size": int,
@@ -147,6 +153,14 @@ def load_spec(path: str) -> dict[str, object]:
             problems.append(f"{key!r} must be a whole number, got {value!r}")
         elif want is str and not isinstance(value, str):
             problems.append(f"{key!r} must be a string, got {value!r}")
+        elif want is list and (
+            not isinstance(value, list)
+            or not value
+            or not all(isinstance(item, str) and item for item in value)
+        ):
+            problems.append(
+                f"{key!r} must be a non-empty list of region strings, got {value!r}"
+            )
     if problems:
         for problem in problems:
             log_error(f"{path}: {problem}")
@@ -168,7 +182,14 @@ def spec_from_env() -> dict[str, object]:
     for key, want in SPEC_KEYS.items():
         raw = os.environ.get(key.upper().replace("-", "_"))
         if raw:
-            spec[key] = int(raw) if want is int else raw
+            if want is int:
+                spec[key] = int(raw)
+            elif want is list:
+                # REGIONS="us-west-1,us-east-1" - same comma convention as
+                # every other list-shaped CI environment variable.
+                spec[key] = [part.strip() for part in raw.split(",") if part.strip()]
+            else:
+                spec[key] = raw
     return spec
 
 
@@ -183,7 +204,12 @@ class Config:
     repo: str
     pool: str
     attr_prefix: str
-    region: str
+    # Every region this pool places members in, in spec order. One entry is
+    # the classic single-region pool; more spread members index-modulo
+    # across the list. A tuple because a Config is one tick's immutable
+    # reading, and because member->region must be a pure function of the
+    # spec - a set would let iteration order reassign the whole pool.
+    regions: tuple[str, ...]
     secret_name: str
     pool_size: int
     max_replacements: int
@@ -221,6 +247,28 @@ class Config:
 
     def member_name(self, member: int) -> str:
         return f"{self.pool}-runner-{member}"
+
+    def region_for(self, member: int) -> str:
+        """A member's home region: index modulo the list.
+
+        Deterministic on purpose - a member REPLACES in the region it lived
+        in, so warm state (image cache, learned floors) stays meaningful,
+        and the split stays even without any bookkeeping. Changing the list
+        reassigns homes, which takes effect member by member as replacements
+        happen; the reconcile never migrates a healthy member.
+        """
+        return self.regions[member % len(self.regions)]
+
+    def failover_region(self, home: str) -> str | None:
+        """Where a failed create retries, or None for a single-region pool.
+
+        The next region in spec order. One alternative, not a tour of the
+        whole list: a create that fails everywhere should fail the member
+        loudly rather than time out the tick trying coasts in sequence.
+        """
+        if len(self.regions) < 2:
+            return None
+        return self.regions[(self.regions.index(home) + 1) % len(self.regions)]
 
     @classmethod
     def load(cls) -> "Config":
@@ -303,11 +351,35 @@ class Config:
                 log_error(f"autoscaling is off for this run: {why}")
             min_warm = max_online = pool_size
 
+        # `region` and `regions` are one setting with two spellings, and a
+        # spec carrying both is a spec whose author believes two different
+        # things about where the pool lives - refuse rather than pick.
+        if spec.get("region") is not None and spec.get("regions") is not None:
+            log_error(
+                "the pool spec sets both `region` and `regions`; set exactly"
+                " one (`regions` with a single entry is the same pool as"
+                " `region`)"
+            )
+            raise SystemExit(1)
+        regions_value = spec.get("regions")
+        if regions_value is not None:
+            regions = tuple(str(item) for item in regions_value)  # type: ignore[union-attr]
+            if len(set(regions)) != len(regions):
+                log_error(
+                    f"`regions` repeats an entry ({list(regions)!r}); each"
+                    " region appears once - the SHARE of the pool it hosts"
+                    " is its position count, and a duplicate is almost"
+                    " certainly a typo, not a weighting scheme"
+                )
+                raise SystemExit(1)
+        else:
+            regions = (text("region", "us-west-1"),)
+
         return cls(
             repo=os.environ["GITHUB_REPOSITORY"],
             pool=pool,
             attr_prefix=text("attr-prefix", "ci-runner"),
-            region=text("region", "us-west-1"),
+            regions=regions,
             secret_name=os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token",
             pool_size=pool_size,
             max_replacements=number("max-replacements", 2),

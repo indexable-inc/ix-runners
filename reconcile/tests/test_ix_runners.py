@@ -195,6 +195,10 @@ class FakeMachines:
         name = options["name"]
         self.platform.calls.append((None, ("create", options)))
         error = self.platform.create_errors.get(name, self.platform.create_error)
+        # A dict scripts PER-REGION failure: {"us-east-1": err} fails creates
+        # routed there and lets the failover attempt in another region pass.
+        if isinstance(error, dict):
+            error = error.get(options["region"])
         if error is not None:
             raise error
         self.platform.in_flight += 1
@@ -394,6 +398,37 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
                 "secret_files": {"baml_runner_reg_token": "runner-token"},
             },
         )
+
+    async def test_a_failed_create_retries_once_in_the_next_region(self):
+        # Two-region pool; member 1's home region (index 1 % 2 -> the second
+        # entry) is scripted sick. The create must retry once in the OTHER
+        # region this tick - replacements flowing back into a dying region
+        # is how a regional incident ate the whole pool once - and the
+        # healthy member 2 must land in its own home untouched.
+        env = dict(ENV)
+        env.pop("REGION")
+        env["REGIONS"] = "us-west-1,us-east-1"
+        ix = FakeIx(
+            vms=set(), revs={}, online=set(), markers=set(),
+            create_errors={
+                "baml-runner-1": {"us-east-1": RuntimeError("hosts sick")}
+            },
+        )
+        await self.reconcile_with(ix, env=env)
+        member1 = [
+            c[1]["region"] for _, c in ix.calls
+            if c[0] == "create" and c[1]["name"] == "baml-runner-1"
+        ]
+        self.assertEqual(
+            member1, ["us-east-1", "us-west-1"],
+            "home first, then exactly one failover attempt",
+        )
+        self.assertIn("baml-runner-1", ix.created)
+        member2 = [
+            c[1]["region"] for _, c in ix.calls
+            if c[0] == "create" and c[1]["name"] == "baml-runner-2"
+        ]
+        self.assertEqual(member2, ["us-west-1"])
 
     async def test_the_registration_token_is_masked_and_the_row_is_kept(self):
         # The token can register a job-stealing runner for an hour, so it
@@ -2024,9 +2059,66 @@ class PoolSpecTest(unittest.TestCase):
              "min-warm": 3, "runner-label": "ix"}
         )
         self.assertEqual(config.pool, "demo")
-        self.assertEqual(config.region, "us-east-1")
+        self.assertEqual(config.regions, ("us-east-1",))
         self.assertEqual((config.pool_size, config.min_warm), (12, 3))
         self.assertTrue(config.autoscaling)
+
+    def test_regions_spread_members_index_modulo(self):
+        config, _ = self.load(
+            {"pool-name": "demo", "regions": ["us-west-1", "us-east-1"],
+             "pool-size": 32, "runner-label": "ix"}
+        )
+        self.assertEqual(config.regions, ("us-west-1", "us-east-1"))
+        homes = [config.region_for(member) for member in range(1, 33)]
+        # Even split, deterministically - not one region until it fills.
+        self.assertEqual(homes.count("us-west-1"), 16)
+        self.assertEqual(homes.count("us-east-1"), 16)
+        self.assertNotEqual(homes[0], homes[1])
+        # Failover is the NEXT region, and cycles.
+        self.assertEqual(config.failover_region("us-west-1"), "us-east-1")
+        self.assertEqual(config.failover_region("us-east-1"), "us-west-1")
+
+    def test_a_single_region_pool_has_no_failover(self):
+        config, _ = self.load(
+            {"pool-name": "demo", "region": "us-east-1", "runner-label": "ix"}
+        )
+        self.assertEqual(config.region_for(7), "us-east-1")
+        self.assertIsNone(config.failover_region("us-east-1"))
+
+    def test_region_and_regions_together_refuse(self):
+        config, out = self.load(
+            {"pool-name": "demo", "region": "us-east-1",
+             "regions": ["us-west-1"], "runner-label": "ix"}
+        )
+        self.assertIsNone(config)
+        self.assertIn("both", out)
+
+    def test_duplicate_regions_refuse(self):
+        config, out = self.load(
+            {"pool-name": "demo", "regions": ["us-east-1", "us-east-1"],
+             "runner-label": "ix"}
+        )
+        self.assertIsNone(config)
+        self.assertIn("repeats", out)
+
+    def test_an_empty_or_nonstring_regions_list_refuses(self):
+        for bad in ([], [1, 2], [""]):
+            config, out = self.load(
+                {"pool-name": "demo", "regions": bad, "runner-label": "ix"}
+            )
+            self.assertIsNone(config, bad)
+            self.assertIn("regions", out)
+
+    def test_regions_reach_the_config_from_the_environment_too(self):
+        # The env path must parse the same shape (comma-separated), and it
+        # must NOT be handed the single-region default the fixture carries -
+        # that fed exactly the fallback prod lacked once before (#28).
+        env = dict(ENV, GITHUB_TOKEN="ghs_workflow_token")
+        env.pop("REGION")
+        env["REGIONS"] = "us-west-1,us-east-1"
+        with mock.patch.dict("os.environ", env, clear=True):
+            config = Config.load()
+        self.assertEqual(config.regions, ("us-west-1", "us-east-1"))
 
     def test_every_key_is_optional(self):
         # The file's PRESENCE declares that this repo has a pool; the values
