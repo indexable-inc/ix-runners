@@ -179,10 +179,31 @@ async def execute(
                         return
                     await ix.machines().connect(vms[name].id).delete()
                 if kind != "prune":
-                    await create(
-                        ix, config.repo, rev, config.secret_name,
-                        config.attr_prefix, member, name, config.region,
-                    )
+                    home = config.region_for(member)
+                    try:
+                        await create(
+                            ix, config.repo, rev, config.secret_name,
+                            config.attr_prefix, member, name, home,
+                        )
+                    except Exception as error:
+                        # One retry in the next region, same tick. This is
+                        # the multi-region pool's failover: when a region's
+                        # hosts are sick (the state that killed members in
+                        # the first place), replacements must not pile back
+                        # into it just because the modulo says so. Single
+                        # region -> no alternative -> the failure propagates
+                        # to the per-member handler as before.
+                        alt = config.failover_region(home)
+                        if alt is None:
+                            raise
+                        log_warning(
+                            f"{name}: create in {home} failed ({error!r});"
+                            f" retrying once in {alt}"
+                        )
+                        await create(
+                            ix, config.repo, rev, config.secret_name,
+                            config.attr_prefix, member, name, alt,
+                        )
                 result.summary.append((name, kind, "ok"))
             # Any exception, not just the SDK's: an unforeseen one used to
             # abort the gather and cancel every sibling MID-CREATE.
