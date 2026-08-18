@@ -399,6 +399,20 @@ class ReconcileTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_flake_dir_pins_the_template_to_the_subflake(self):
+        # Same create, pool defined in a subflake: the ref gains ?dir= and
+        # nothing else moves (the rev still names the whole repo, so the
+        # server's (rev, attr) template cache key is unchanged in shape).
+        ix = FakeIx(vms=set(), revs={}, online=set(), markers=set())
+        self.assertEqual(
+            await self.reconcile_with(ix, ENV | {"FLAKE_DIR": "nix/ix"}), 2
+        )
+        creates = [c for _, c in ix.calls if c[0] == "create"]
+        self.assertEqual(
+            creates[0][1]["template"],
+            f"github:example/baml/{REV}?dir=nix/ix#ci-runner-1",
+        )
+
     async def test_a_failed_create_retries_once_in_the_next_region(self):
         # Two-region pool; member 1's home region (index 1 % 2 -> the second
         # entry) is scripted sick. The create must retry once in the OTHER
@@ -1717,6 +1731,21 @@ class DesiredRevTest(unittest.TestCase):
         ):
             self.assertEqual(desired_rev(), REV)
 
+    def test_flake_dir_narrows_the_config_pathspec(self):
+        # A subflake pool must roll ONLY on its own directory: the repo's
+        # flake.nix and flake.lock are somebody else's concern by design.
+        seen = []
+
+        def run(args, **kwargs):
+            if args[1:3] == ["rev-parse", "--is-shallow-repository"]:
+                return subprocess.CompletedProcess(args, 0, "false\n", "")
+            seen.append(args)
+            return subprocess.CompletedProcess(args, 0, f"{REV}\n", "")
+
+        with mock.patch("reconcile.config.subprocess.run", run):
+            self.assertEqual(desired_rev("nix/ix"), REV)
+        self.assertEqual(seen[0][seen[0].index("--") + 1 :], ["nix/ix/"])
+
 
 class GithubApiTest(unittest.TestCase):
     """RUNNER_PAT carries Administration rw - repo takeover. Every rule here
@@ -2007,6 +2036,31 @@ class ConfigTest(unittest.TestCase):
                 self.assertEqual(
                     self.load(ENV | {"GITHUB_EVENT_NAME": event}).tick_mode, mode
                 )
+
+    def test_flake_dir_is_normalized_to_one_spelling(self):
+        # The git pathspec and the template ref are both derived from this
+        # value; two spellings of the same directory must not disagree.
+        for raw, want in [
+            ("nix/ix", "nix/ix"),
+            ("./nix/ix", "nix/ix"),
+            ("nix/ix/", "nix/ix"),
+            ("", ""),
+            (".", ""),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    self.load(ENV | {"FLAKE_DIR": raw}).flake_dir, want
+                )
+
+    def test_a_flake_dir_outside_the_repo_is_refused(self):
+        # The template ref pins github:<repo>/<rev>?dir=<flake-dir>; a
+        # directory the ref cannot express must die here, not at create.
+        for raw in ["/etc/nixos", "../elsewhere", "nix/../.."]:
+            with self.subTest(raw=raw):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    with self.assertRaises(SystemExit):
+                        self.load(ENV | {"FLAKE_DIR": raw})
 
     def test_secrets_are_not_carried_on_the_config(self):
         # A dataclass has a repr and a repr ends up in tracebacks. The admin

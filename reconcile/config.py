@@ -22,6 +22,9 @@ import tomllib
 from .report import log_error
 
 # Paths whose last-touching commit defines the desired runner-config rev.
+# With `flake-dir` set in the pool spec the runner config IS that directory
+# (a self-contained subflake with its own lock), so only it rolls the fleet
+# - the repo's own flake.nix and flake.lock stop being fleet-roll triggers.
 CONFIG_PATHS = ["nix/", "flake.nix", "flake.lock"]
 
 def git(*args: str) -> str:
@@ -30,7 +33,7 @@ def git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def desired_rev() -> str:
+def desired_rev(flake_dir: str = "") -> str:
     """Last commit touching the runner config, NOT GITHUB_SHA.
 
     Unrelated merges must not roll the fleet, and the template cache is
@@ -47,11 +50,12 @@ def desired_rev() -> str:
             " on actions/checkout."
         )
         raise SystemExit(1)
-    rev = git("log", "-1", "--format=%H", "--", *CONFIG_PATHS)
+    paths = [f"{flake_dir}/"] if flake_dir else CONFIG_PATHS
+    rev = git("log", "-1", "--format=%H", "--", *paths)
     if not rev:
         log_error(
             "could not resolve the runner-config rev: no commit in this"
-            f" history touches {' '.join(CONFIG_PATHS)}"
+            f" history touches {' '.join(paths)}"
         )
         raise SystemExit(1)
     return rev
@@ -93,6 +97,12 @@ SPEC_KEYS = {
     # create that fails in a member's home region retries once in the next
     # one the same tick. Set one of `region`/`regions`, never both.
     "regions": list,
+    # Directory of the flake that defines the pool members, relative to the
+    # repo root, for repos that keep the runner config in a self-contained
+    # subflake (own inputs, own lock) instead of the repo's flake.nix.
+    # Renders into the template ref as `?dir=<flake-dir>`, and narrows the
+    # fleet-roll trigger to that directory alone.
+    "flake-dir": str,
     "attr-prefix": str,
     "runner-label": str,
     "pool-size": int,
@@ -210,6 +220,10 @@ class Config:
     # reading, and because member->region must be a pure function of the
     # spec - a set would let iteration order reassign the whole pool.
     regions: tuple[str, ...]
+    # Subflake directory the members build from, "" for the repo flake.
+    # Normalized (no leading ./, no trailing /) so the template ref and the
+    # git pathspec derived from it agree with each other.
+    flake_dir: str
     secret_name: str
     pool_size: int
     max_replacements: int
@@ -375,11 +389,32 @@ class Config:
         else:
             regions = (text("region", "us-west-1"),)
 
+        # Normalize rather than refuse the cosmetic variants ("./nix/ix",
+        # "nix/ix/"): both spellings mean the same directory, and the git
+        # pathspec and the flake ref built from this must agree. What IS
+        # refused is anything that escapes the repo: the template ref pins
+        # `github:<repo>/<rev>?dir=<flake-dir>`, and a dir outside the repo
+        # is not a thing that ref can express.
+        raw_flake_dir = text("flake-dir", "").strip()
+        if raw_flake_dir.startswith("/") or ".." in raw_flake_dir.split("/"):
+            log_error(
+                f"flake-dir {raw_flake_dir!r} must be a directory inside the"
+                " repository, relative to its root (e.g. nix/ix)"
+            )
+            raise SystemExit(1)
+        flake_dir = raw_flake_dir
+        if flake_dir.startswith("./"):
+            flake_dir = flake_dir[2:]
+        flake_dir = flake_dir.rstrip("/")
+        if flake_dir == ".":
+            flake_dir = ""
+
         return cls(
             repo=os.environ["GITHUB_REPOSITORY"],
             pool=pool,
             attr_prefix=text("attr-prefix", "ci-runner"),
             regions=regions,
+            flake_dir=flake_dir,
             secret_name=os.environ.get("SECRET_NAME") or f"{pool}_runner_reg_token",
             pool_size=pool_size,
             max_replacements=number("max-replacements", 2),

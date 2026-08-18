@@ -107,6 +107,7 @@ async def create(
     member: int,
     name: str,
     region: str,
+    flake_dir: str = "",
 ) -> None:
     """Provision one pool member; the registration token is already stored.
 
@@ -116,8 +117,11 @@ async def create(
     (single-flight per pinned rev; idempotency_key is refused for flake-ref
     templates, so none is sent).
     """
+    # A pool defined in a subflake addresses it with `?dir=`; the rev pin
+    # still names the whole repo, so the cache key stays (rev, attr).
+    dir_part = f"?dir={flake_dir}" if flake_dir else ""
     options = create_options(
-        template=f"github:{repo}/{rev}#{prefix}-{member}",
+        template=f"github:{repo}/{rev}{dir_part}#{prefix}-{member}",
         name=name,
         region=region,
         secret_files={secret_name: "runner-token"},
