@@ -128,7 +128,7 @@ async def reconcile(ix: Any) -> int:
     failures = len(config.refusals)
 
     # -- observe --
-    rev = desired_rev()
+    rev = desired_rev(config.flake_dir)
     runners = list_runners(pat, config.repo)
     vms = {info.name: info for info in await ix.machines().list()}
     snapshot = await observe_pool(

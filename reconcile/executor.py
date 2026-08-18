@@ -184,6 +184,7 @@ async def execute(
                         await create(
                             ix, config.repo, rev, config.secret_name,
                             config.attr_prefix, member, name, home,
+                            flake_dir=config.flake_dir,
                         )
                     except Exception as error:
                         # One retry in the next region, same tick. This is
@@ -203,6 +204,7 @@ async def execute(
                         await create(
                             ix, config.repo, rev, config.secret_name,
                             config.attr_prefix, member, name, alt,
+                            flake_dir=config.flake_dir,
                         )
                 result.summary.append((name, kind, "ok"))
             # Any exception, not just the SDK's: an unforeseen one used to
