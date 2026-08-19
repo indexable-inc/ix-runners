@@ -1,6 +1,36 @@
 import { describe, expect, test } from "bun:test"
-import { HttpError } from "./github.ts"
+import { HttpError, trustedRunProvenance } from "./github.ts"
 import { clean } from "./report.ts"
+
+describe("run provenance gates seed candidacy", () => {
+  const repo = "acme/app"
+
+  test("a FORK pull request whose head branch is named 'main' is NOT trusted", () => {
+    // The security case: head_branch === defaultBranch matches, so
+    // provenance is the only thing between fork code and the seed every
+    // trusted job forks from.
+    const run = { event: "pull_request", head_repository: { full_name: "mallory/app" } }
+    expect(trustedRunProvenance(run, repo)).toBe(false)
+  })
+
+  test("a push run is trusted", () => {
+    expect(trustedRunProvenance({ event: "push" }, repo)).toBe(true)
+  })
+
+  test("a same-repository run of any event is trusted", () => {
+    const run = { event: "schedule", head_repository: { full_name: "acme/app" } }
+    expect(trustedRunProvenance(run, repo)).toBe(true)
+  })
+
+  test("repository names compare case-insensitively, as GitHub treats them", () => {
+    const run = { event: "workflow_dispatch", head_repository: { full_name: "Acme/App" } }
+    expect(trustedRunProvenance(run, repo)).toBe(true)
+  })
+
+  test("a run with no head repository at all is not trusted", () => {
+    expect(trustedRunProvenance({ event: "pull_request" }, repo)).toBe(false)
+  })
+})
 
 describe("the 422 busy classification", () => {
   test("a busy runner's refusal reads as busy", () => {
