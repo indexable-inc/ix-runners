@@ -1,0 +1,44 @@
+{
+  "nodes": {
+    "ix-runners": {
+      "locked": {
+        "lastModified": 1787133156,
+        "narHash": "sha256-8DL6oGVEIG4typZN78FRyq7bD/wQH6G/Vp5vopdwefA=",
+        "owner": "indexable-inc",
+        "repo": "ix-runners",
+        "rev": "4751cbbab884173b3a3bcee7c19808e89a18bb37",
+        "type": "github"
+      },
+      "original": {
+        "owner": "indexable-inc",
+        "repo": "ix-runners",
+        "rev": "4751cbbab884173b3a3bcee7c19808e89a18bb37",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787070829,
+        "narHash": "sha256-vXNVDVtvfiQuXthP0NHPFdNvvMTkGpx0UP8oddIWbNk=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "0ae2bc1419c3f345984c2629e72e7a631820fa4d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "ix-runners": "ix-runners",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
