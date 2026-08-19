@@ -34,6 +34,8 @@ const config: Config = {
   maxColdBoots: 4,
   warmGraceSeconds: 300,
   mayScaleDown: true,
+  templateRepo: "acme/app",
+  templateRev: "",
 }
 
 let nextId = 0
@@ -82,6 +84,33 @@ describe("spawning", () => {
       expect(spawn.region).toBe("us-west-1")
       expect(spawn.name).toMatch(new RegExp(`^p-run-${LINEAGE}-`))
     }
+  })
+
+  test("pool mode cold-boots from the action's own repo at the action rev", () => {
+    // `pool:` mode: the template lives in the ACTION's repository, pinned
+    // at the action's own commit (which is also what world.rev carries,
+    // via resolveRev). The exact string is the seam: everything GitHub-side
+    // stays keyed on config.repo, only the flake ref moves.
+    const actionRev = "4751cbbab884173b3a3bcee7c19808e89a18bb37"
+    const pinned: Config = {
+      ...config,
+      flakeDir: "pools/baml",
+      templateRepo: "indexable-inc/ix-runners",
+      templateRev: actionRev,
+    }
+    const plan = steps(
+      world({
+        rev: actionRev,
+        queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false },
+      }),
+      pinned,
+    )
+    for (const spawn of only(plan, "spawn")) {
+      expect(spawn.source).toEqual({
+        template: `github:indexable-inc/ix-runners/${actionRev}?dir=pools/baml#ci-runner`,
+      })
+    }
+    expect(only(plan, "spawn").length).toBeGreaterThan(0)
   })
 
   test("a ready seed makes spawns restores, not cold boots", () => {

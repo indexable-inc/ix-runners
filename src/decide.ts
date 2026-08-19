@@ -311,8 +311,10 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
 }
 
 /** The sha-pinned flake reference a cold boot builds. Pinned by rev so the
- * platform's template cache is keyed by exactly the config that produced it. */
+ * platform's template cache is keyed by exactly the config that produced it.
+ * templateRepo, not repo: in pool mode the template lives in the ACTION's
+ * repository, while every GitHub call stays on the customer's. */
 function templateRef(config: Config, rev: string): string {
   const dir = config.flakeDir ? `?dir=${config.flakeDir}` : ""
-  return `github:${config.repo}/${rev}${dir}#${config.templateAttr}`
+  return `github:${config.templateRepo}/${rev}${dir}#${config.templateAttr}`
 }
