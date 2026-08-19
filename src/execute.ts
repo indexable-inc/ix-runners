@@ -6,7 +6,7 @@
  * destructive one begins, so a tick that dies halfway leaves the pool
  * larger than intended, never smaller. */
 
-import type { Client } from "@indexable/sdk"
+import type { Client, Machine } from "@indexable/sdk"
 import { NotFound } from "@indexable/sdk"
 import type { GitHub } from "./github.ts"
 import { clean, logError, mask } from "./report.ts"
@@ -67,7 +67,12 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
         return `deleted (${step.why})`
       }
       case "stop": {
-        await ix.machines().connect(step.machine.id).stop()
+        const holder = ix.machines().connect(step.machine.id)
+        try {
+          await holder.stop()
+        } finally {
+          await release(holder)
+        }
         return `stopped (${step.why})`
       }
       case "deregister": {
@@ -94,13 +99,19 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
       await machine.writeFile(JITCONFIG_PATH, jit)
     } catch (error) {
       try {
-        await destroy(machine.id())
+        // The create handle OWNS its machine: close() deletes it and
+        // releases the handle in one motion (NotFound swallowed by the
+        // SDK), which is exactly the cleanup this path wants.
+        await machine.close()
       } catch (cleanup) {
         // The root cause is `error`; a failed cleanup only adds a warning.
         logError(`${step.name}: deleting the half-spawned machine also failed (${clean(cleanup)})`)
       }
       throw error
     }
+    // Deliberately NOT closed on success: closing a handle that booted its
+    // machine DELETES the machine (SDK contract); a plain binding left to
+    // drop is the sanctioned way to let a machine outlive the program.
     return "snapshot" in step.source ? "spawned from seed" : "spawned cold"
   }
 
@@ -111,27 +122,67 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
    * once this machine's snapshot is listed as ready. */
   async function promote(step: Step & { do: "promote" }): Promise<string> {
     const winner = ix.machines().connect(step.winner.id)
-    const ref = await winner.snapshot()
-    const wait = await winner.waitSnapshotReady(ref.snapshotId, SNAPSHOT_WAIT_MS)
-    if (wait !== "ready") throw new Error(`snapshot ${ref.snapshotId} ended ${wait}`)
-    if (step.oldHolder !== undefined) {
-      // A -retiring machine can already exist if the previous promotion's
-      // cleanup has not run yet; it is strictly staler than what it would
-      // be replaced by, so it goes first.
-      await destroyByName(`${step.oldHolder.name}-retiring`)
-      await ix.machines().connect(step.oldHolder.id).rename(`${step.oldHolder.name}-retiring`)
+    try {
+      const snapshotId =
+        (await reusableSnapshot(step.winner.id)) ?? (await winner.snapshot()).snapshotId
+      const wait = await winner.waitSnapshotReady(snapshotId, SNAPSHOT_WAIT_MS)
+      if (wait !== "ready") throw new Error(`snapshot ${snapshotId} ended ${wait}`)
+      if (step.oldHolder !== undefined) {
+        // A -retiring machine can already exist if the previous promotion's
+        // cleanup has not run yet; it is strictly staler than what it would
+        // be replaced by, so it goes first.
+        await destroyByName(`${step.oldHolder.name}-retiring`)
+        const oldHolder = ix.machines().connect(step.oldHolder.id)
+        try {
+          await oldHolder.rename(`${step.oldHolder.name}-retiring`)
+        } finally {
+          await release(oldHolder)
+        }
+      }
+      await winner.rename(step.holderName)
+      await winner.stop()
+      return `now holds the ${step.holderName.split("-").at(-2)} seed`
+    } finally {
+      await release(winner)
     }
-    await winner.rename(step.holderName)
-    await winner.stop()
-    return `now holds the ${step.holderName.split("-").at(-2)} seed`
+  }
+
+  /** A previous attempt's capture of this machine, adopted instead of
+   * minting another. Promote failures cluster in CAS-pressure windows
+   * (captures dying pre-commit read back as "gone" or "failed"), and a
+   * fresh capture per retry tick feeds the very pressure that killed the
+   * last one - plus every abandoned capture leaks until the machine goes.
+   * A ready snapshot is adopted outright; a still-capturing one is waited
+   * on. The winner ran its one job and is idle, so every capture of it
+   * holds the same disk state. */
+  async function reusableSnapshot(machineId: string): Promise<string | undefined> {
+    const usable = (await ix.snapshots().list(machineId))
+      .filter((snapshot) => snapshot.status === "ready" || snapshot.status === "capturing")
+      .sort((a, b) => b.createdAt - a.createdAt)
+    return (usable.find((snapshot) => snapshot.status === "ready") ?? usable[0])?.id
+  }
+
+  /** Drop a connect() handle. An adopted handle never owns its machine
+   * (only a handle that BOOTED one deletes it at close), so this releases
+   * the connection and nothing else - and a failed release is a log line,
+   * never a failed step: the step's own outcome already happened. */
+  async function release(handle: Machine): Promise<void> {
+    try {
+      await handle.close()
+    } catch (error) {
+      logError(`releasing a machine handle failed (${clean(error)})`)
+    }
   }
 
   async function destroy(machineId: string): Promise<void> {
+    const handle = ix.machines().connect(machineId)
     try {
-      await ix.machines().connect(machineId).delete()
+      await handle.delete()
     } catch (error) {
       if (error instanceof NotFound) return // already gone is the goal state
       throw error
+    } finally {
+      await release(handle)
     }
   }
 
