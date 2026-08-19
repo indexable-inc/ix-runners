@@ -1,0 +1,36 @@
+# BAML's runner fleet. Read by the reconcile when the customer workflow
+# says `pool: baml` on the action; the flake next to this file builds the
+# cold-boot template it names. Every key is optional with a working default;
+# an unknown key is an error, not a default.
+
+# Fleet identity: machine names are <pool-name>-run-<lineage>-<nonce> and
+# <pool-name>-seed-<lineage>-<rev>; the reconcile matches on those, so
+# renaming this orphans every seed.       (default: the repository's name)
+pool-name = "baml"
+
+# The pool is defined in this self-contained subflake of the ix-runners
+# repository itself: cold boots pin
+# github:indexable-inc/ix-runners/<rev>?dir=pools/baml#ci-runner, where
+# <rev> is the commit the customer's workflow pins the action to. Seeds key
+# on that rev too, so a pin bump re-seeds the fleet and a baml merge never
+# does.
+flake-dir = "pools/baml"
+
+# The nixosConfigurations attribute the flake exposes.  (default: ci-runner)
+template-attr = "ci-runner"
+
+# ix regions, a lineage homes by hash modulo the list - roughly an even
+# split. Two regions so one region's bad day costs half the lineages, not
+# all of them. A lineage lives in ONE region for its whole life (seed and
+# forks together), so there is never a cross-region restore.
+regions = ["us-west-1", "us-east-1"]
+
+# Global cap on concurrently existing runner machines. 32 matches the v1
+# pool's concurrent-job budget: one full baml wave fits without queueing on
+# the cap.                                              (default: 16)
+max-runners = 32
+
+# Idle standbys kept beyond queued demand, per lineage with demand: the
+# next job of a busy lineage finds a registered runner instead of paying a
+# spawn.                                                (default: 1)
+headroom = 1

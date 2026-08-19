@@ -135,6 +135,30 @@ jobs:
           runner-pat: ${{ secrets.RUNNER_PAT }}
 ```
 
+### Pool mode: pools shipped in this repository
+
+A pool ix maintains for you lives under [`pools/`](./pools) in this repo -
+spec (`ix-runners.toml`), runner policy, and template flake - and your
+repository carries only the workflow. Pass `pool: <name>` instead of
+`config-file`:
+
+```yaml
+      - uses: indexable-inc/ix-runners@<sha>   # full commit sha, required
+        with:
+          ix-token: ${{ secrets.IX_TOKEN }}
+          runner-pat: ${{ secrets.RUNNER_PAT }}
+          pool: baml
+```
+
+In pool mode the cold-boot template pins THIS repository at the action's
+own commit, and seeds key on that same rev - so bumping the `uses:` sha is
+what re-seeds the fleet (the ordinary config-change law, with the pin as
+the config), and a merge in your repository never can. The reconcile reads
+nothing from your working tree: drop the checkout step (and with it the
+`fetch-depth: 0` requirement) from the workflow above, and the `push`
+trigger stops mattering - `schedule`, `workflow_dispatch` and
+`workflow_run` are enough.
+
 ## How it works
 
 Warmth is copy-on-write. A lineage's *seed* is an immutable ix snapshot

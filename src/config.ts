@@ -36,6 +36,17 @@ export interface Config {
   readonly warmGraceSeconds: number
   /** Only a scheduled tick may retire capacity. */
   readonly mayScaleDown: boolean
+  /** Where the cold-boot template builds from. Equal to `repo` (the
+   * customer repository) normally; the ACTION's own repository in pool
+   * mode, where the pool ships under pools/<name> in this repo. Kept apart
+   * from `repo` because everything GitHub-side - runners, queue, JIT
+   * credentials - stays on the customer repository either way. */
+  readonly templateRepo: string
+  /** The exact commit templates pin in pool mode, "" to derive the rev from
+   * the customer checkout's git history instead. Always a full 40-hex sha
+   * when set: the platform's template cache is keyed by exact rev, and a
+   * mutable ref re-resolves. */
+  readonly templateRev: string
 }
 
 const SPEC_KEYS: Record<string, "string" | "int" | "regions"> = {
@@ -154,6 +165,44 @@ function fromSpec(spec: Record<string, unknown>): Config {
     process.exit(1)
   }
 
+  // -- pool mode -------------------------------------------------------------
+  // Set by the action when the pool is one THIS repository ships (the
+  // `pool:` input): the spec came from the action's own checkout, so the
+  // templates must build from the action's repository at the action's own
+  // pinned commit - not from the customer repo, whose history says nothing
+  // about this pool. The rev-roll law is unchanged in shape: seeds key on
+  // this rev, so bumping the `uses:` pin is what re-seeds the fleet, and a
+  // customer merge never can.
+  const actionRev = (process.env.IX_RUNNERS_ACTION_REV ?? "").trim()
+  const actionRepo = (process.env.IX_RUNNERS_ACTION_REPO ?? "").trim()
+  if (!actionRev !== !actionRepo) {
+    logError(
+      "IX_RUNNERS_ACTION_REV and IX_RUNNERS_ACTION_REPO must be set together" +
+        ` (the action sets both under its \`pool\` input); got rev='${actionRev}',` +
+        ` repo='${actionRepo}'`,
+    )
+    process.exit(1)
+  }
+  if (actionRev && !/^[0-9a-f]{40}$/.test(actionRev)) {
+    logError(
+      `the action ref '${actionRev}' is not a full commit sha. To use the` +
+        " `pool:` input, pin the action by commit" +
+        " (uses: indexable-inc/ix-runners@<40-hex sha>): seeds and the" +
+        " template cache key on that exact rev, and a tag or branch both" +
+        " re-resolves and defeats the action's own pin-by-commit posture.",
+    )
+    process.exit(1)
+  }
+  if (actionRev && !flakeDir) {
+    // A shipped pool always lives in a subflake; this repo's root flake
+    // defines the mechanism, not a bootable machine.
+    logError(
+      "the pool spec came from the action's own checkout but sets no" +
+        ' flake-dir; a shipped pool must name its subflake (flake-dir = "pools/<name>")',
+    )
+    process.exit(1)
+  }
+
   // Which trigger this is. NOT a spec key: the trigger already says, and an
   // operator pinning it in a file would pin it for the cron too. TICK_MODE
   // exists for tests.
@@ -174,7 +223,17 @@ function fromSpec(spec: Record<string, unknown>): Config {
     maxColdBoots: int("max-cold-boots", 4),
     warmGraceSeconds: 300,
     mayScaleDown: tickMode === "scheduled",
+    templateRepo: actionRepo || repo,
+    templateRev: actionRev,
   }
+}
+
+/** The rev this tick converges toward. In pool mode it IS the action's
+ * pinned commit - the customer checkout's git history (which may not even
+ * exist under `pool:`) is never consulted. */
+export async function resolveRev(config: Config): Promise<string> {
+  if (config.templateRev) return config.templateRev
+  return desiredRev(config.flakeDir)
 }
 
 /** Last commit touching the runner config - NOT GITHUB_SHA: unrelated merges

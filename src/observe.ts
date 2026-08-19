@@ -4,7 +4,7 @@
 
 import type { Client } from "@indexable/sdk"
 import type { Config } from "./config.ts"
-import { desiredRev } from "./config.ts"
+import { resolveRev } from "./config.ts"
 import type { GitHub } from "./github.ts"
 import { parseRole } from "./names.ts"
 import type { MachineRow, Seed, World } from "./types.ts"
@@ -12,7 +12,7 @@ import type { MachineRow, Seed, World } from "./types.ts"
 export async function observe(ix: Client, gh: GitHub, config: Config): Promise<World> {
   // Independent reads, one round trip deep.
   const [rev, defaultBranch, machineInfos, allRegistrations] = await Promise.all([
-    desiredRev(config.flakeDir),
+    resolveRev(config),
     gh.defaultBranch(),
     ix.machines().list(),
     gh.listRunners(),

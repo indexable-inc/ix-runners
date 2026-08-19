@@ -10,7 +10,9 @@ description: >
 
 # One secret, one credential choice, one optional path. Every dial - the
 # pool name, caps, grace periods - lives in the spec file, which is the one
-# place the fleet's shape is stated.
+# place the fleet's shape is stated. The spec comes from `config-file` (a
+# pool your repository defines) or `pool` (one THIS repository ships under
+# pools/<name>); with neither set, the default spec path applies as before.
 inputs:
   ix-token:
     description: ix API token the runner VMs bill to
@@ -42,10 +44,23 @@ inputs:
       it is the fallback and not the destination.
     default: ""
 
+  pool:
+    description: >
+      Name of a pool this repository ships under pools/<name>/ (its
+      ix-runners.toml spec, runner policy, and template flake). The pool's
+      whole definition then travels with the action: cold-boot templates
+      pin THIS repository at the action's own commit, so seeds re-key -
+      and the fleet re-seeds - exactly when the `uses:` pin changes, and a
+      merge in your repository never can. Requires the action to be pinned
+      by full commit sha. Ignored when config-file is set; your repository
+      then needs no checkout step at all.
+    default: ""
+
   config-file:
     description: >
-      Path to the pool spec, relative to the workspace.
-    default: .github/ix-runners.toml
+      Path to the pool spec, relative to the workspace. Takes precedence
+      over `pool`.
+    default: ""
 
   github-token:
     description: >
@@ -73,11 +88,31 @@ runs:
         IX_TOKEN_SOURCE: ${{ inputs.token-source }}
         GITHUB_ADMIN_TOKEN: ${{ inputs.runner-pat }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
-        IX_POOL_SPEC: ${{ inputs.config-file }}
+        INPUT_CONFIG_FILE: ${{ inputs.config-file }}
+        INPUT_POOL: ${{ inputs.pool }}
+        # The ref this action was invoked at (the sha in `uses:` when pinned
+        # by commit) and the repository it lives in. Forwarded to the
+        # reconcile only in `pool` mode, where the templates must pin the
+        # action's own repo at this exact rev.
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
       # --frozen-lockfile: install exactly the hash-pinned dependency set in
       # bun.lock, never whatever the registry resolves to today.
       run: |
         cd "${{ github.action_path }}"
         bun install --frozen-lockfile --production
         cd "$GITHUB_WORKSPACE"
+        if [ -n "$INPUT_CONFIG_FILE" ]; then
+          # A pool your repository defines: the spec comes from the
+          # workspace checkout, as it always has.
+          export IX_POOL_SPEC="$INPUT_CONFIG_FILE"
+        elif [ -n "$INPUT_POOL" ]; then
+          # A pool this repository ships: spec and template come from the
+          # action's own checkout, and the re-seed trigger is the pin.
+          export IX_POOL_SPEC="$GITHUB_ACTION_PATH/pools/$INPUT_POOL/ix-runners.toml"
+          export IX_RUNNERS_ACTION_REV="$ACTION_REF"
+          export IX_RUNNERS_ACTION_REPO="$ACTION_REPO"
+        else
+          export IX_POOL_SPEC=".github/ix-runners.toml"
+        fi
         bun run "${{ github.action_path }}/src/main.ts"

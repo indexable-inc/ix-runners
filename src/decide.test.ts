@@ -34,6 +34,8 @@ const config: Config = {
   maxColdBoots: 4,
   warmGraceSeconds: 300,
   mayScaleDown: true,
+  templateRepo: "acme/app",
+  templateRev: "",
 }
 
 let nextId = 0
@@ -82,6 +84,33 @@ describe("spawning", () => {
       expect(spawn.region).toBe("us-west-1")
       expect(spawn.name).toMatch(new RegExp(`^p-run-${LINEAGE}-`))
     }
+  })
+
+  test("pool mode cold-boots from the action's own repo at the action rev", () => {
+    // `pool:` mode: the template lives in the ACTION's repository, pinned
+    // at the action's own commit (which is also what world.rev carries,
+    // via resolveRev). The exact string is the seam: everything GitHub-side
+    // stays keyed on config.repo, only the flake ref moves.
+    const actionRev = "4751cbbab884173b3a3bcee7c19808e89a18bb37"
+    const pinned: Config = {
+      ...config,
+      flakeDir: "pools/baml",
+      templateRepo: "indexable-inc/ix-runners",
+      templateRev: actionRev,
+    }
+    const plan = steps(
+      world({
+        rev: actionRev,
+        queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false },
+      }),
+      pinned,
+    )
+    for (const spawn of only(plan, "spawn")) {
+      expect(spawn.source).toEqual({
+        template: `github:indexable-inc/ix-runners/${actionRev}?dir=pools/baml#ci-runner`,
+      })
+    }
+    expect(only(plan, "spawn").length).toBeGreaterThan(0)
   })
 
   test("a ready seed makes spawns restores, not cold boots", () => {
@@ -259,6 +288,54 @@ describe("cleanup", () => {
     const done = machine(`p-run-${LINEAGE}-x1`)
     const plan = steps(world({ machines: [done] }))
     expect(only(plan, "delete").map((s) => s.machine.name)).toEqual([done.name])
+  })
+
+  // The seed race: a JIT runner deregisters seconds after its job ends,
+  // but the finished-job observation can lag. Deleting on deregistration
+  // alone destroys the very disk state promotion snapshots - so an
+  // unevidenced runner is HELD until its evidence arrives or the idle
+  // grace expires.
+  test("a deregistered runner without finished evidence is held, not deleted", () => {
+    const unevidenced = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 400_000 })
+    expect(steps(world({ machines: [unevidenced] }))).toHaveLength(0)
+  })
+
+  test("finished evidence releases the job-finished delete", () => {
+    const evidenced = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 400_000 })
+    const plan = steps(
+      world({
+        machines: [evidenced],
+        queue: {
+          demanded: [],
+          // A PR job (not promotable) so the machine deletes instead of promoting.
+          finished: [finished(evidenced.name, { onDefaultBranch: false })],
+          truncated: false,
+        },
+      }),
+    )
+    const deletes = only(plan, "delete")
+    expect(deletes.map((s) => s.machine.name)).toEqual([evidenced.name])
+    expect(deletes[0]?.why).toBe("job finished")
+  })
+
+  test("the idle grace is the backstop for evidence that never arrives", () => {
+    const abandoned = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 901_000 })
+    const plan = steps(world({ machines: [abandoned] }))
+    const deletes = only(plan, "delete")
+    expect(deletes.map((s) => s.machine.name)).toEqual([abandoned.name])
+    expect(deletes[0]?.why).toBe("no registration past idle grace")
+  })
+
+  test("a held runner promotes when its green default-branch evidence lands late", () => {
+    const winner = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 400_000 })
+    const plan = steps(
+      world({
+        machines: [winner],
+        queue: { demanded: [], finished: [finished(winner.name)], truncated: false },
+      }),
+    )
+    expect(only(plan, "promote").map((s) => s.winner.name)).toEqual([winner.name])
+    expect(only(plan, "delete")).toHaveLength(0)
   })
 
   test("an offline registration with no machine is deregistered", () => {
