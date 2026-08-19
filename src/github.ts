@@ -11,8 +11,11 @@ import { canonicalLabels } from "./names.ts"
 
 /** Ceiling on active workflow runs whose jobs are counted for demand. */
 const MAX_DEMAND_RUNS = 100
-/** Recently-completed runs scanned for promotions and idle evidence. */
-const FINISHED_SCAN_RUNS = 30
+/** Recently-completed runs scanned for promotions and idle evidence. This
+ * window IS a held winner's promotability: once its run scrolls past it,
+ * the machine can never be promoted and falls to the idle-grace backstop.
+ * Sized so a busy repository cannot push a green run out between ticks. */
+const FINISHED_SCAN_RUNS = 100
 /** Spacing between registration DELETEs: rapid ones trip the secondary rate
  * limit, whose 422 wears the same status as a busy runner's refusal. */
 const DEREGISTER_PAUSE_MS = 1000
@@ -298,7 +301,7 @@ export class HttpError extends Error {
 }
 
 /** GitHub tolerates modest read parallelism; 8 keeps the worst-case scan
- * (~230 runs) to a few dozen batched round trips without brushing the
+ * (~300 runs) to a few dozen batched round trips without brushing the
  * secondary rate limit the way a burst of hundreds would. */
 const JOB_READ_CONCURRENCY = 8
 

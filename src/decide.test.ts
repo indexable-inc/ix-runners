@@ -357,10 +357,14 @@ describe("cleanup", () => {
 
   test("the idle grace is the backstop for evidence that never arrives", () => {
     const abandoned = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 901_000 })
-    const plan = steps(world({ machines: [abandoned] }))
-    const deletes = only(plan, "delete")
+    const plan = decide(config, world({ machines: [abandoned] }), NOW)
+    const deletes = only([...plan.steps], "delete")
     expect(deletes.map((s) => s.machine.name)).toEqual([abandoned.name])
     expect(deletes[0]?.why).toBe("no registration past idle grace")
+    // The evidence-less delete warns: a lost green run must be findable.
+    expect(
+      plan.notes.some((n) => n.level === "warn" && n.text.includes(`${abandoned.name}: deleting`)),
+    ).toBe(true)
   })
 
   test("a held runner promotes when its green default-branch evidence lands late", () => {

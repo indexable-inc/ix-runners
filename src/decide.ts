@@ -218,6 +218,17 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
       steps.push({ do: "delete", machine, why: "job finished" })
       deleted.add(machine.id)
     } else if (nowMs - machine.createdAt >= config.idleGraceSeconds * 1000) {
+      // Evidence loss must never be silent: if this machine's job was green
+      // on the default branch, deleting it here is the seed candidacy being
+      // destroyed - say so, loudly, so an evicted scan window is findable.
+      notes.push({
+        level: "warn",
+        text:
+          `${machine.name}: deleting past the idle grace with NO finished-job` +
+          " evidence in the scan window (cancelled run, or the run scrolled" +
+          " out of the completed scan). If its job was green on the default" +
+          " branch, its seed candidacy is lost with it.",
+      })
       steps.push({ do: "delete", machine, why: "no registration past idle grace" })
       deleted.add(machine.id)
     }
