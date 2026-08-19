@@ -9,7 +9,7 @@
 import type { Client, Machine } from "@indexable/sdk"
 import { NotFound } from "@indexable/sdk"
 import type { GitHub } from "./github.ts"
-import { clean, logError, mask } from "./report.ts"
+import { clean, logError, logWarning, mask } from "./report.ts"
 import type { Plan, Step } from "./types.ts"
 
 /** Where the guest's path unit watches for its single-job credential. */
@@ -17,6 +17,11 @@ const JITCONFIG_PATH = "/var/lib/ix-runner/jitconfig"
 /** Snapshot capture of a CI machine's disk, observed under a minute; three
  * minutes is the point past which waiting costs more than a cold boot. */
 const SNAPSHOT_WAIT_MS = 180_000
+/** How old a still-"capturing" snapshot may be and still be adopted by a
+ * promote retry: a capture started within the last wait-plus-one-cron-tick
+ * may genuinely still be replicating; anything older is stuck, and waiting
+ * on it again burns the full wait every tick without ever re-minting. */
+const CAPTURE_ADOPTION_AGE_MS = SNAPSHOT_WAIT_MS + 15 * 60_000
 
 export interface Outcome {
   /** (subject, action, outcome) rows for the job summary. */
@@ -99,10 +104,12 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
       await machine.writeFile(JITCONFIG_PATH, jit)
     } catch (error) {
       try {
-        // The create handle OWNS its machine: close() deletes it and
-        // releases the handle in one motion (NotFound swallowed by the
-        // SDK), which is exactly the cleanup this path wants.
-        await machine.close()
+        // Deleted EXPLICITLY, never via close(): close only deletes because
+        // create() marked the handle as owning, and billing-critical cleanup
+        // must not lean on an SDK ownership flag. The handle is then closed
+        // best-effort (a second delete of a gone machine is swallowed).
+        await destroy(machine.id())
+        await release(machine)
       } catch (cleanup) {
         // The root cause is `error`; a failed cleanup only adds a warning.
         logError(`${step.name}: deleting the half-spawned machine also failed (${clean(cleanup)})`)
@@ -141,7 +148,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
       }
       await winner.rename(step.holderName)
       await winner.stop()
-      return `now holds the ${step.holderName.split("-").at(-2)} seed`
+      return `now holds the seed as ${step.holderName}`
     } finally {
       await release(winner)
     }
@@ -153,13 +160,29 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
    * fresh capture per retry tick feeds the very pressure that killed the
    * last one - plus every abandoned capture leaks until the machine goes.
    * A ready snapshot is adopted outright; a still-capturing one is waited
-   * on. The winner ran its one job and is idle, so every capture of it
-   * holds the same disk state. */
+   * on only while young enough to plausibly still finish - one stuck
+   * "capturing" row must not be re-adopted every tick forever, wedging the
+   * lineage while the winner bills. The winner ran its one job and is
+   * idle, so every capture of it holds the same disk state.
+   *
+   * Best-effort by construction: adoption is an optimization, so a failure
+   * to LIST snapshots falls back to minting rather than failing a promote
+   * that would previously have gone straight to snapshot(). */
   async function reusableSnapshot(machineId: string): Promise<string | undefined> {
-    const usable = (await ix.snapshots().list(machineId))
-      .filter((snapshot) => snapshot.status === "ready" || snapshot.status === "capturing")
-      .sort((a, b) => b.createdAt - a.createdAt)
-    return (usable.find((snapshot) => snapshot.status === "ready") ?? usable[0])?.id
+    try {
+      const usable = (await ix.snapshots().list(machineId))
+        .filter(
+          (snapshot) =>
+            snapshot.status === "ready" ||
+            (snapshot.status === "capturing" &&
+              Date.now() - snapshot.createdAt <= CAPTURE_ADOPTION_AGE_MS),
+        )
+        .sort((a, b) => b.createdAt - a.createdAt)
+      return (usable.find((snapshot) => snapshot.status === "ready") ?? usable[0])?.id
+    } catch (error) {
+      logWarning(`could not list ${machineId}'s snapshots (${clean(error)}); minting a fresh capture`)
+      return undefined
+    }
   }
 
   /** Drop a connect() handle. An adopted handle never owns its machine
