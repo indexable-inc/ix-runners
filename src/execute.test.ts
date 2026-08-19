@@ -2,7 +2,7 @@
  * record every SDK call: which snapshot a retry adopts, and that no handle
  * outlives its step. */
 
-import { describe, expect, mock, test } from "bun:test"
+import { afterAll, describe, expect, mock, test } from "bun:test"
 import type { Client } from "@indexable/sdk"
 import type { GitHub } from "./github.ts"
 import type { MachineRow, Plan } from "./types.ts"
@@ -12,6 +12,9 @@ import type { MachineRow, Plan } from "./types.ts"
 // and never touch the network or the addon.
 mock.module("@indexable/sdk", () => ({ NotFound: class NotFound extends Error {} }))
 const { execute } = await import("./execute.ts")
+// The module mock is process-global: restore it so no later-loaded test
+// file inherits a fake SDK by accident.
+afterAll(() => mock.restore())
 
 const WINNER: MachineRow = {
   id: "w1",
@@ -29,7 +32,12 @@ interface FakeSnapshot {
 
 /** A recording ix client: every machine call lands in `calls` as
  * `<verb>:<machine id>[:<argument>]`. */
-function fakeIx(options: { snapshots?: FakeSnapshot[]; wait?: string; jitFails?: boolean }) {
+function fakeIx(options: {
+  snapshots?: FakeSnapshot[]
+  wait?: string
+  jitFails?: boolean
+  listFails?: boolean
+}) {
   const calls: string[] = []
   const handle = (id: string) => ({
     snapshot: async () => {
@@ -68,6 +76,7 @@ function fakeIx(options: { snapshots?: FakeSnapshot[]; wait?: string; jitFails?:
     snapshots: () => ({
       list: async (machineId: string) => {
         calls.push(`list:${machineId}`)
+        if (options.listFails) throw new Error("listing outage")
         return options.snapshots ?? []
       },
     }),
@@ -89,7 +98,7 @@ const promotePlan: Plan = {
 describe("promote adopts prior captures", () => {
   test("a still-capturing snapshot from a previous attempt is waited on, not re-minted", async () => {
     const { ix, gh, calls } = fakeIx({
-      snapshots: [{ id: "prev", status: "capturing", createdAt: 5 }],
+      snapshots: [{ id: "prev", status: "capturing", createdAt: Date.now() - 60_000 }],
     })
     const outcome = await execute(ix, gh, promotePlan)
     expect(outcome.failures).toBe(0)
@@ -101,8 +110,8 @@ describe("promote adopts prior captures", () => {
   test("a ready snapshot is adopted over a younger in-flight one", async () => {
     const { ix, gh, calls } = fakeIx({
       snapshots: [
-        { id: "done", status: "ready", createdAt: 1 },
-        { id: "mid", status: "capturing", createdAt: 2 },
+        { id: "done", status: "ready", createdAt: Date.now() - 120_000 },
+        { id: "mid", status: "capturing", createdAt: Date.now() - 60_000 },
       ],
     })
     await execute(ix, gh, promotePlan)
@@ -118,9 +127,26 @@ describe("promote adopts prior captures", () => {
     expect(calls).toContain("wait:w1:fresh")
   })
 
+  test("a STUCK capturing snapshot (older than wait + a tick) is not re-adopted", async () => {
+    // One wedged capturing row must not be waited on every tick forever.
+    const { ix, gh, calls } = fakeIx({
+      snapshots: [{ id: "stuck", status: "capturing", createdAt: Date.now() - 3_600_000 }],
+    })
+    await execute(ix, gh, promotePlan)
+    expect(calls).toContain("snapshot:w1")
+    expect(calls).toContain("wait:w1:fresh")
+  })
+
+  test("a snapshot-listing failure falls back to minting, never fails the promote", async () => {
+    const { ix, gh, calls } = fakeIx({ listFails: true })
+    const outcome = await execute(ix, gh, promotePlan)
+    expect(outcome.failures).toBe(0)
+    expect(calls).toContain("snapshot:w1")
+  })
+
   test("a wait that ends short of ready fails the step, renames nothing, releases the handle", async () => {
     const { ix, gh, calls } = fakeIx({
-      snapshots: [{ id: "prev", status: "capturing", createdAt: 5 }],
+      snapshots: [{ id: "prev", status: "capturing", createdAt: Date.now() - 60_000 }],
       wait: "gone",
     })
     const outcome = await execute(ix, gh, promotePlan)
@@ -144,18 +170,22 @@ describe("spawn handle ownership", () => {
     notes: [],
   }
 
-  test("a failed mint closes the create handle, which deletes the machine it owns", async () => {
+  test("a failed mint DELETES the half-spawned machine explicitly, then closes the handle", async () => {
     const { ix, gh, calls } = fakeIx({ jitFails: true })
     const outcome = await execute(ix, gh, spawnPlan)
     expect(outcome.failures).toBe(1)
+    // The delete verb is pinned: cleanup must never lean on close()'s
+    // SDK-ownership side effect to do the billing-critical deletion.
+    expect(calls).toContain("delete:new")
     expect(calls).toContain("close:new")
   })
 
-  test("a successful spawn never closes the create handle: close would delete the machine", async () => {
+  test("a successful spawn never deletes or closes the create handle", async () => {
     const { ix, gh, calls } = fakeIx({})
     const outcome = await execute(ix, gh, spawnPlan)
     expect(outcome.failures).toBe(0)
     expect(calls).toContain("write:new")
+    expect(calls).not.toContain("delete:new")
     expect(calls).not.toContain("close:new")
   })
 })

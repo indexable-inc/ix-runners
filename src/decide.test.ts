@@ -206,7 +206,8 @@ describe("promotion", () => {
     const promotes = only(plan, "promote")
     expect(promotes).toHaveLength(1)
     expect(promotes[0]!.winner.name).toBe(newer.name)
-    expect(promotes[0]!.holderName).toBe(HOLDER)
+    // The holder name carries the winner's source-job completion time.
+    expect(promotes[0]!.holderName).toBe(seedName("p", LINEAGE, REV, NOW / 1000 - 60))
     // the loser is a finished runner, deleted
     expect(only(plan, "delete").map((s) => s.machine.name)).toEqual([older.name])
   })
@@ -272,6 +273,57 @@ describe("promotion", () => {
     expect(only([...plan.steps], "delete").map((s) => s.machine.name)).toEqual([leftover.name])
     // The skip is never silent: it must be distinguishable from cleanup.
     expect(plan.notes.some((n) => n.text.includes(`not promoting ${leftover.name}`))).toBe(true)
+  })
+
+  test("two-tick seed regression: an older survivor cannot overwrite a fresher seed", () => {
+    // The review's blocker scenario, end to end. Tick 1: same-lineage green
+    // machines A (older job, still registered so "still settling") and B
+    // (newer job, settled) - B promotes, A survives untouched. Tick 2: A
+    // has deregistered; its evidence is only minutes older than the seed's,
+    // well inside any snapshot-time slack. Under a slack-based gate A would
+    // regress the seed to older state; the holder NAME carrying B's job
+    // time is what refuses it. The times are chosen inside every slack ever
+    // used (old 20m, legacy 5m) so only job-time-vs-job-time can pass.
+    const tA = NOW / 1000 - 180 // A's job: 3 minutes ago
+    const tB = NOW / 1000 - 120 // B's job: 2 minutes ago, the fresher evidence
+    const a = machine(`p-run-${LINEAGE}-aaa1`)
+    const b = machine(`p-run-${LINEAGE}-bbb1`)
+    const tick1 = steps(
+      world({
+        machines: [a, b],
+        registrations: [registration(a.name)], // A still settling
+        queue: {
+          demanded: [],
+          finished: [
+            finished(a.name, { completedAt: tA }),
+            finished(b.name, { completedAt: tB }),
+          ],
+          truncated: false,
+        },
+      }),
+    )
+    expect(only(tick1, "promote").map((s) => s.winner.name)).toEqual([b.name])
+    expect(only(tick1, "delete")).toHaveLength(0) // A survives tick 1
+    const holderName = only(tick1, "promote")[0]!.holderName
+
+    // Tick 2: B's promotion landed - the holder wears the name tick 1
+    // minted - and A deregistered. A must be cleaned up, never promoted.
+    const holder = machine(holderName, { status: "stopped" })
+    const tick2 = steps(
+      world({
+        machines: [holder, a],
+        seeds: new Map([
+          [holder.id, { holder, snapshotId: "s", snapshotAt: NOW - 30_000 }],
+        ]),
+        queue: {
+          demanded: [],
+          finished: [finished(a.name, { completedAt: tA })],
+          truncated: false,
+        },
+      }),
+    )
+    expect(only(tick2, "promote")).toHaveLength(0)
+    expect(only(tick2, "delete").map((s) => s.machine.name)).toEqual([a.name])
   })
 
   test("a newer green run is not judged stale by an older run's later-landing snapshot", () => {
@@ -365,6 +417,20 @@ describe("cleanup", () => {
     expect(
       plan.notes.some((n) => n.level === "warn" && n.text.includes(`${abandoned.name}: deleting`)),
     ).toBe(true)
+  })
+
+  test("the evidence-loss warning stays quiet when the scan was truncated", () => {
+    // A truncated scan makes evidence absence expected; the delete still
+    // happens (the machine is past every grace), but crying wolf on every
+    // busy-repo tick would drown the real eviction signal.
+    const abandoned = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 901_000 })
+    const plan = decide(
+      config,
+      world({ machines: [abandoned], queue: { demanded: [], finished: [], truncated: true } }),
+      NOW,
+    )
+    expect(only([...plan.steps], "delete").map((s) => s.machine.name)).toEqual([abandoned.name])
+    expect(plan.notes.some((n) => n.level === "warn" && n.text.includes("deleting"))).toBe(false)
   })
 
   test("a held runner promotes when its green default-branch evidence lands late", () => {
@@ -560,7 +626,11 @@ describe("holes the first review found, pinned shut", () => {
   })
 
   test("promotion over a FAILED incumbent hands it over as the machine to move aside", () => {
-    const incumbent = machine(HOLDER, { status: "failed" })
+    // With evidence-suffixed names a collision needs the failed incumbent
+    // to hold EXACTLY the target name (same lineage, rev, and evidence
+    // second) - rare, but a failed holder from a previous promotion of the
+    // same-second evidence does exactly that.
+    const incumbent = machine(seedName("p", LINEAGE, REV, NOW / 1000 - 60), { status: "failed" })
     const winner = machine(`p-run-${LINEAGE}-abc1`)
     const plan = steps(
       world({

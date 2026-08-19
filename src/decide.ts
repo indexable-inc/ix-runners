@@ -10,21 +10,21 @@ import type { Config } from "./config.ts"
 import { lineageKey, parseRole, runnerName, seedName } from "./names.ts"
 import type { Labels, MachineRow, Plan, Registration, Step, World } from "./types.ts"
 
-/** Slack the seed-freshness gate allows between the two clocks it compares.
+/** Slack for LEGACY holders only: seeds promoted before the holder name
+ * carried its source job's completion time.
  *
- * A seed's `snapshotAt` is CAPTURE time - the promoting tick found the
- * evidence up to a cron interval after the source job completed, then
- * started the capture - while a winner's `completedAt` is JOB time.
- * Comparing them raw makes a genuinely newer green run silently lose to an
- * older seed whose snapshot merely landed later (job B completes after job
- * A but before A's snapshot exists: B reads as stale). The SDK's snapshot
- * record carries no field to round-trip the source job's completion time,
- * so the gate is biased by this slack instead: skip only when the snapshot
- * predates the winner's evidence by MORE than any plausible capture skew.
- * The bias errs toward promoting - a rare redundant promote costs one
- * snapshot and swap; a silently stale seed is served to every fork until
- * the next green run notices nothing and keeps it stale. */
-export const MAX_CAPTURE_SKEW_MS = 20 * 60 * 1000 // cron tick (15m) + scan + capture start
+ * A current holder's name encodes its evidence, so the freshness gate
+ * compares job time to job time exactly. A legacy holder only has
+ * `snapshotAt` - CAPTURE time, which postdates its source job by the
+ * promoting tick's scan-to-capture latency (seconds, at most a minute or
+ * two) - so the gate biases by this slack against it. The slack cuts both
+ * ways and is deliberately SMALL: too large and an older leftover runner
+ * can REGRESS a legacy seed (a wide slack admits evidence older than the
+ * seed's own); too small and a genuinely newer run reads as stale. Legacy
+ * holders also refuse any winner whose evidence predates the holder
+ * machine's creation - a machine cannot hold evidence from before it
+ * existed. A rev roll deletes every holder, so legacy names wash out. */
+export const LEGACY_CAPTURE_SKEW_MS = 5 * 60 * 1000
 
 export function decide(config: Config, world: World, nowMs: number): Plan {
   const steps: Step[] = []
@@ -67,11 +67,22 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   const holders = alive.filter((machine) => role(machine)?.kind === "seed")
 
   const currentHolders = new Map<string, MachineRow>() // lineage -> holder
+  const seedEvidence = (machine: MachineRow): number | undefined => {
+    const parsed = role(machine)
+    return parsed?.kind === "seed" ? parsed.evidenceAtSec : undefined
+  }
   for (const holder of holders) {
     const parsed = role(holder)
-    if (parsed?.kind === "seed" && parsed.rev === rev8 && !parsed.retiring) {
-      currentHolders.set(parsed.lineage, holder)
+    if (parsed?.kind !== "seed" || parsed.rev !== rev8 || parsed.retiring) continue
+    // Evidence-suffixed names mean two non-retiring holders CAN coexist
+    // briefly around a crash; the one with the newest evidence is the
+    // lineage's seed (a legacy name with unknown evidence counts oldest).
+    const incumbent = currentHolders.get(parsed.lineage)
+    if (incumbent !== undefined) {
+      const standing = seedEvidence(incumbent)
+      if (standing !== undefined && (parsed.evidenceAtSec ?? -Infinity) <= standing) continue
     }
+    currentHolders.set(parsed.lineage, holder)
   }
 
   // A failed machine still owns its NAME. Promotion renames the winner into
@@ -175,24 +186,52 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   }
   for (const [lineage, winner] of winners) {
     const oldHolder = currentHolders.get(lineage)
+    const oldEvidenceSec = oldHolder && seedEvidence(oldHolder)
     const oldSeed = oldHolder && world.seeds.get(oldHolder.id)
-    if (
-      oldSeed?.snapshotAt !== undefined &&
-      oldSeed.snapshotAt - MAX_CAPTURE_SKEW_MS >= winner.completedAt * 1000
-    ) {
-      // The seed's evidence is newer beyond any capture skew. Never silent:
-      // the winner falls through to job-finished deletion below, and a
-      // skipped promotion must be distinguishable from plain cleanup.
-      notes.push({
-        level: "info",
-        text:
-          `${lineage}: not promoting ${winner.machine.name} - the seed's snapshot` +
-          ` (${new Date(oldSeed.snapshotAt).toISOString()}) already postdates its evidence` +
-          ` (job completed ${new Date(winner.completedAt * 1000).toISOString()})`,
-      })
-      continue
+    // A skipped promotion is never silent: the winner falls through to
+    // job-finished deletion below, and a skip must be distinguishable from
+    // plain cleanup - the shape of every "why did the seed not refresh?" hunt.
+    if (oldEvidenceSec !== undefined) {
+      // The holder's name carries its source job's completion: job time
+      // against job time, exactly, no slack in either direction.
+      if (oldEvidenceSec >= winner.completedAt) {
+        notes.push({
+          level: "info",
+          text:
+            `${lineage}: not promoting ${winner.machine.name} - the seed already holds` +
+            ` evidence from ${new Date(oldEvidenceSec * 1000).toISOString()}, no older than` +
+            ` this job (completed ${new Date(winner.completedAt * 1000).toISOString()})`,
+        })
+        continue
+      }
+    } else if (oldHolder !== undefined && oldSeed?.snapshotAt !== undefined) {
+      // Legacy holder: its name predates the evidence suffix, so only its
+      // capture time is known. Two guards, both refusing the winner: the
+      // snapshot predates the evidence beyond the capture skew, or the
+      // evidence predates the holder machine itself (a machine cannot hold
+      // evidence from before it existed).
+      if (oldSeed.snapshotAt - LEGACY_CAPTURE_SKEW_MS >= winner.completedAt * 1000) {
+        notes.push({
+          level: "info",
+          text:
+            `${lineage}: not promoting ${winner.machine.name} - the legacy seed's snapshot` +
+            ` (${new Date(oldSeed.snapshotAt).toISOString()}) already postdates its evidence` +
+            ` (job completed ${new Date(winner.completedAt * 1000).toISOString()})`,
+        })
+        continue
+      }
+      if (winner.completedAt * 1000 <= oldHolder.createdAt) {
+        notes.push({
+          level: "info",
+          text:
+            `${lineage}: not promoting ${winner.machine.name} - its job completed` +
+            ` (${new Date(winner.completedAt * 1000).toISOString()}) before the legacy holder` +
+            ` machine even existed (${new Date(oldHolder.createdAt).toISOString()})`,
+        })
+        continue
+      }
     }
-    const holderName = seedName(config.pool, lineage, world.rev)
+    const holderName = seedName(config.pool, lineage, world.rev, winner.completedAt)
     steps.push({
       do: "promote",
       winner: winner.machine,
@@ -228,15 +267,21 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
     } else if (nowMs - machine.createdAt >= config.idleGraceSeconds * 1000) {
       // Evidence loss must never be silent: if this machine's job was green
       // on the default branch, deleting it here is the seed candidacy being
-      // destroyed - say so, loudly, so an evicted scan window is findable.
-      notes.push({
-        level: "warn",
-        text:
-          `${machine.name}: deleting past the idle grace with NO finished-job` +
-          " evidence in the scan window (cancelled run, or the run scrolled" +
-          " out of the completed scan). If its job was green on the default" +
-          " branch, its seed candidacy is lost with it.",
-      })
+      // destroyed - say so, so an evicted scan window is findable. Only when
+      // the scan was complete, though: a truncated scan makes absence
+      // expected, and the benign residents of this branch (a retiree whose
+      // delete failed last tick, a spawn that never registered) would drown
+      // the real signal in cried wolves.
+      if (!queue.truncated) {
+        notes.push({
+          level: "warn",
+          text:
+            `${machine.name}: deleting past the idle grace with NO finished-job` +
+            " evidence in the scan window. If its job was green on the default" +
+            " branch, its seed candidacy is lost with it; a retiree whose delete" +
+            " failed or a spawn that never registered lands here benignly.",
+        })
+      }
       steps.push({ do: "delete", machine, why: "no registration past idle grace" })
       deleted.add(machine.id)
     }

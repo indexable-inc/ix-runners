@@ -11,10 +11,13 @@ import { canonicalLabels } from "./names.ts"
 
 /** Ceiling on active workflow runs whose jobs are counted for demand. */
 const MAX_DEMAND_RUNS = 100
-/** Recently-completed runs scanned for promotions and idle evidence. This
- * window IS a held winner's promotability: once its run scrolls past it,
- * the machine can never be promoted and falls to the idle-grace backstop.
- * Sized so a busy repository cannot push a green run out between ticks. */
+/** Hard cap on recently-completed runs scanned for promotions and idle
+ * evidence. This window IS a held winner's promotability: once its run
+ * scrolls past it, the machine can never be promoted and falls to the
+ * idle-grace backstop. The scan normally stops far earlier, at the
+ * caller's evidence floor (no run older than the oldest standing machine
+ * can matter) - the cap only bounds the pathological wide-open case
+ * against the workflow token's request budget. */
 const FINISHED_SCAN_RUNS = 100
 /** Spacing between registration DELETEs: rapid ones trip the secondary rate
  * limit, whose 422 wears the same status as a busy runner's refusal. */
@@ -161,8 +164,18 @@ export class GitHub {
   /** One pass over the queue: demand for this pool, and the recently
    * finished jobs that drive promotion and idle evidence. Returns null when
    * the read failed: missing data is not zero demand, and the caller's
-   * answer is to make no scale-down decision at all. */
-  async observeQueue(markerLabel: string, defaultBranch: string): Promise<QueueObservation | null> {
+   * answer is to make no scale-down decision at all.
+   *
+   * `evidenceFloorMs` time-bounds the completed-runs scan: runs created
+   * before it cannot carry evidence for any standing machine (the caller
+   * derives it from the oldest standing runner), so the scan stops there
+   * instead of always spending the full run budget against the workflow
+   * token's rate limit. */
+  async observeQueue(
+    markerLabel: string,
+    defaultBranch: string,
+    evidenceFloorMs?: number,
+  ): Promise<QueueObservation | null> {
     try {
       const demanded: DemandedJob[] = []
       const finished: FinishedJob[] = []
@@ -172,7 +185,10 @@ export class GitHub {
       // minutes before the run itself completes, and a runner machine whose
       // evidence is invisible until run-completion would be reaped as
       // job-finished before it could ever be promoted into a seed.
-      const collectFinished = (job: Awaited<ReturnType<typeof this.runJobs>>[number]) => {
+      const collectFinished = (
+        job: Awaited<ReturnType<typeof this.runJobs>>[number],
+        trustedRun: boolean,
+      ) => {
         const completedAt = Date.parse(job.completed_at ?? "")
         if (!job.runner_name || Number.isNaN(completedAt)) return
         finished.push({
@@ -180,19 +196,24 @@ export class GitHub {
           labels: canonicalLabels(job.labels ?? []),
           completedAt: completedAt / 1000,
           succeeded: job.conclusion === "success",
-          onDefaultBranch: job.head_branch === defaultBranch,
+          // The branch name alone is forgeable (a fork PR's head branch can
+          // be named after the default branch); the run's provenance must
+          // vouch too, or fork code seeds the machines trusted jobs fork from.
+          onDefaultBranch: job.head_branch === defaultBranch && trustedRun,
         })
       }
       let truncated = false
       for (const status of ["queued", "in_progress"] as const) {
-        const { ids, hitCap } = await this.runIds(status, MAX_DEMAND_RUNS)
+        const { runs, hitCap } = await this.scanRuns(status, MAX_DEMAND_RUNS)
         truncated ||= hitCap
         // Per-run job reads are same-depth: one bounded batch, not a serial
         // walk - the event tick exists to cut pickup latency, not add it.
-        for (const jobs of await mapLimit(ids, JOB_READ_CONCURRENCY, (id) => this.runJobs(id))) {
+        const jobLists = await mapLimit(runs, JOB_READ_CONCURRENCY, (run) => this.runJobs(run.id))
+        for (const [index, jobs] of jobLists.entries()) {
+          const run = runs[index]!
           for (const job of jobs) {
             if (job.status === "completed") {
-              collectFinished(job)
+              collectFinished(job, run.trusted)
               continue
             }
             if (job.status !== "queued" && job.status !== "in_progress") continue
@@ -201,9 +222,11 @@ export class GitHub {
           }
         }
       }
-      const { ids } = await this.runIds("completed", FINISHED_SCAN_RUNS)
-      for (const jobs of await mapLimit(ids, JOB_READ_CONCURRENCY, (id) => this.runJobs(id))) {
-        for (const job of jobs) collectFinished(job)
+      const { runs } = await this.scanRuns("completed", FINISHED_SCAN_RUNS, evidenceFloorMs)
+      const jobLists = await mapLimit(runs, JOB_READ_CONCURRENCY, (run) => this.runJobs(run.id))
+      for (const [index, jobs] of jobLists.entries()) {
+        const run = runs[index]!
+        for (const job of jobs) collectFinished(job, run.trusted)
       }
       return { demanded, finished, truncated }
     } catch (error) {
@@ -230,22 +253,45 @@ export class GitHub {
     return body.default_branch
   }
 
-  private async runIds(
+  /** The run listing, with the provenance the jobs API omits: the jobs
+   * endpoint has no head_repository, so whether a run's code is this
+   * repository's is only learnable here and must ride along to every job
+   * it carries. `sinceMs` stops the scan at the first run created before
+   * it - the listing is newest-first (GitHub's documented default order),
+   * so nothing after that run can matter. */
+  private async scanRuns(
     status: string,
     cap: number,
-  ): Promise<{ ids: number[]; hitCap: boolean }> {
-    const ids = new Set<number>()
-    for (let page = 1; ids.size <= cap; page++) {
+    sinceMs?: number,
+  ): Promise<{ runs: RunMeta[]; hitCap: boolean }> {
+    const runs = new Map<number, RunMeta>()
+    let floored = false
+    outer: for (let page = 1; runs.size <= cap; page++) {
       const body = (await this.call(
         this.workflow,
         `/actions/runs?status=${status}&per_page=100&page=${page}`,
-      )) as { total_count?: number; workflow_runs?: { id: number; head_branch?: string }[] }
+      )) as {
+        total_count?: number
+        workflow_runs?: {
+          id: number
+          event?: string
+          created_at?: string
+          head_repository?: { full_name?: string }
+        }[]
+      }
       const batch = body.workflow_runs ?? []
       if (batch.length === 0) break
-      for (const run of batch) ids.add(run.id)
-      if (ids.size >= (body.total_count ?? 0)) break
+      for (const run of batch) {
+        const createdAtMs = Date.parse(run.created_at ?? "")
+        if (sinceMs !== undefined && createdAtMs < sinceMs) {
+          floored = true
+          break outer
+        }
+        runs.set(run.id, { id: run.id, trusted: trustedRunProvenance(run, this.repo) })
+      }
+      if (runs.size >= (body.total_count ?? 0)) break
     }
-    return { ids: [...ids].slice(0, cap), hitCap: ids.size > cap }
+    return { runs: [...runs.values()].slice(0, cap), hitCap: !floored && runs.size > cap }
   }
 
   private async runJobs(runId: number): Promise<
@@ -277,6 +323,32 @@ export class GitHub {
     }
     return jobs
   }
+}
+
+/** One run from the runs listing, reduced to what the queue scan needs. */
+interface RunMeta {
+  readonly id: number
+  /** The run's code provably came from this repository (see below). */
+  readonly trusted: boolean
+}
+
+/** Whether a run's post-job disk state may seed the lineage every trusted
+ * job forks from.
+ *
+ * `head_branch` alone is FORGEABLE: a fork pull request whose head branch
+ * is also named "main" matches the default branch, and promoting it would
+ * bake attacker-controlled disk state into the seed every subsequent job
+ * forks from. Provenance must also say the code is this repository's: a
+ * `push` event, or any event whose head repository IS the repository
+ * (schedule and workflow_dispatch runs carry that; fork PRs carry the
+ * fork's name). Repository names compare case-insensitively, as GitHub
+ * treats them. */
+export function trustedRunProvenance(
+  run: { event?: string; head_repository?: { full_name?: string } },
+  repo: string,
+): boolean {
+  if (run.event === "push") return true
+  return run.head_repository?.full_name?.toLowerCase() === repo.toLowerCase()
 }
 
 /** GitHub documents 422 on runner-delete only as "validation failed or
