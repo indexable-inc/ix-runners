@@ -42,6 +42,10 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   // -- Failed machines serve nothing on any tick: clear them, registered
   // or not. A failed holder loses its lineage's seed; the next green
   // default-branch run re-establishes it, and until then spawns boot cold.
+  // This deliberately includes a promotion WINNER whose machine flips to
+  // failed mid-capture: its snapshot is doomed with the machine (a capture
+  // cannot outlive its source), so sweeping it is not a lost seed - it is
+  // the only honest outcome, and the next green run promotes instead.
   const failed = world.machines.filter((machine) => machine.status === "failed")
   for (const machine of failed) {
     const registrations = registrationsByName.get(machine.name) ?? []
@@ -106,7 +110,11 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
       } else {
         // Mid-promotion crash: the successor is absent or its snapshot is
         // not restorable yet. This retiring holder is the lineage's last
-        // good seed - keeping it is the recovery.
+        // good seed - keeping it is the recovery. The hold is deliberately
+        // UNBOUNDED: while the snapshot pipeline is sick a retiring holder
+        // can sit (and bill) for days, warning every tick, but deleting it
+        // on any timer would trade a storage bill for losing the lineage's
+        // only restorable seed. Intentional, not a leak.
         notes.push({
           level: "warn",
           text: `${holder.name}: keeping the retiring holder, its successor has no ready snapshot yet`,
