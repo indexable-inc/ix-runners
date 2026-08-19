@@ -10,6 +10,22 @@ import type { Config } from "./config.ts"
 import { lineageKey, parseRole, runnerName, seedName } from "./names.ts"
 import type { Labels, MachineRow, Plan, Registration, Step, World } from "./types.ts"
 
+/** Slack the seed-freshness gate allows between the two clocks it compares.
+ *
+ * A seed's `snapshotAt` is CAPTURE time - the promoting tick found the
+ * evidence up to a cron interval after the source job completed, then
+ * started the capture - while a winner's `completedAt` is JOB time.
+ * Comparing them raw makes a genuinely newer green run silently lose to an
+ * older seed whose snapshot merely landed later (job B completes after job
+ * A but before A's snapshot exists: B reads as stale). The SDK's snapshot
+ * record carries no field to round-trip the source job's completion time,
+ * so the gate is biased by this slack instead: skip only when the snapshot
+ * predates the winner's evidence by MORE than any plausible capture skew.
+ * The bias errs toward promoting - a rare redundant promote costs one
+ * snapshot and swap; a silently stale seed is served to every fork until
+ * the next green run notices nothing and keeps it stale. */
+export const MAX_CAPTURE_SKEW_MS = 20 * 60 * 1000 // cron tick (15m) + scan + capture start
+
 export function decide(config: Config, world: World, nowMs: number): Plan {
   const steps: Step[] = []
   const notes: { level: "info" | "warn"; text: string }[] = []
@@ -137,8 +153,11 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   for (const [lineage, winner] of winners) {
     const oldHolder = currentHolders.get(lineage)
     const oldSeed = oldHolder && world.seeds.get(oldHolder.id)
-    if (oldSeed?.snapshotAt !== undefined && oldSeed.snapshotAt >= winner.completedAt * 1000) {
-      continue // the seed already descends from evidence at least this new
+    if (
+      oldSeed?.snapshotAt !== undefined &&
+      oldSeed.snapshotAt - MAX_CAPTURE_SKEW_MS >= winner.completedAt * 1000
+    ) {
+      continue // the seed's evidence is newer beyond any capture skew
     }
     const holderName = seedName(config.pool, lineage, world.rev)
     steps.push({

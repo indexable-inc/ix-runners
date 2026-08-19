@@ -245,6 +245,8 @@ describe("promotion", () => {
   })
 
   test("evidence older than the current seed does not re-promote", () => {
+    // Older beyond MAX_CAPTURE_SKEW_MS: snapshotAt is capture time, so only
+    // a gap the skew cannot explain proves the leftover's evidence is stale.
     const holder = machine(HOLDER, { status: "stopped" })
     const leftover = machine(`p-run-${LINEAGE}-x1`)
     const plan = steps(
@@ -253,13 +255,38 @@ describe("promotion", () => {
         seeds: new Map([[holder.id, { holder, snapshotId: "s", snapshotAt: NOW - 1000 }]]),
         queue: {
           demanded: [],
-          finished: [finished(leftover.name, { completedAt: (NOW - 600_000) / 1000 })],
+          finished: [finished(leftover.name, { completedAt: (NOW - 2_000_000) / 1000 })],
           truncated: false,
         },
       }),
     )
     expect(only(plan, "promote")).toHaveLength(0)
     expect(only(plan, "delete").map((s) => s.machine.name)).toEqual([leftover.name])
+  })
+
+  test("a newer green run is not judged stale by an older run's later-landing snapshot", () => {
+    // The clock-domain regression: job A completes, job B completes after
+    // it, THEN A's promotion snapshot lands. snapshotAt (capture time)
+    // postdates B's completedAt (job time), but B's evidence is the newer
+    // machine state and must still promote.
+    const holder = machine(HOLDER, { status: "stopped" }) // holds A's seed
+    const winnerB = machine(`p-run-${LINEAGE}-x2`)
+    const plan = steps(
+      world({
+        machines: [holder, winnerB],
+        // A's snapshot was captured 120s ago; B's job completed 180s ago -
+        // after A's job, before A's snapshot existed.
+        seeds: new Map([[holder.id, { holder, snapshotId: "s", snapshotAt: NOW - 120_000 }]]),
+        queue: {
+          demanded: [],
+          finished: [finished(winnerB.name, { completedAt: (NOW - 180_000) / 1000 })],
+          truncated: false,
+        },
+      }),
+    )
+    const promotes = only(plan, "promote")
+    expect(promotes.map((s) => s.winner.name)).toEqual([winnerB.name])
+    expect(only(plan, "delete")).toHaveLength(0)
   })
 
   test("promoting names the old holder for the swap", () => {
