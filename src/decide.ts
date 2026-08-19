@@ -138,13 +138,28 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   const runnerByName = new Map(runners.map((machine) => [machine.name, machine]))
   const promoted = new Set<string>() // machine ids leaving the runner pool
   const winners = new Map<string, { machine: MachineRow; completedAt: number }>()
+  const notedOffBranch = new Set<string>()
   for (const job of queue.finished) {
-    if (!job.succeeded || !job.onDefaultBranch) continue
+    if (!job.succeeded) continue
     const machine = runnerByName.get(job.runnerName)
     if (machine === undefined) continue
     if ((registrationsByName.get(machine.name) ?? []).length > 0) continue // still settling
     const parsed = role(machine)
     if (parsed?.kind !== "runner") continue
+    if (!job.onDefaultBranch) {
+      // A green machine that can never seed. Said out loud, or its
+      // job-finished deletion below is indistinguishable in the log from a
+      // promotable winner's - the shape of every "why did the seed not
+      // refresh?" hunt.
+      if (!notedOffBranch.has(machine.name)) {
+        notedOffBranch.add(machine.name)
+        notes.push({
+          level: "info",
+          text: `${machine.name}: green job did not run on the default branch; not a seed candidate`,
+        })
+      }
+      continue
+    }
     const best = winners.get(parsed.lineage)
     if (best === undefined || job.completedAt > best.completedAt) {
       winners.set(parsed.lineage, { machine, completedAt: job.completedAt })
@@ -157,7 +172,17 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
       oldSeed?.snapshotAt !== undefined &&
       oldSeed.snapshotAt - MAX_CAPTURE_SKEW_MS >= winner.completedAt * 1000
     ) {
-      continue // the seed's evidence is newer beyond any capture skew
+      // The seed's evidence is newer beyond any capture skew. Never silent:
+      // the winner falls through to job-finished deletion below, and a
+      // skipped promotion must be distinguishable from plain cleanup.
+      notes.push({
+        level: "info",
+        text:
+          `${lineage}: not promoting ${winner.machine.name} - the seed's snapshot` +
+          ` (${new Date(oldSeed.snapshotAt).toISOString()}) already postdates its evidence` +
+          ` (job completed ${new Date(winner.completedAt * 1000).toISOString()})`,
+      })
+      continue
     }
     const holderName = seedName(config.pool, lineage, world.rev)
     steps.push({

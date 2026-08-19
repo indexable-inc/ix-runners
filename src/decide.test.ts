@@ -214,7 +214,8 @@ describe("promotion", () => {
   test("PR jobs and failures never promote", () => {
     const pr = machine(`p-run-${LINEAGE}-x1`)
     const red = machine(`p-run-${LINEAGE}-x2`)
-    const plan = steps(
+    const plan = decide(
+      config,
       world({
         machines: [pr, red],
         queue: {
@@ -226,9 +227,14 @@ describe("promotion", () => {
           truncated: false,
         },
       }),
+      NOW,
     )
-    expect(only(plan, "promote")).toHaveLength(0)
-    expect(only(plan, "delete")).toHaveLength(2) // both are just finished runners
+    expect(only([...plan.steps], "promote")).toHaveLength(0)
+    expect(only([...plan.steps], "delete")).toHaveLength(2) // both are just finished runners
+    // A green-but-off-branch machine says why it is not a seed candidate.
+    expect(
+      plan.notes.filter((n) => n.text.includes(`${pr.name}: green job did not run`)),
+    ).toHaveLength(1)
   })
 
   test("a still-registered winner waits for its runner to settle", () => {
@@ -249,7 +255,8 @@ describe("promotion", () => {
     // a gap the skew cannot explain proves the leftover's evidence is stale.
     const holder = machine(HOLDER, { status: "stopped" })
     const leftover = machine(`p-run-${LINEAGE}-x1`)
-    const plan = steps(
+    const plan = decide(
+      config,
       world({
         machines: [holder, leftover],
         seeds: new Map([[holder.id, { holder, snapshotId: "s", snapshotAt: NOW - 1000 }]]),
@@ -259,9 +266,12 @@ describe("promotion", () => {
           truncated: false,
         },
       }),
+      NOW,
     )
-    expect(only(plan, "promote")).toHaveLength(0)
-    expect(only(plan, "delete").map((s) => s.machine.name)).toEqual([leftover.name])
+    expect(only([...plan.steps], "promote")).toHaveLength(0)
+    expect(only([...plan.steps], "delete").map((s) => s.machine.name)).toEqual([leftover.name])
+    // The skip is never silent: it must be distinguishable from cleanup.
+    expect(plan.notes.some((n) => n.text.includes(`not promoting ${leftover.name}`))).toBe(true)
   })
 
   test("a newer green run is not judged stale by an older run's later-landing snapshot", () => {
