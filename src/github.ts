@@ -162,6 +162,24 @@ export class GitHub {
   async observeQueue(markerLabel: string, defaultBranch: string): Promise<QueueObservation | null> {
     try {
       const demanded: DemandedJob[] = []
+      const finished: FinishedJob[] = []
+      // Shared by both loops: a completed job is promotion/deletion evidence
+      // wherever it is seen. Jobs of still-active runs MUST feed this too: a
+      // long multi-job run finishes (and deregisters) its early jobs many
+      // minutes before the run itself completes, and a runner machine whose
+      // evidence is invisible until run-completion would be reaped as
+      // job-finished before it could ever be promoted into a seed.
+      const collectFinished = (job: Awaited<ReturnType<typeof this.runJobs>>[number]) => {
+        const completedAt = Date.parse(job.completed_at ?? "")
+        if (!job.runner_name || Number.isNaN(completedAt)) return
+        finished.push({
+          runnerName: job.runner_name,
+          labels: canonicalLabels(job.labels ?? []),
+          completedAt: completedAt / 1000,
+          succeeded: job.conclusion === "success",
+          onDefaultBranch: job.head_branch === defaultBranch,
+        })
+      }
       let truncated = false
       for (const status of ["queued", "in_progress"] as const) {
         const { ids, hitCap } = await this.runIds(status, MAX_DEMAND_RUNS)
@@ -170,26 +188,19 @@ export class GitHub {
         // walk - the event tick exists to cut pickup latency, not add it.
         for (const jobs of await mapLimit(ids, JOB_READ_CONCURRENCY, (id) => this.runJobs(id))) {
           for (const job of jobs) {
+            if (job.status === "completed") {
+              collectFinished(job)
+              continue
+            }
             if (job.status !== "queued" && job.status !== "in_progress") continue
             const labels = canonicalLabels(job.labels ?? [])
             if (labels.includes(markerLabel)) demanded.push({ labels })
           }
         }
       }
-      const finished: FinishedJob[] = []
       const { ids } = await this.runIds("completed", FINISHED_SCAN_RUNS)
       for (const jobs of await mapLimit(ids, JOB_READ_CONCURRENCY, (id) => this.runJobs(id))) {
-        for (const job of jobs) {
-          const completedAt = Date.parse(job.completed_at ?? "")
-          if (!job.runner_name || Number.isNaN(completedAt)) continue
-          finished.push({
-            runnerName: job.runner_name,
-            labels: canonicalLabels(job.labels ?? []),
-            completedAt: completedAt / 1000,
-            succeeded: job.conclusion === "success",
-            onDefaultBranch: job.head_branch === defaultBranch,
-          })
-        }
+        for (const job of jobs) collectFinished(job)
       }
       return { demanded, finished, truncated }
     } catch (error) {

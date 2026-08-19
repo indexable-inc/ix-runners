@@ -154,13 +154,31 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   // (JIT runners deregister themselves after their one job) - unless it
   // was just spawned and its registration has not appeared yet, which is
   // what the warm grace absorbs.
+  //
+  // "Done" requires EVIDENCE, not inference: deregistration is visible
+  // seconds after a job ends, while the finished-job observation can lag
+  // it. A machine deleted on deregistration alone destroys the disk state
+  // promotion exists to capture - the seed race that ate every green
+  // canary machine of a long multi-job run. So a job-finished delete
+  // demands the machine's completed job in this tick's queue observation
+  // (the same evidence promotion reads); a machine whose evidence never
+  // arrives (cancelled run, evicted scan window) falls to the idle-grace
+  // backstop below instead.
+  const finishedEvidence = new Set(queue.finished.map((job) => job.runnerName))
   const deleted = new Set<string>()
   for (const machine of runners) {
     if (promoted.has(machine.id)) continue
     if ((registrationsByName.get(machine.name) ?? []).length > 0) continue
     if (nowMs - machine.createdAt < config.warmGraceSeconds * 1000) continue
-    steps.push({ do: "delete", machine, why: "job finished" })
-    deleted.add(machine.id)
+    if (finishedEvidence.has(machine.name)) {
+      steps.push({ do: "delete", machine, why: "job finished" })
+      deleted.add(machine.id)
+    } else if (nowMs - machine.createdAt >= config.idleGraceSeconds * 1000) {
+      steps.push({ do: "delete", machine, why: "no registration past idle grace" })
+      deleted.add(machine.id)
+    }
+    // else: deregistered but unevidenced and young - hold for the evidence
+    // (or the backstop) on a later tick.
   }
 
   // -- Dark runners: registered (the registration is minted alongside the
