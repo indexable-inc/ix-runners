@@ -8,7 +8,7 @@
     "check": "bunx tsc --noEmit"
   },
   "dependencies": {
-    "@indexable/sdk": "0.7.1"
+    "@indexable/sdk": "0.7.2"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

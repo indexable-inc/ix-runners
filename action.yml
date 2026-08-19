@@ -29,9 +29,9 @@ inputs:
       "pat" (the default) uses the admin PAT in `runner-pat`.
 
       "ix" trades this run's OIDC identity for a short-lived installation
-      token scoped to THIS repository. Not available yet from this action's
-      TypeScript SDK; the input exists so workflows can be written against
-      the destination while it ships.
+      token scoped to THIS repository: no standing admin secret anywhere.
+      Needs the ix-runners GitHub App installed on the repo and
+      `permissions: id-token: write` on the reconcile job.
     default: pat
 
   runner-pat:

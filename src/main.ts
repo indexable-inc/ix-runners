@@ -33,7 +33,6 @@ if (!process.env.IX_TOKEN) {
   logError("IX_TOKEN is required: the action's ix-token input")
   process.exit(1)
 }
-const admin = adminCredential()
 const workflow = process.env.GITHUB_TOKEN
 if (!workflow) {
   logError("GITHUB_TOKEN is required: the workflow's own token, for reading the job queue")
@@ -41,8 +40,8 @@ if (!workflow) {
 }
 
 const config = await loadConfig()
-const gh = new GitHub(admin, workflow, config.repo)
 const ix = new Client()
+const gh = new GitHub(await adminCredential(ix), workflow, config.repo)
 
 const world = await observe(ix, gh, config)
 

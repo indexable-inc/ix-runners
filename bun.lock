@@ -5,7 +5,7 @@
     "": {
       "name": "ix-runners",
       "dependencies": {
-        "@indexable/sdk": "0.7.1",
+        "@indexable/sdk": "0.7.2",
       },
       "devDependencies": {
         "@types/bun": "^1.2.0",
@@ -14,11 +14,11 @@
     },
   },
   "packages": {
-    "@indexable/sdk": ["@indexable/sdk@0.7.1", "", { "optionalDependencies": { "@indexable/sdk-node-darwin-arm64": "0.7.1", "@indexable/sdk-node-linux-x64": "0.7.1" }, "peerDependencies": { "zod": "^4" }, "optionalPeers": ["zod"] }, "sha512-Vn75AdEG3jX6Mb/MLE2HsUPWzB0nNGAEqxwCrUiBipVPcUeqGJf9nyroeFYQr11IbsRSZdcb/Nii62zQH35h+w=="],
+    "@indexable/sdk": ["@indexable/sdk@0.7.2", "", { "optionalDependencies": { "@indexable/sdk-node-darwin-arm64": "0.7.2", "@indexable/sdk-node-linux-x64": "0.7.2" }, "peerDependencies": { "zod": "^4" }, "optionalPeers": ["zod"] }, "sha512-IkE8uRf0GTaOoEioMXdudmPjUkPDjY2mu1PF8SoWHL4dcD788rWqSngFfrCXqd7dwAYz9m4DkakkQyupEwFG7A=="],
 
-    "@indexable/sdk-node-darwin-arm64": ["@indexable/sdk-node-darwin-arm64@0.7.1", "", { "os": "darwin", "cpu": "arm64" }, "sha512-g9yVIvY8wKsyTVQOdayktMBlnJ/MKHSus9HYSI8oCf5I2/05hID7/Z/rfUshhofcAHx6o3lqT7bW+6t2oLjV6w=="],
+    "@indexable/sdk-node-darwin-arm64": ["@indexable/sdk-node-darwin-arm64@0.7.2", "", { "os": "darwin", "cpu": "arm64" }, "sha512-Hl3AQXUMkYlpqBDdAQNNcfgvumwMfHWk8tQDbg0mXA0gQ9eH5M21Yx8oBOxwfznNiKJ4mymh8EMrrbsipeQkiQ=="],
 
-    "@indexable/sdk-node-linux-x64": ["@indexable/sdk-node-linux-x64@0.7.1", "", { "os": "linux", "cpu": "x64" }, "sha512-0w5aJjlpHSKdqYqdgrwbfVIDxlfkq0xYiuXkY6dk4VVlSUdMdhyn7UNtYS8mkWNWrxtExFzghiMnb6xPEubj6A=="],
+    "@indexable/sdk-node-linux-x64": ["@indexable/sdk-node-linux-x64@0.7.2", "", { "os": "linux", "cpu": "x64" }, "sha512-A3XUTc20tNeHu3/paoxr2cjsGeiaoTcI1hjXew2HHAKmxZAdWVYX5WG+jvsmqemia5zTPJ1WwrKcpHpZoAE+3Q=="],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

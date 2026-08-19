@@ -137,6 +137,18 @@ jobs:
 
 ## How it works
 
+Warmth is copy-on-write. A lineage's *seed* is an immutable ix snapshot
+(disk and memory) of the machine that ran its last green default-branch
+job. Every runner is a fork of that snapshot: it boots in about a second
+with everything the green run left behind - the nix store, `$HOME`
+caches, compiled artifacts - already on disk, and its writes land in its
+own private copy-on-write layer. Nothing a job writes can reach the seed
+or any sibling fork; a fork's writes die with the fork. The seed only
+ever advances by *promotion*: a fresh snapshot of a machine that just
+ran a green default-branch job. That is the whole trick - `ubuntu-latest`
+spends minutes re-downloading what your last run already built, a fork
+starts where the last green run stopped.
+
 Each tick is level-based and stateless: it observes the machines, the
 runner registrations and the job queue fresh, decides from that snapshot
 alone, and converges. Every machine's role rides its NAME
@@ -202,15 +214,19 @@ where it is not:
 - No sudo: the job user cannot elevate. Install into `$HOME` or ship the
   package in your nix policy instead.
 - `$HOME` (/home/runner) is the warmth: whatever a green default-branch
-  run leaves there is what the next fork of that lineage boots with.
+  run leaves there is what the next fork of that lineage boots with
+  (copy-on-write, so ten concurrent forks share the seed's bytes and
+  none can dirty another).
 - Preinstalled tooling comes from your nix policy, not from a hosted
   image: anything a job expects "to just be there" (Go, docker, protoc)
   must be listed there.
+- `token-source: ix` deletes the PAT entirely: the reconcile trades its
+  OIDC identity (`permissions: id-token: write`) for a repo-scoped App
+  installation token minted by ix. The repository comes from the OIDC
+  token's signed claims, so the credential cannot be minted for a repo
+  the run has not proved it is running for.
 
 ## Roadmap
 
-- `token-source: ix`: the reconcile trades its OIDC identity for a
-  repo-scoped App installation token and `RUNNER_PAT` deletes. Blocked on
-  `@indexable/sdk` shipping the `ci()` vending namespace.
 - An ix-hosted control plane (GitHub App webhooks instead of a workflow in
   your repo): the workflow file deletes, the policy file stays.

@@ -113,14 +113,14 @@ ticks, derived from GitHub's own job timestamps, never counted.
   repo. Vending is an in-protocol RPC in the SDK core, not a REST
   endpoint (verified by string-dumping the Python ix_sdk 0.7.2 native
   module: the op sits in the RPC method table, and the binary carries no
-  REST path at all), and the published TypeScript SDK (0.7.1, the version
-  this package pins) does not carry the op yet - so `token-source: ix`
-  refuses with a message naming that blocker, and the PAT path is the
-  working era until `@indexable/sdk` ships `ci()`.
-- **Host pinning and redirect refusal** on every credentialed request, the
-  strict servable/label matching rule, complete-or-refuse pagination of
-  the runner listing, `::add-mask::` before any credential can print, and
-  control-character stripping on every remote string.
+  REST path at all); `@indexable/sdk` 0.7.2 ships it as
+  `client.ci().githubRunnerToken(oidcJwt)`, and vend.ts fetches the JWT
+  with the same host-pinned, redirect-refusing posture github.ts uses.
+- **Host pinning and redirect refusal** on every credentialed request,
+  complete-or-refuse pagination of the runner listing, `::add-mask::`
+  before any credential can print, and control-character stripping on
+  every remote string. (v1's servable/label matching dissolved: labels now
+  ride each JIT credential, so a runner *cannot* serve the wrong lineage.)
 - **Budgeted convergence**: creations per tick are capped and spent at
   admission, so a bad template rev stalls loudly instead of thrashing.
 
