@@ -9,7 +9,7 @@ import { decide } from "./decide.ts"
 import { execute } from "./execute.ts"
 import { GitHub } from "./github.ts"
 import { observe } from "./observe.ts"
-import { logError, logWarning, writeSummary } from "./report.ts"
+import { clean, logError, logWarning, writeSummary } from "./report.ts"
 import { adminCredential } from "./vend.ts"
 
 /** Hosted runners only. This process holds IX_TOKEN and a repo-admin
@@ -43,7 +43,13 @@ const config = await loadConfig()
 const ix = new Client()
 const gh = new GitHub(await adminCredential(ix), workflow, config.repo)
 
-const world = await observe(ix, gh, config)
+// Observation can fail wholesale (a rate-limited GitHub read, an ix
+// listing outage): that is a lost tick, not a crash - it becomes an error
+// annotation and a clean exit 1, never an unhandled rejection.
+const world = await observe(ix, gh, config).catch((error) => {
+  logError(`observation failed (${clean(error)}); converging nothing this tick`)
+  process.exit(1)
+})
 
 // The rev this tick derived came from the checkout, and only the default
 // branch may steer the fleet: a workflow_dispatch from a feature branch
