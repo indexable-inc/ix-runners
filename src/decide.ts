@@ -267,14 +267,21 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
     } else if (nowMs - machine.createdAt >= config.idleGraceSeconds * 1000) {
       // Evidence loss must never be silent: if this machine's job was green
       // on the default branch, deleting it here is the seed candidacy being
-      // destroyed - say so, loudly, so an evicted scan window is findable.
-      notes.push({
-        level: "warn",
-        text:
-          `${machine.name}: deleting past the idle grace with NO finished-job` +
-          " evidence in the scan window. If its job was green on the default" +
-          " branch, its seed candidacy is lost with it.",
-      })
+      // destroyed - say so, so an evicted scan window is findable. Only when
+      // the scan was complete, though: a truncated scan makes absence
+      // expected, and the benign residents of this branch (a retiree whose
+      // delete failed last tick, a spawn that never registered) would drown
+      // the real signal in cried wolves.
+      if (!queue.truncated) {
+        notes.push({
+          level: "warn",
+          text:
+            `${machine.name}: deleting past the idle grace with NO finished-job` +
+            " evidence in the scan window. If its job was green on the default" +
+            " branch, its seed candidacy is lost with it; a retiree whose delete" +
+            " failed or a spawn that never registered lands here benignly.",
+        })
+      }
       steps.push({ do: "delete", machine, why: "no registration past idle grace" })
       deleted.add(machine.id)
     }

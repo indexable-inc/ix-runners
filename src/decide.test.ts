@@ -419,6 +419,20 @@ describe("cleanup", () => {
     ).toBe(true)
   })
 
+  test("the evidence-loss warning stays quiet when the scan was truncated", () => {
+    // A truncated scan makes evidence absence expected; the delete still
+    // happens (the machine is past every grace), but crying wolf on every
+    // busy-repo tick would drown the real eviction signal.
+    const abandoned = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 901_000 })
+    const plan = decide(
+      config,
+      world({ machines: [abandoned], queue: { demanded: [], finished: [], truncated: true } }),
+      NOW,
+    )
+    expect(only([...plan.steps], "delete").map((s) => s.machine.name)).toEqual([abandoned.name])
+    expect(plan.notes.some((n) => n.level === "warn" && n.text.includes("deleting"))).toBe(false)
+  })
+
   test("a held runner promotes when its green default-branch evidence lands late", () => {
     const winner = machine(`p-run-${LINEAGE}-x1`, { createdAt: NOW - 400_000 })
     const plan = steps(
