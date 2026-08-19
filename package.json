@@ -1,0 +1,17 @@
+{
+  "name": "ix-runners",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "reconcile": "bun run src/main.ts",
+    "test": "bun test",
+    "check": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@indexable/sdk": "0.7.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,48 +1,84 @@
 # ix-runners
 
-Self-hosted GitHub Actions runner pools on [ix](https://ix.dev) VMs.
+Ephemeral fork-per-job GitHub Actions runners on [ix](https://ix.dev) VMs.
 
-[ix CI](https://ix.dev/blog/ci).
+Every runner is a machine that exists for exactly one job. When a job on
+your default branch goes green, the machine that ran it is snapshotted and
+becomes the **seed** for its label set: every later job with those labels
+boots a fork of it in seconds - toolchains, `target/`, `node_modules`,
+every cache already warm - runs, and is deleted. Warm caches without shared
+machines: a PR job's writes die with its fork and can never reach another
+job or the seed.
 
-This repository is the mechanism for a nix github action runner, maintained by ix. 
+Why it looks this way: [docs/design.md](./docs/design.md).
 
-Runners are persistent, not ephemeral
+## The machine lifecycle, in one picture
+
+```mermaid
+flowchart LR
+    Q[job queued<br/>runs-on: self-hosted, ix] -->|reconcile tick| S{seed for this<br/>label set?}
+    S -->|yes| F[fork the seed<br/>boots in seconds, caches warm]
+    S -->|no, first time| C[cold boot from<br/>your flake's ci-runner]
+    F --> R[machine runs its ONE job<br/>on a single-job JIT credential]
+    C --> R
+    R -->|green, on the default branch| P[snapshot the machine:<br/>it becomes the new seed]
+    R -->|anything else<br/>PR, red, cancelled| D[machine deleted<br/>its writes die with it]
+    P --> D2[old seed deleted]
+    P -.->|next job of this label set forks it| F
+```
+
+Two things fall out of the shape. Warmth is a property of the **label
+set**, not of any machine - so there is no idle pool, no cold-start tax
+after the first green run, and nothing to repair. And isolation is the
+machine boundary - a PR job runs on a fork that is deleted afterward, so
+nothing it writes can ever reach another job or the seed.
 
 ## Setup
 
-1. Add two Actions secrets to your repo: `IX_TOKEN` (the ix account the VMs
-   bill to) and `RUNNER_PAT` (fine-grained PAT, Administration read/write on
-   the repo).
+1. Add two Actions secrets: `IX_TOKEN` (the ix account the VMs bill to) and
+   `RUNNER_PAT` (fine-grained PAT, Administration read/write on the repo).
 
    The built-in `GITHUB_TOKEN` cannot stand in for the PAT: workflow
-   permissions have no `administration` scope, so it structurally cannot mint
-   runner registration tokens.
+   permissions have no `administration` scope, so it structurally cannot
+   mint runner credentials.
 
-2. Wire the pool into your `flake.nix`:
+2. Wire the runner template into your `flake.nix`:
 
    ```nix
    inputs.nixpkgs-ci.url = "github:NixOS/nixpkgs/nixos-unstable";
    inputs.ix-runners.url = "github:indexable-inc/ix-runners/<rev>";
 
    # in outputs:
-   nixosConfigurations = ix-runners.lib.mkPool {
-     nixpkgs = nixpkgs-ci;
-     configRev = self.rev or null;
-     modules = [ ./nix/ci-runner.nix ];
+   nixosConfigurations.ci-runner = ix-runners.lib.mkRunner {
+     nixpkgs = nixpkgs-ci;                # keep it fresh: GitHub deprecates
+     modules = [ ./nix/ci-runner.nix ];   # old runner versions aggressively
    };
    ```
 
-3. Write your policy in `nix/ci-runner.nix`: `services.ix-runner` with your
-   repo URL, a pool name, and the packages your jobs expect on PATH.
+3. Write your policy in `nix/ci-runner.nix`: the packages your jobs expect
+   on PATH and any job environment.
 
-   `services.ix-runner.poolName` MUST equal the action's `pool-name` input
-   (which defaults to your repository's name). 
-   The module derives runner daemon names from it and the reconcile matches on those names, so if they
-   disagree every member reads offline, gets repaired once, and is then replaced. 
+   ```nix
+   { pkgs, ... }:
+   {
+     services.ix-runner.extraPackages = [ pkgs.docker pkgs.protobuf ];
+   }
+   ```
 
-4. Add the workflow below and merge.
+4. Optionally add `.github/ix-runners.toml`. Every key has a working
+   default; the file exists for the dials:
 
-[`action.yml`](./action.yml).
+   ```toml
+   region = "us-west-1"
+   max-runners = 16        # global cap on concurrently existing machines
+   headroom = 1            # idle standbys beyond queued demand, per lineage
+   min-warm = 0            # standbys per known lineage even with no demand
+   idle-grace-seconds = 900
+   ```
+
+5. Add the workflow below, merge, and put `runs-on: [self-hosted, ix]` in
+   the workflows you want on the fleet. The `ix` marker label is what opts
+   a job in; every distinct label set you use becomes its own seed lineage.
 
 ### The workflow
 
@@ -51,24 +87,26 @@ name: ix runners
 
 on:
   schedule:
-    # Best effort: GitHub drops scheduled runs under load, and disables the
-    # schedule entirely after 60 days with no commit to the repo.
-    - cron: "*/30 * * * *"
+    # The steady tick: promotion, retirement, cleanup. Best effort - GitHub
+    # drops scheduled runs under load, and a missed tick costs latency,
+    # never correctness.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
-  push:
-    branches: [main]
-    # The reconcile's desired state is the last commit touching these paths,
-    # so these are the only pushes that can change anything.
-    paths:
-      - nix/**
-      - flake.nix
-      - flake.lock
+  workflow_run:
+    # The fast path: fires when any run is requested, so capacity is being
+    # created while the wave's jobs are still queueing. "**" includes this
+    # workflow itself (workflow_run cannot exclude by name); the follow-up
+    # it requests coalesces into the concurrency group below and GitHub
+    # caps the chain, so the noise is one extra no-op tick, not a loop.
+    workflows: ["**"]
+    types: [requested]
 
 permissions:
   contents: read
+  actions: read
 
-# One reconcile at a time, and never cancel one mid-create: a cancelled run
-# can leave a VM created but not yet registered.
+# One reconcile at a time, never cancelled mid-create: a cancelled run can
+# leave a machine created but not yet registered.
 concurrency:
   group: ix-runners
   cancel-in-progress: false
@@ -79,15 +117,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Pinned by commit, not by tag: this job holds IX_TOKEN and a
-      # repo-admin PAT, and checkout runs before the reconcile does - it can
-      # rewrite the environment the reconcile then reads, through $GITHUB_ENV.
+      # repo-admin PAT, and checkout runs before the reconcile does - it
+      # can rewrite the environment the reconcile then reads, through
+      # $GITHUB_ENV.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The desired rev is the last commit touching the runner config, so
-          # the whole history has to be here. Under a shallow checkout the
-          # grafted boundary commit diffs against the empty tree, every commit
-          # looks like a config change, and the fleet rolls on every push. The
-          # reconcile detects this and refuses to run rather than roll.
+          # The runner-config rev is the last commit touching nix/ (or your
+          # flake-dir), so the history has to be here. Under a shallow
+          # checkout every commit looks like a config change and the fleet
+          # would roll on every push; the reconcile detects this and refuses.
           fetch-depth: 0
           persist-credentials: false
 
@@ -95,103 +133,84 @@ jobs:
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
           runner-pat: ${{ secrets.RUNNER_PAT }}
-          pool-size: "8"
 ```
-
-Then swap `runs-on:` to `[self-hosted, ix]` in your other workflows at your leisure.
 
 ## How it works
 
-A scheduled reconcile - on GitHub-hosted runners, never on the pool it
-manages - converges reality to your git history: the last commit touching
-the runner config is the desired state, every VM image bakes the rev it was
-built from, and any member that drifts is replaced. Creation goes through
-the ix SDK; templates compile server-side on first boot and cache by rev.
+Each tick is level-based and stateless: it observes the machines, the
+runner registrations and the job queue fresh, decides from that snapshot
+alone, and converges. Every machine's role rides its NAME
+(`<pool>-run-<lineage>-<nonce>`, `<pool>-seed-<lineage>-<rev>`), so there
+is no state store to disagree with reality.
 
-- Missing member: created, with a fresh 1-hour registration token attached
-  as a root-only file at first boot. No post-boot seeding step exists.
-- Still booting: skipped. A first boot of a new rev compiles the template
-  in-guest, and a machine that young has nothing to say about its health.
-- Stale rev: replaced. Every runner slot's `busy` flag is checked on a
-  freshly-read listing first, and all of the member's registrations are
-  deleted before the VM is - GitHub refuses (422) to delete a runner that is
-  mid-job. That closes the wide window, not all of it: a job assigned in the
-  seconds between the listing and the delete is still lost, and costs that
-  job one retry. A member that is busy at every single scan defers its own
-  replacement indefinitely; past 30 days the run says so and asks you to
-  drain it by hand, rather than killing a job to make a point.
-- Offline: restarted once, replaced if still offline next run.
-- Above `pool-size`: deregistered and deleted. Shrinking the pool would
-  otherwise leave orphans billing and taking jobs.
-- Empty pool: the per-run replacement cap self-raises to `pool-size`, so a
-  first bootstrap builds every member in one run. If that run only partly
-  succeeds the pool is no longer empty, the cap drops back to
-  `max-replacements`, and the rest trickle in over the following runs.
-- Creations and replacements execute concurrently (bounded, one registration
-  token per run): a full-pool roll takes minutes, not one boot at a time.
+- Demanded job: a machine is spawned for it (plus `headroom`) - forked
+  from its lineage's seed, or booted cold from your flake when the lineage
+  has none yet. Each machine gets its own single-job JIT credential,
+  minted for it by name and written to it alone.
+- Green default-branch job: the machine that ran it is snapshotted and
+  swapped in as its lineage's seed before being stopped. Only
+  default-branch successes promote - PR state never enters a seed.
+- Finished runner (its one-job registration is gone): deleted.
+- Config change under `nix/`/`flake.nix`/`flake.lock` (or your
+  `flake-dir`): every seed of the old rev reads as absent and is deleted;
+  each lineage re-seeds from its next green run on the new template.
+- Idle standby past `idle-grace-seconds`: deregistered and deleted -
+  GitHub refuses (422) to deregister a runner that is mid-job, and that
+  refusal is the one lock in the system.
+- A tick that could not read the queue makes no scale-down decision at
+  all, and an event tick only ever adds capacity.
 
-Failures are per member. One member's failure is logged as an Actions error,
-spends its budget, and the run continues; the job summary carries a table of
-what happened to each member.
+Failures are per step: one machine's failure is logged as an Actions
+error and the run continues; the job summary carries a table of what
+happened.
 
 ## Security model
 
-- `IX_TOKEN` and `RUNNER_PAT` live in GitHub Actions secrets and never
-  reach a runner VM. The reconcile refuses to start unless
-  `RUNNER_ENVIRONMENT` says it is on a GitHub-hosted runner: it is the
-  control plane for the pool, so running it on the pool would hand both
-  secrets to the machines they exist to control. On GHES or ARC, set
-  `IX_RUNNERS_ALLOW_NON_HOSTED=1` to accept that explicitly - which also
-  lets `GITHUB_API_URL` name your own https API base. Everywhere else the
-  API base is pinned to `api.github.com`, because `GITHUB_API_URL` is an
-  environment variable any earlier step in the job can rewrite.
-- No PAT-bearing request follows a redirect. urllib re-sends the
-  Authorization header across a 30x, so one redirect would be enough.
-- The only credential a VM ever holds is a registration token. For its
-  one-hour life that token can register a runner against your repo and steal
-  its jobs - it is short-lived, not harmless. It is masked in Actions logs
-  and deleted from the ix secret store at the end of the run that minted it.
-- A `RUNNER_PAT` that has expired or been revoked presents as HTTP 401; the
-  reconcile stops and says exactly that, so rotate the secret rather than
-  hunting a status code.
-- Machines are disposable by design and rev-anchored: a hand-edited or
-  wedged VM converges away on the next reconcile.
-- A pool VM is the least trusted party in the reconcile. It is asked one
-  question (which rev it was built from) and its answer is bounded and
-  read as a string; a member that floods, hangs, or fails in any way is
-  decided as unreachable and replaced, and can never end the run or stall
-  the other members' convergence.
-- The runners are persistent and shared across jobs: any job that runs on
-  the pool owns the machine and its warm state (caches, toolchains) until the
-  reconcile replaces it. Point only trusted events at the pool's labels -
-  never `pull_request` from forks on a public repo, and gate
-  `workflow_dispatch`-driven runs the same way.
-- Persistent-not-ephemeral is deliberate: warm toolchains and compile caches
-  are the product. If you want per-job isolation (ARC-style ephemeral
-  runners), this is not that tool.
+- `IX_TOKEN` and `RUNNER_PAT` live in Actions secrets and never reach a
+  runner VM. The reconcile refuses to start unless `RUNNER_ENVIRONMENT`
+  says it is on a GitHub-hosted runner: it is the control plane, so
+  running it on the fleet would hand both secrets to the machines they
+  exist to control. On GHES or ARC, set `IX_RUNNERS_ALLOW_NON_HOSTED=1`
+  to accept that explicitly - which also lets `GITHUB_API_URL` name your
+  own https API base. Everywhere else the API base is pinned to
+  `api.github.com`, because `GITHUB_API_URL` is an environment variable
+  any earlier step in the job can rewrite.
+- No credentialed request follows a redirect: a 30x would re-aim the
+  Authorization header at whatever host `Location` names.
+- The only credential a runner VM ever holds is its own single-job JIT
+  config, which can take exactly one job as exactly the runner it names,
+  and is consumed (moved out of the watched path) before the job starts -
+  so a spent credential can never ride into a seed snapshot. It is masked
+  in Actions logs the moment it is minted.
+- An expired or revoked `RUNNER_PAT` presents as HTTP 401; the reconcile
+  stops and says exactly that.
+- Jobs run with the machine as the isolation boundary: no co-tenants, no
+  shared caches, nothing to escape into. A PR job can poison at most its
+  own fork, which is deleted. Still: seeds descend only from default-branch
+  runs, so gate who can push there as you already do.
 - Everything that runs your CI is in this repository, readable.
 
 ## What differs from ubuntu-latest
 
-The runner VM is NixOS, tuned for parity where it is cheap and honest where
-it is not:
+The runner VM is NixOS, tuned for parity where it is cheap and honest
+where it is not:
 
 - Foreign dynamically linked binaries (rustup/mise toolchains, prebuilt
-  node, playwright browsers) run via nix-ld + envfs with a generous library
-  set; a missing library fails at load time - file an issue, additions are
-  one line.
-- No sudo: the job user cannot elevate (`NoNewPrivileges`). Install into
-  `$HOME` or ship the package in the pool's nix policy instead.
-- `$HOME` is per-slot and persists across jobs and reboots; the checkout
-  directory is wiped on every runner restart.
-- Preinstalled tooling comes from the pool's nix policy, not from a hosted
+  node, playwright browsers) run via nix-ld + envfs with a generous
+  library set; a missing library fails at load time - file an issue,
+  additions are one line.
+- No sudo: the job user cannot elevate. Install into `$HOME` or ship the
+  package in your nix policy instead.
+- `$HOME` (/home/runner) is the warmth: whatever a green default-branch
+  run leaves there is what the next fork of that lineage boots with.
+- Preinstalled tooling comes from your nix policy, not from a hosted
   image: anything a job expects "to just be there" (Go, docker, protoc)
   must be listed there.
 
 ## Roadmap
 
-- An official ix GitHub App with token vending through the ix API replaces
-  `RUNNER_PAT`; setup becomes install-app plus one secret (#5).
-- v2 is an ix-hosted control plane: webhook-driven ephemeral runners booted
-  from warm snapshots. The workflow file in consumer repos deletes; the
-  policy file stays.
+- `token-source: ix`: the reconcile trades its OIDC identity for a
+  repo-scoped App installation token and `RUNNER_PAT` deletes. Blocked on
+  `@indexable/sdk` shipping the `ci()` vending namespace.
+- An ix-hosted control plane (GitHub App webhooks instead of a workflow in
+  your repo): the workflow file deletes, the policy file stays.
