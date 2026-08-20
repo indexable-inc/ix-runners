@@ -241,8 +241,10 @@ describe("promotion", () => {
     const promotes = only(plan, "promote")
     expect(promotes).toHaveLength(1)
     expect(promotes[0]!.winner.name).toBe(newer.name)
-    // The holder name carries the winner's source-job completion time.
+    // The holder name carries the winner's source-job completion time,
+    // and the step carries it raw: the executor's capture-adoption floor.
     expect(promotes[0]!.holderName).toBe(seedName("p", LINEAGE, REV, NOW / 1000 - 60))
+    expect(promotes[0]!.completedAtSec).toBe(NOW / 1000 - 60)
     // the loser is a finished runner, deleted
     expect(only(plan, "delete").map((s) => s.machine.name)).toEqual([older.name])
   })

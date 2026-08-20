@@ -235,6 +235,7 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
     steps.push({
       do: "promote",
       winner: winner.machine,
+      completedAtSec: winner.completedAt,
       holderName,
       oldHolder: oldHolder ?? failedHolderByName.get(holderName),
     })

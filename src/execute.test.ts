@@ -104,10 +104,22 @@ function fakeIx(options: {
   return { ix, gh, calls }
 }
 
-const promotePlan: Plan = {
-  steps: [{ do: "promote", winner: WINNER, holderName: HOLDER_NAME, oldHolder: undefined }],
+/** The winner's green job completed ten minutes ago: snapshots the tests
+ * date within the last few minutes sit safely past the adoption floor. */
+const COMPLETED_AT_SEC = Math.floor(Date.now() / 1000) - 600
+const promotePlanWith = (completedAtSec: number): Plan => ({
+  steps: [
+    {
+      do: "promote",
+      winner: WINNER,
+      completedAtSec,
+      holderName: HOLDER_NAME,
+      oldHolder: undefined,
+    },
+  ],
   notes: [],
-}
+})
+const promotePlan = promotePlanWith(COMPLETED_AT_SEC)
 
 describe("promote adopts prior captures", () => {
   test("a still-capturing snapshot from a previous attempt is waited on, not re-minted", async () => {
@@ -133,8 +145,9 @@ describe("promote adopts prior captures", () => {
   })
 
   test("failed and gone snapshots are never reused; a fresh one is minted", async () => {
+    // Dated past the adoption floor, so the STATUS filter is what rejects it.
     const { ix, gh, calls } = fakeIx({
-      snapshots: [{ id: "dead", status: "failed", createdAt: 9 }],
+      snapshots: [{ id: "dead", status: "failed", createdAt: Date.now() - 60_000 }],
     })
     await execute(ix, gh, promotePlan)
     expect(calls).toContain("snapshot:w1")
@@ -143,12 +156,49 @@ describe("promote adopts prior captures", () => {
 
   test("a STUCK capturing snapshot (older than wait + a tick) is not re-adopted", async () => {
     // One wedged capturing row must not be waited on every tick forever.
+    // The job's floor sits two hours back, so the AGE cap is what rejects it.
     const { ix, gh, calls } = fakeIx({
       snapshots: [{ id: "stuck", status: "capturing", createdAt: Date.now() - 3_600_000 }],
     })
-    await execute(ix, gh, promotePlan)
+    await execute(ix, gh, promotePlanWith(Math.floor(Date.now() / 1000) - 7200))
     expect(calls).toContain("snapshot:w1")
     expect(calls).toContain("wait:w1:fresh")
+  })
+
+  test("a ready snapshot PREDATING the green job is never adopted (the birth-child shape)", async () => {
+    // Every fork-created machine is born with a restore-child snapshot
+    // row: minted at machine creation, ready from the start, never
+    // warm-restorable. It predates the machine's job by construction, so
+    // the adoption floor must reject it and mint a fresh capture -
+    // adopting it is exactly how the poison seed of 2026-08-20 was made.
+    const { ix, gh, calls } = fakeIx({
+      snapshots: [{ id: "birth", status: "ready", createdAt: (COMPLETED_AT_SEC - 300) * 1000 }],
+    })
+    const outcome = await execute(ix, gh, promotePlan)
+    expect(outcome.failures).toBe(0)
+    expect(calls.some((call) => call.startsWith("wait:w1:birth"))).toBe(false)
+    expect(calls).toContain("snapshot:w1")
+    expect(calls).toContain("wait:w1:fresh")
+  })
+
+  test("a ready snapshot created after the green job completed is adopted", async () => {
+    const { ix, gh, calls } = fakeIx({
+      snapshots: [{ id: "post", status: "ready", createdAt: (COMPLETED_AT_SEC + 60) * 1000 }],
+    })
+    await execute(ix, gh, promotePlan)
+    expect(calls).toContain("wait:w1:post")
+    expect(calls.some((call) => call.startsWith("snapshot:"))).toBe(false)
+  })
+
+  test("the adoption floor applies to capturing snapshots too", async () => {
+    const { ix, gh, calls } = fakeIx({
+      snapshots: [
+        { id: "pre-job", status: "capturing", createdAt: (COMPLETED_AT_SEC - 300) * 1000 },
+      ],
+    })
+    await execute(ix, gh, promotePlan)
+    expect(calls.some((call) => call.startsWith("wait:w1:pre-job"))).toBe(false)
+    expect(calls).toContain("snapshot:w1")
   })
 
   test("a snapshot-listing failure falls back to minting, never fails the promote", async () => {

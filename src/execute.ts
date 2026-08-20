@@ -162,7 +162,8 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
     const winner = ix.machines().connect(step.winner.id)
     try {
       const snapshotId =
-        (await reusableSnapshot(step.winner.id)) ?? (await winner.snapshot()).snapshotId
+        (await reusableSnapshot(step.winner.id, step.completedAtSec * 1000)) ??
+        (await winner.snapshot()).snapshotId
       const wait = await winner.waitSnapshotReady(snapshotId, SNAPSHOT_WAIT_MS)
       if (wait !== "ready") throw new Error(`snapshot ${snapshotId} ended ${wait}`)
       if (step.oldHolder !== undefined) {
@@ -233,10 +234,26 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
    *
    * Best-effort by construction: adoption is an optimization, so a failure
    * to LIST snapshots falls back to minting rather than failing a promote
-   * that would previously have gone straight to snapshot(). */
-  async function reusableSnapshot(machineId: string): Promise<string | undefined> {
+   * that would previously have gone straight to snapshot().
+   *
+   * `evidenceFloorMs` is a hard eligibility line, not an optimization: a
+   * snapshot created BEFORE the winner's green job completed cannot hold
+   * that run's state. The platform also mints a "birth" restore-child
+   * snapshot row inside machine creation - listed ready from the start,
+   * yet never warm-restorable (a birth record, not a capture) - and a
+   * status-only filter adopts it whenever the capture pipeline is sick,
+   * minting a seed every fork of which the platform refuses. The floor
+   * kills that whole class: a birth row predates the machine's job by
+   * construction. Genuine retry captures postdate the job by seconds to
+   * minutes, comfortably past any clock skew between GitHub and the
+   * platform. */
+  async function reusableSnapshot(
+    machineId: string,
+    evidenceFloorMs: number,
+  ): Promise<string | undefined> {
     try {
       const usable = (await ix.snapshots().list(machineId))
+        .filter((snapshot) => snapshot.createdAt >= evidenceFloorMs)
         .filter(
           (snapshot) =>
             snapshot.status === "ready" ||

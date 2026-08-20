@@ -92,6 +92,10 @@ export type Step =
       /** Snapshot the winner, swap it into the holder name, stop it. */
       readonly do: "promote"
       readonly winner: MachineRow
+      /** The winner's green job completion, epoch SECONDS. No snapshot
+       * created before it can hold that run's state, so it is the floor
+       * for capture adoption. */
+      readonly completedAtSec: number
       readonly holderName: string
       readonly oldHolder?: MachineRow | undefined
     }
