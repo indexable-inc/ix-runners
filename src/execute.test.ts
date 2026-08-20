@@ -37,6 +37,7 @@ function fakeIx(options: {
   wait?: string
   jitFails?: boolean
   listFails?: boolean
+  deleteFails?: boolean
 }) {
   const calls: string[] = []
   const handle = (id: string) => ({
@@ -56,6 +57,7 @@ function fakeIx(options: {
     },
     delete: async () => {
       calls.push(`delete:${id}`)
+      if (options.deleteFails) throw new Error("delete outage")
     },
     close: async () => {
       calls.push(`close:${id}`)
@@ -187,5 +189,15 @@ describe("spawn handle ownership", () => {
     expect(calls).toContain("write:new")
     expect(calls).not.toContain("delete:new")
     expect(calls).not.toContain("close:new")
+  })
+
+  test("a failed mint releases the handle even when the cleanup delete fails", async () => {
+    // delete throws (not NotFound), and the handle must STILL be closed:
+    // an unreleased handle is the "unclosed Machine" leak.
+    const { ix, gh, calls } = fakeIx({ jitFails: true, deleteFails: true })
+    const outcome = await execute(ix, gh, spawnPlan)
+    expect(outcome.failures).toBe(1)
+    expect(calls).toContain("delete:new")
+    expect(calls).toContain("close:new")
   })
 })

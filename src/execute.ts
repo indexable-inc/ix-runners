@@ -106,13 +106,15 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
       try {
         // Deleted EXPLICITLY, never via close(): close only deletes because
         // create() marked the handle as owning, and billing-critical cleanup
-        // must not lean on an SDK ownership flag. The handle is then closed
-        // best-effort (a second delete of a gone machine is swallowed).
+        // must not lean on an SDK ownership flag.
         await destroy(machine.id())
-        await release(machine)
       } catch (cleanup) {
         // The root cause is `error`; a failed cleanup only adds a warning.
         logError(`${step.name}: deleting the half-spawned machine also failed (${clean(cleanup)})`)
+      } finally {
+        // Released even when the delete fails, or the handle leaks and
+        // warns "unclosed Machine" at exit (release itself never throws).
+        await release(machine)
       }
       throw error
     }
