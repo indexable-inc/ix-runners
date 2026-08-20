@@ -7,10 +7,10 @@
  * larger than intended, never smaller. */
 
 import type { Client, Machine } from "@indexable/sdk"
-import { NotFound } from "@indexable/sdk"
+import { InvalidArgument, NotFound } from "@indexable/sdk"
 import type { GitHub } from "./github.ts"
 import { clean, logError, logWarning, mask } from "./report.ts"
-import type { Plan, Step } from "./types.ts"
+import type { MachineRow, Plan, Step } from "./types.ts"
 
 /** Where the guest's path unit watches for its single-job credential. */
 const JITCONFIG_PATH = "/var/lib/ix-runner/jitconfig"
@@ -36,11 +36,16 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
   }
   const additive = plan.steps.filter((step) => step.do === "spawn" || step.do === "promote")
   const destructive = plan.steps.filter((step) => step.do !== "spawn" && step.do !== "promote")
+  // Seeds whose snapshot the platform REFUSED to restore this tick, keyed
+  // by holder id: any number of refused spawns retire their seed once.
+  const deadSeeds = new Map<string, { holder: MachineRow; snapshotId: string; refusal: string }>()
 
   await Promise.all(additive.map((step) => run(step)))
   // Destructive steps run one at a time: each deregister already paces
   // itself against GitHub's secondary rate limit, and there is never a
-  // hurry to destroy anything.
+  // hurry to destroy anything. Dead-seed retirement is destructive too
+  // (it takes a lineage's seed out of service), so it waits for this phase.
+  for (const dead of deadSeeds.values()) await retireDeadSeed(dead)
   for (const step of destructive) await run(step)
   return outcome
 
@@ -88,11 +93,35 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
   }
 
   async function spawn(step: Step & { do: "spawn" }): Promise<string> {
-    const machine = await ix.machines().create({
-      name: step.name,
-      region: step.region,
-      ...step.source,
-    })
+    let machine: Machine
+    try {
+      machine = await ix.machines().create({
+        name: step.name,
+        region: step.region,
+        ...step.source,
+      })
+    } catch (error) {
+      // InvalidArgument on a seed restore is the platform's TYPED refusal
+      // of the snapshot itself ("not warm-restorable"): deterministic, so
+      // every future fork of this seed fails identically and the lineage
+      // wedges while its jobs queue. The escape hatch is to retire the
+      // holder (serial phase, below); transient classes - Unavailable,
+      // RateLimited, Internal - must never cost a healthy seed, and a
+      // snapshot deleted underneath us (NotFound) heals by itself: the
+      // next tick's observation no longer lists it.
+      if (
+        error instanceof InvalidArgument &&
+        "snapshot" in step.source &&
+        step.seedHolder !== undefined
+      ) {
+        deadSeeds.set(step.seedHolder.id, {
+          holder: step.seedHolder,
+          snapshotId: step.source.snapshot,
+          refusal: clean(error),
+        })
+      }
+      throw error
+    }
     // The machine exists before its credential does: a failure past this
     // point deletes it, or a registered-but-machineless runner would be
     // GitHub's view of this pool forever.
@@ -106,13 +135,15 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
       try {
         // Deleted EXPLICITLY, never via close(): close only deletes because
         // create() marked the handle as owning, and billing-critical cleanup
-        // must not lean on an SDK ownership flag. The handle is then closed
-        // best-effort (a second delete of a gone machine is swallowed).
+        // must not lean on an SDK ownership flag.
         await destroy(machine.id())
-        await release(machine)
       } catch (cleanup) {
         // The root cause is `error`; a failed cleanup only adds a warning.
         logError(`${step.name}: deleting the half-spawned machine also failed (${clean(cleanup)})`)
+      } finally {
+        // Released even when the delete fails, or the handle leaks and
+        // warns "unclosed Machine" at exit (release itself never throws).
+        await release(machine)
       }
       throw error
     }
@@ -131,7 +162,8 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
     const winner = ix.machines().connect(step.winner.id)
     try {
       const snapshotId =
-        (await reusableSnapshot(step.winner.id)) ?? (await winner.snapshot()).snapshotId
+        (await reusableSnapshot(step.winner.id, step.completedAtSec * 1000)) ??
+        (await winner.snapshot()).snapshotId
       const wait = await winner.waitSnapshotReady(snapshotId, SNAPSHOT_WAIT_MS)
       if (wait !== "ready") throw new Error(`snapshot ${snapshotId} ended ${wait}`)
       if (step.oldHolder !== undefined) {
@@ -154,6 +186,41 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
     }
   }
 
+  /** Retire a holder whose snapshot the platform refuses to restore. The
+   * reconcile is stateless across ticks, so the escape hatch must live in
+   * a NAME: renamed to `-retiring`, the holder stops being any lineage's
+   * seed (the decider skips retiring holders), the next tick cold-boots
+   * the lineage, and its next green default-branch run re-seeds it. The
+   * rename mirrors promotion's holder handover - a stale same-named
+   * retiring machine is strictly older, so it goes first - and a failure
+   * here is a log line, not a lost tick: the same refusal re-trips this
+   * next tick. */
+  async function retireDeadSeed(dead: {
+    holder: MachineRow
+    snapshotId: string
+    refusal: string
+  }): Promise<void> {
+    logWarning(
+      `${dead.holder.name}: seed snapshot ${dead.snapshotId} is not restorable` +
+        ` (${dead.refusal}); retiring the holder - the lineage cold-boots next` +
+        ` tick and re-seeds from its next green default-branch run`,
+    )
+    try {
+      await destroyByName(`${dead.holder.name}-retiring`)
+      const holder = ix.machines().connect(dead.holder.id)
+      try {
+        await holder.rename(`${dead.holder.name}-retiring`)
+      } finally {
+        await release(holder)
+      }
+      outcome.rows.push([dead.holder.name, "retire dead seed", "renamed to -retiring; the lineage cold-boots next tick"])
+    } catch (error) {
+      outcome.failures += 1
+      logError(`${dead.holder.name}: retiring the dead seed FAILED (${clean(error)}); reconciling again next tick`)
+      outcome.rows.push([dead.holder.name, "retire dead seed", `FAILED: ${clean(error)}`])
+    }
+  }
+
   /** A previous attempt's capture of this machine, adopted instead of
    * minting another. Promote failures cluster in CAS-pressure windows
    * (captures dying pre-commit read back as "gone" or "failed"), and a
@@ -167,10 +234,26 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
    *
    * Best-effort by construction: adoption is an optimization, so a failure
    * to LIST snapshots falls back to minting rather than failing a promote
-   * that would previously have gone straight to snapshot(). */
-  async function reusableSnapshot(machineId: string): Promise<string | undefined> {
+   * that would previously have gone straight to snapshot().
+   *
+   * `evidenceFloorMs` is a hard eligibility line, not an optimization: a
+   * snapshot created BEFORE the winner's green job completed cannot hold
+   * that run's state. The platform also mints a "birth" restore-child
+   * snapshot row inside machine creation - listed ready from the start,
+   * yet never warm-restorable (a birth record, not a capture) - and a
+   * status-only filter adopts it whenever the capture pipeline is sick,
+   * minting a seed every fork of which the platform refuses. The floor
+   * kills that whole class: a birth row predates the machine's job by
+   * construction. Genuine retry captures postdate the job by seconds to
+   * minutes, comfortably past any clock skew between GitHub and the
+   * platform. */
+  async function reusableSnapshot(
+    machineId: string,
+    evidenceFloorMs: number,
+  ): Promise<string | undefined> {
     try {
       const usable = (await ix.snapshots().list(machineId))
+        .filter((snapshot) => snapshot.createdAt >= evidenceFloorMs)
         .filter(
           (snapshot) =>
             snapshot.status === "ready" ||

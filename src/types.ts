@@ -81,12 +81,21 @@ export type Step =
       readonly labels: Labels
       /** Restore the lineage's seed, or cold-boot the pinned template. */
       readonly source: { readonly snapshot: string } | { readonly template: string }
+      /** The holder whose snapshot `source` restores, when it does. The
+       * executor retires it in place if the platform refuses the snapshot
+       * as not restorable - the only channel back to a stateless next tick
+       * is the holder's name. */
+      readonly seedHolder?: MachineRow | undefined
       readonly region: string
     }
   | {
       /** Snapshot the winner, swap it into the holder name, stop it. */
       readonly do: "promote"
       readonly winner: MachineRow
+      /** The winner's green job completion, epoch SECONDS. No snapshot
+       * created before it can hold that run's state, so it is the floor
+       * for capture adoption. */
+      readonly completedAtSec: number
       readonly holderName: string
       readonly oldHolder?: MachineRow | undefined
     }
