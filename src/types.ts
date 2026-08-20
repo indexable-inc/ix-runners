@@ -81,6 +81,11 @@ export type Step =
       readonly labels: Labels
       /** Restore the lineage's seed, or cold-boot the pinned template. */
       readonly source: { readonly snapshot: string } | { readonly template: string }
+      /** The holder whose snapshot `source` restores, when it does. The
+       * executor retires it in place if the platform refuses the snapshot
+       * as not restorable - the only channel back to a stateless next tick
+       * is the holder's name. */
+      readonly seedHolder?: MachineRow | undefined
       readonly region: string
     }
   | {

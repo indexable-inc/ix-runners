@@ -126,6 +126,41 @@ describe("spawning", () => {
     for (const spawn of only(plan, "spawn")) expect(spawn.source).toEqual({ snapshot: "snap1" })
   })
 
+  test("a seed-sourced spawn names its holder, so the executor can retire a dead seed", () => {
+    const holder = machine(HOLDER, { status: "stopped" })
+    const plan = steps(
+      world({
+        machines: [holder],
+        queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false },
+        seeds: new Map([[holder.id, { holder, snapshotId: "snap1", snapshotAt: NOW - 60_000 }]]),
+      }),
+    )
+    const spawns = only(plan, "spawn")
+    expect(spawns.length).toBeGreaterThan(0)
+    for (const spawn of spawns) expect(spawn.seedHolder?.id).toBe(holder.id)
+  })
+
+  test("a lineage whose only holder is retiring spawns cold, never from its snapshot", () => {
+    // The dead-seed escape hatch's second half: the executor renamed a
+    // refused seed's holder to -retiring, so the next (stateless) tick
+    // must source spawns from the template, not the dead snapshot -
+    // even though the retiring holder still lists a ready snapshot.
+    const retiring = machine(`${HOLDER}-retiring`, { status: "stopped" })
+    const plan = steps(
+      world({
+        machines: [retiring],
+        queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false },
+        seeds: new Map([[retiring.id, { holder: retiring, snapshotId: "dead", snapshotAt: NOW }]]),
+      }),
+    )
+    const spawns = only(plan, "spawn")
+    expect(spawns.length).toBeGreaterThan(0)
+    for (const spawn of spawns) {
+      expect(spawn.source).toEqual({ template: `github:acme/app/${REV}#ci-runner` })
+      expect(spawn.seedHolder).toBeUndefined()
+    }
+  })
+
   test("existing runners count against want", () => {
     const standing = machine(`p-run-${LINEAGE}-x1`)
     const plan = steps(

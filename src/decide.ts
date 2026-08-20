@@ -382,8 +382,10 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
         break
       }
       let source: { snapshot: string } | { template: string }
+      let seedHolder: MachineRow | undefined
       if (seed?.snapshotId !== undefined) {
         source = { snapshot: seed.snapshotId }
+        seedHolder = holder
       } else {
         if (coldBudget === 0) {
           notes.push({
@@ -401,6 +403,7 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
         name: runnerName(config.pool, lineage),
         labels,
         source,
+        seedHolder,
         region,
       })
     }

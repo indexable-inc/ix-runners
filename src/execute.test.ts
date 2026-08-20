@@ -8,9 +8,12 @@ import type { GitHub } from "./github.ts"
 import type { MachineRow, Plan } from "./types.ts"
 
 // The SDK's entry point loads a native addon at import time; the executor
-// only needs the NotFound class from it, so tests substitute a plain one
-// and never touch the network or the addon.
-mock.module("@indexable/sdk", () => ({ NotFound: class NotFound extends Error {} }))
+// only needs the NotFound and InvalidArgument classes from it, so tests
+// substitute plain ones and never touch the network or the addon.
+class NotFound extends Error {}
+class InvalidArgument extends Error {}
+class Unavailable extends Error {}
+mock.module("@indexable/sdk", () => ({ NotFound, InvalidArgument, Unavailable }))
 const { execute } = await import("./execute.ts")
 // The module mock is process-global: restore it so no later-loaded test
 // file inherits a fake SDK by accident.
@@ -37,6 +40,8 @@ function fakeIx(options: {
   wait?: string
   jitFails?: boolean
   listFails?: boolean
+  createFails?: Error
+  renameFails?: boolean
   deleteFails?: boolean
 }) {
   const calls: string[] = []
@@ -51,6 +56,7 @@ function fakeIx(options: {
     },
     rename: async (name: string) => {
       calls.push(`rename:${id}:${name}`)
+      if (options.renameFails) throw new Error("rename outage")
     },
     stop: async () => {
       calls.push(`stop:${id}`)
@@ -72,7 +78,13 @@ function fakeIx(options: {
       connect: (id: string) => handle(id),
       create: async () => {
         calls.push("create:new")
+        if (options.createFails) throw options.createFails
         return handle("new")
+      },
+      get: async (name: string) => {
+        // No stale -retiring machine exists in these worlds.
+        calls.push(`get:${name}`)
+        throw new NotFound()
       },
     }),
     snapshots: () => ({
@@ -199,5 +211,91 @@ describe("spawn handle ownership", () => {
     expect(outcome.failures).toBe(1)
     expect(calls).toContain("delete:new")
     expect(calls).toContain("close:new")
+  })
+})
+
+describe("dead-seed fallback", () => {
+  const SEED_HOLDER: MachineRow = {
+    id: "h1",
+    name: "p-seed-aaaaaaaa-bbbbbbbb-abc123",
+    status: "stopped",
+    createdAt: 0,
+  }
+  const seedSpawn = (name: string) =>
+    ({
+      do: "spawn",
+      name,
+      labels: ["ix"],
+      source: { snapshot: "snap1" },
+      seedHolder: SEED_HOLDER,
+      region: "us-west-1",
+    }) as const
+
+  test("a not-restorable refusal retires the seed holder in the same tick, once", async () => {
+    // The incident shape: every fork of the seed's snapshot is refused
+    // with the platform's typed InvalidArgument ("snapshot has no captured
+    // block-volume root; not warm-restorable"). Many refusals, ONE retire.
+    const { ix, gh, calls } = fakeIx({
+      createFails: new InvalidArgument("snapshot has no captured block-volume root; not warm-restorable"),
+    })
+    const plan: Plan = {
+      steps: [seedSpawn("p-run-aaaaaaaa-x1"), seedSpawn("p-run-aaaaaaaa-x2")],
+      notes: [],
+    }
+    const outcome = await execute(ix, gh, plan)
+    expect(outcome.failures).toBe(2) // both spawns still failed
+    const retires = calls.filter((call) => call === `rename:h1:${SEED_HOLDER.name}-retiring`)
+    expect(retires).toHaveLength(1)
+    expect(calls).toContain("close:h1")
+  })
+
+  test("a transient failure does not retire the seed", async () => {
+    const { ix, gh, calls } = fakeIx({ createFails: new Unavailable("region briefly down") })
+    const outcome = await execute(ix, gh, { steps: [seedSpawn("p-run-aaaaaaaa-x1")], notes: [] })
+    expect(outcome.failures).toBe(1)
+    expect(calls.some((call) => call.startsWith("rename:"))).toBe(false)
+  })
+
+  test("an InvalidArgument on a COLD boot retires nothing (there is no seed)", async () => {
+    const { ix, gh, calls } = fakeIx({ createFails: new InvalidArgument("bad template ref") })
+    const plan: Plan = {
+      steps: [
+        {
+          do: "spawn",
+          name: "p-run-aaaaaaaa-x1",
+          labels: ["ix"],
+          source: { template: "github:acme/app/rev#ci-runner" },
+          region: "us-west-1",
+        },
+      ],
+      notes: [],
+    }
+    await execute(ix, gh, plan)
+    expect(calls.some((call) => call.startsWith("rename:"))).toBe(false)
+  })
+
+  test("a failed retire rename is a logged failure, not a crash; the tick finishes", async () => {
+    const { ix, gh, calls } = fakeIx({
+      createFails: new InvalidArgument("not warm-restorable"),
+      renameFails: true,
+    })
+    const outcome = await execute(ix, gh, { steps: [seedSpawn("p-run-aaaaaaaa-x1")], notes: [] })
+    expect(outcome.failures).toBe(2) // the spawn AND the retire
+    expect(calls).toContain(`rename:h1:${SEED_HOLDER.name}-retiring`)
+    expect(calls).toContain("close:h1") // the handle never leaks
+  })
+
+  test("the retire waits for the serial phase: it runs after every additive step", async () => {
+    const { ix, gh, calls } = fakeIx({
+      createFails: new InvalidArgument("not warm-restorable"),
+    })
+    const plan: Plan = {
+      steps: [seedSpawn("p-run-aaaaaaaa-x1"), seedSpawn("p-run-aaaaaaaa-x2")],
+      notes: [],
+    }
+    await execute(ix, gh, plan)
+    const lastCreate = calls.lastIndexOf("create:new")
+    const retire = calls.indexOf(`rename:h1:${SEED_HOLDER.name}-retiring`)
+    expect(retire).toBeGreaterThan(lastCreate)
   })
 })

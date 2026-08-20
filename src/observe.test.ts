@@ -10,8 +10,13 @@ import type { GitHub } from "./github.ts"
 
 // The SDK's entry point loads a native addon at import time; observe only
 // needs the NotFound class from it, so tests substitute a plain one and
-// never touch the network or the addon.
-mock.module("@indexable/sdk", () => ({ NotFound: class NotFound extends Error {} }))
+// never touch the network or the addon. Every class the source tree imports
+// from the SDK must appear here: the mock is process-global while this file
+// runs, and a missing name fails whichever file's import re-links against it.
+mock.module("@indexable/sdk", () => ({
+  NotFound: class NotFound extends Error {},
+  InvalidArgument: class InvalidArgument extends Error {},
+}))
 const { NotFound } = await import("@indexable/sdk")
 const { flickeringIds, listCompletely, observe, unionListings } = await import("./observe.ts")
 // The module mock is process-global: restore it so no later-loaded test
