@@ -2,6 +2,17 @@
 
 Ephemeral fork-per-job GitHub Actions runners on [ix](https://ix.dev) VMs.
 
+## Maintenance mode
+
+New feature work happens in the v2 webhook control plane, not here.
+
+This repository still matters for two things:
+
+- The cron-tick sweep for missed webhooks, until v2 grows its own.
+- GHES and organizations that restrict GitHub App installation.
+
+Archiving is gated on the v2 sweep landing. Bug fixes remain welcome until then.
+
 Every runner is a machine that exists for exactly one job. When a job on
 your default branch goes green, the machine that ran it is snapshotted and
 becomes the **seed** for its label set: every later job with those labels
