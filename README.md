@@ -2,6 +2,26 @@
 
 Ephemeral fork-per-job GitHub Actions runners on [ix](https://ix.dev) VMs.
 
+## Maintenance mode
+
+New feature work happens in the ix-hosted webhook control plane (in the ix
+monorepo), not here. (This repository's own design notes call this
+implementation v2; the webhook control plane is its successor.)
+
+A pool is owned by exactly one control plane, never both: the reconcile has
+no internal lock, so two planes managing one pool double-spawn and
+double-promote (see the warning in `action.yml`). Migrating a pool means
+removing it here in the same change that adds it there.
+
+This repository still matters for two things:
+
+- Pools not yet migrated. Until the webhook control plane grows its own
+  reconcile sweep, only pools here have missed-webhook protection.
+- GHES and organizations that restrict GitHub App installation.
+
+Archiving is gated on that sweep landing and the last pool migrating.
+Bug fixes remain welcome until then.
+
 Every runner is a machine that exists for exactly one job. When a job on
 your default branch goes green, the machine that ran it is snapshotted and
 becomes the **seed** for its label set: every later job with those labels
@@ -252,5 +272,6 @@ where it is not:
 
 ## Roadmap
 
-- An ix-hosted control plane (GitHub App webhooks instead of a workflow in
-  your repo): the workflow file deletes, the policy file stays.
+- The ix-hosted control plane (GitHub App webhooks instead of a workflow in
+  your repo) is now being built in the ix monorepo; see "Maintenance mode"
+  above for what stays here and the pool-ownership rule.
