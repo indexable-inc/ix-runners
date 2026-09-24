@@ -2,25 +2,47 @@
 
 Ephemeral fork-per-job GitHub Actions runners on [ix](https://ix.dev) VMs.
 
-## Maintenance mode
+## Superseded: use the ix GitHub App instead
 
-New feature work happens in the ix-hosted webhook control plane (in the ix
-monorepo), not here. (This repository's own design notes call this
-implementation v2; the webhook control plane is its successor.)
+New repositories should not use this Action. ix now runs the same
+fork-per-job runners as a hosted service, driven by GitHub App webhooks,
+with nothing to add to your repository but a label:
 
-A pool is owned by exactly one control plane, never both: the reconcile has
-no internal lock, so two planes managing one pool double-spawn and
-double-promote (see the warning in `action.yml`). Migrating a pool means
-removing it here in the same change that adds it there.
+1. Install the ix-runners GitHub App on the repository:
+   <https://github.com/apps/ix-runners/installations/new>. The install
+   redirects to ix.dev, where you sign in to link it to the ix account the
+   runners bill to.
+2. Put `runs-on: ix` on the jobs you want on ix.
 
-This repository still matters for two things:
+That's it. No reconcile workflow, no `IX_TOKEN` or `RUNNER_PAT` secrets,
+no flake to write: the first `runs-on: ix` job creates the repository's
+pool, jobs boot on ix's default NixOS runner image (stock Nix, so workflows
+that start with `cachix/install-nix-action` or
+`DeterminateSystems/nix-installer-action` run unchanged), and green jobs on
+your default branch become the seeds later jobs fork from, exactly as
+described below.
 
-- Pools not yet migrated. Until the webhook control plane grows its own
-  reconcile sweep, only pools here have missed-webhook protection.
-- GHES and organizations that restrict GitHub App installation.
+What the hosted plane covers that this Action did: the missed-webhook sweep
+(queued and in-progress runs are re-read from GitHub every few minutes, so a
+dropped delivery cannot strand a job), seed promotion with the same
+fork-PR provenance check, and GC. It adds a hard lifetime cap on every
+runner, deletion of machines whose pool is disabled or removed, and expiry
+of seeds for label sets no job has used in a week.
 
-Archiving is gated on that sweep landing and the last pool migrating.
-Bug fixes remain welcome until then.
+### Who should still use this repository
+
+- Pools already configured here, until they migrate. A pool is owned by
+  exactly one control plane, never both: the reconcile has no internal
+  lock, so two planes managing one pool double-spawn and double-promote
+  (see the warning in `action.yml`). Migrating is one change in your
+  repository: delete the reconcile workflow and install the App in the
+  same step, keeping `runs-on` labels as they are (drop `self-hosted` if
+  you like; it is only a label).
+- GitHub Enterprise Server, or organizations that do not allow GitHub App
+  installs. The hosted plane needs the App.
+
+Bug fixes are still welcome. The repository will be archived once the last
+pool configured here has migrated.
 
 Every runner is a machine that exists for exactly one job. When a job on
 your default branch goes green, the machine that ran it is snapshotted and
@@ -272,6 +294,5 @@ where it is not:
 
 ## Roadmap
 
-- The ix-hosted control plane (GitHub App webhooks instead of a workflow in
-  your repo) is now being built in the ix monorepo; see "Maintenance mode"
-  above for what stays here and the pool-ownership rule.
+None here. Feature work happens in the ix-hosted control plane; see
+"Superseded" above.
