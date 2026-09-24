@@ -37,7 +37,11 @@ of seeds for label sets no job has used in a week.
   (see the warning in `action.yml`). Migrating is one change in your
   repository: delete the reconcile workflow and install the App in the
   same step, keeping `runs-on` labels as they are (drop `self-hosted` if
-  you like; it is only a label).
+  you like; it is only a label). Then delete this Action's own machines
+  (`<pool-name>-run-*` and `<pool-name>-seed-*`) on the ix account whose
+  `IX_TOKEN` the reconcile used: the hosted plane only lists its own
+  account, so nothing else ever deletes them, and a stopped seed keeps
+  billing its disk.
 - GitHub Enterprise Server, or organizations that do not allow GitHub App
   installs. The hosted plane needs the App.
 
@@ -178,6 +182,11 @@ jobs:
 ```
 
 ### Pool mode: pools shipped in this repository
+
+`pools/baml` is no longer served by this Action: BoundaryML/baml's pool
+moved to the hosted plane, and selecting `pool: baml` here would put that
+repository under two control planes. The files stay only because the
+pool-mode tests read them (`src/config.test.ts`).
 
 A pool ix maintains for you lives under [`pools/`](./pools) in this repo -
 spec (`ix-runners.toml`), runner policy, and template flake - and your
