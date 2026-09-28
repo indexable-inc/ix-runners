@@ -413,6 +413,11 @@ in
       automatic = true;
       dates = "weekly";
       options = "--delete-older-than 30d";
+      # A fork boots with its seed's timer stamps. Persistent (the default)
+      # makes every fork of a week-old seed run the missed GC at boot, in
+      # the job's first minute: disk contention, and deletion of exactly
+      # the store paths the seed kept warm for that job.
+      persistent = false;
     };
   };
 }
