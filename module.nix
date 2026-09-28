@@ -417,7 +417,7 @@ in
       # makes every fork of a week-old seed run the missed GC at boot, in
       # the job's first minute: disk contention, and deletion of exactly
       # the store paths the seed kept warm for that job.
-      persistent = false;
+      persistent = lib.mkDefault false;
     };
   };
 }

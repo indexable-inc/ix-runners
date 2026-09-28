@@ -23,7 +23,13 @@ import { appendFile } from "node:fs/promises"
 import { clean, logError } from "./report.ts"
 
 const API = "https://api.github.com"
-const POLL_MS = 3_000
+// 10 s keeps a worst-case watch (start + finish deadlines) near 270 reads,
+// well inside the workflow token's hourly budget the reconcile shares.
+const POLL_MS = 10_000
+const REQUEST_TIMEOUT_MS = 30_000
+// Consecutive failed reads tolerated before the watch gives up: one 5xx
+// must not strand the run, a dead API must not be polled forever.
+const MAX_READ_FAILURES = 5
 
 interface Step {
   readonly name: string
@@ -48,6 +54,7 @@ type Outcome =
   | { readonly kind: "never-queued"; readonly elapsedS: number; readonly polls: number }
   | { readonly kind: "never-started"; readonly elapsedS: number; readonly polls: number; readonly job: Job }
   | { readonly kind: "never-finished"; readonly elapsedS: number; readonly polls: number; readonly job: Job }
+  | { readonly kind: "watch-failed"; readonly elapsedS: number; readonly polls: number; readonly error: string }
 
 function required(name: string): string {
   const value = process.env[name]
@@ -81,6 +88,7 @@ async function github(method: string, path: string): Promise<Response> {
   const response = await fetch(`${API}${path}`, {
     method,
     redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: {
       authorization: `Bearer ${token}`,
       accept: "application/vnd.github+json",
@@ -110,9 +118,20 @@ async function watch(): Promise<Outcome> {
   let startedAt: number | undefined
   let polls = 0
   let last: Job | undefined
+  let failures = 0
   for (;;) {
     polls += 1
-    last = await readJob()
+    try {
+      last = await readJob()
+      failures = 0
+    } catch (error) {
+      failures += 1
+      const elapsedS = (Date.now() - begin) / 1000
+      if (failures >= MAX_READ_FAILURES) return { kind: "watch-failed", elapsedS, polls, error: clean(error) }
+      console.log(`read ${polls} failed (${clean(error)}); retrying`)
+      await Bun.sleep(POLL_MS)
+      continue
+    }
     const elapsedS = (Date.now() - begin) / 1000
     if (last?.status === "completed") return { kind: "finished", job: last }
     if (last?.status === "in_progress" && startedAt === undefined) startedAt = Date.now()
@@ -150,10 +169,12 @@ async function cancelRun(): Promise<void> {
 const outcome = await watch()
 if (outcome.kind !== "finished") {
   const detail =
-    outcome.kind === "never-queued"
-      ? `job '${jobName}' never appeared in run ${runId}`
-      : `job '${jobName}' is still ${clean(outcome.job.status)}` +
-        (outcome.job.runner_name ? ` on runner ${clean(outcome.job.runner_name)}` : ", no runner took it")
+    outcome.kind === "watch-failed"
+      ? `${MAX_READ_FAILURES} consecutive job reads failed, last: ${outcome.error}`
+      : outcome.kind === "never-queued"
+        ? `job '${jobName}' never appeared in run ${runId}`
+        : `job '${jobName}' is still ${clean(outcome.job.status)}` +
+          (outcome.job.runner_name ? ` on runner ${clean(outcome.job.runner_name)}` : ", no runner took it")
   logError(`${outcome.kind} after ${outcome.elapsedS.toFixed(0)} s and ${outcome.polls} polls: ${detail}`)
   await cancelRun()
   process.exit(1)
