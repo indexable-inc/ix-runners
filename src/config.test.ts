@@ -118,6 +118,21 @@ describe("pool mode config", () => {
     expect(config.templateRev).toBe(ACTION_REV)
   })
 
+  test("the e2e spec loads in config-file mode against this repository", async () => {
+    // .github/workflows/e2e.yml passes this file as `config-file`: no action
+    // pin, so the template must build from the workflow's own repository at
+    // the rev git derives for pools/e2e.
+    setEnv({ IX_POOL_SPEC: join(import.meta.dir, "..", "pools", "e2e", "ix-runners.toml") })
+    process.env.GITHUB_REPOSITORY = "indexable-inc/ix-runners"
+    const config = await loadConfig()
+    expect(config.pool).toBe("ixr-e2e")
+    expect(config.flakeDir).toBe("pools/e2e")
+    expect(config.regions).toEqual(["us-west-1"])
+    expect(config.maxRunners).toBe(2)
+    expect(config.templateRepo).toBe("indexable-inc/ix-runners")
+    expect(config.templateRev).toBe("")
+  })
+
   test("resolveRev never consults git in pool mode", async () => {
     // Run in a directory that is NOT a git repository, with process.exit
     // unmocked: if the bypass is broken, desiredRev's git call fails and
