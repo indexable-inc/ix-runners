@@ -1,0 +1,151 @@
+name: e2e
+
+# End to end, the way a customer runs it: this checkout's reconcile (the
+# action at `./`) spawns an ix VM for a queued `runs-on: [self-hosted, ix]`
+# job, the VM registers with a single-job JIT credential, the job runs a real
+# `nix build` in the guest, and a watcher asserts the job went green and
+# reports how long it waited for its runner.
+#
+# Secrets (repository Actions secrets):
+#   IX_TOKEN    ix API key for the account the e2e machines bill to
+#   RUNNER_PAT  fine-grained PAT on this repository, Administration read/write
+# Without both, the run skips instead of queueing a job no runner will take.
+#
+# Optional repository variable:
+#   IX_E2E_START_BUDGET_S  fail a green run whose queue-to-runner latency
+#                          exceeded this many seconds (unset: report only)
+
+# No pull_request trigger: the reconcile refuses any ref but the default
+# branch (src/main.ts), so a PR run could only ever queue a job nobody
+# spawns a machine for. The schedule makes this a standing canary for the
+# ix platform, which changes under this repository without a commit here.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+  # The watcher cancels a run whose ix job never started: a queued
+  # self-hosted job has no timeout of its own and would hold the
+  # concurrency group below for a day.
+  actions: write
+
+# One e2e at a time: every run reconciles the same pool, and the reconcile
+# takes no lock of its own (see action.yml).
+concurrency:
+  group: ix-runners-e2e
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          HAVE_IX_TOKEN: ${{ secrets.IX_TOKEN != '' }}
+          HAVE_RUNNER_PAT: ${{ secrets.RUNNER_PAT != '' }}
+        run: |
+          if [ "$HAVE_IX_TOKEN" = true ] && [ "$HAVE_RUNNER_PAT" = true ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::e2e skipped: needs secrets IX_TOKEN and RUNNER_PAT (IX_TOKEN=$HAVE_IX_TOKEN RUNNER_PAT=$HAVE_RUNNER_PAT)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The job under test. Its name is what the watcher looks up.
+  nix-build:
+    name: nix build on ix
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: [self-hosted, ix, ixr-e2e]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: nix build
+        run: |
+          set -euo pipefail
+          nix --version
+          echo "store paths at job start: $(ls /nix/store | wc -l)"
+          start=$(date +%s%N)
+          out=$(nix build ./pools/e2e#e2e-probe --no-link --print-out-paths -L)
+          build_ms=$(( ($(date +%s%N) - start) / 1000000 ))
+          echo "nix build took ${build_ms} ms: $out"
+          test "$(cat "$out")" = "ixr-e2e-probe ok"
+          {
+            echo "### nix build on ix"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| nix | $(nix --version) |"
+            echo "| nix build wall time | ${build_ms} ms |"
+            echo "| output | \`$out\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Spawns the machine for the job above. Hosted, like every reconcile: it
+  # holds IX_TOKEN and the PAT, and a runner VM must never see either.
+  reconcile:
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The template rev is the last commit touching pools/e2e.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./
+        with:
+          ix-token: ${{ secrets.IX_TOKEN }}
+          runner-pat: ${{ secrets.RUNNER_PAT }}
+          config-file: pools/e2e/ix-runners.toml
+
+  watch:
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.13"
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+          E2E_RUN_ID: ${{ github.run_id }}
+          E2E_RUN_ATTEMPT: ${{ github.run_attempt }}
+          E2E_JOB_NAME: nix build on ix
+          # A lineage's first cold boot builds the template flake inside
+          # the VM being created; that is the slow path this allows for.
+          E2E_START_DEADLINE_S: "1500"
+          E2E_FINISH_DEADLINE_S: "1200"
+          E2E_START_BUDGET_S: ${{ vars.IX_E2E_START_BUDGET_S }}
+        run: |
+          bun install --frozen-lockfile
+          bun run src/e2e-watch.ts
+
+  # The machine that ran the job is deleted (or, green on main, promoted to
+  # the lineage's seed) by the next reconcile tick. This is that tick, so an
+  # e2e run leaves nothing billing behind.
+  cleanup:
+    needs: [preflight, watch]
+    if: always() && needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./
+        with:
+          ix-token: ${{ secrets.IX_TOKEN }}
+          runner-pat: ${{ secrets.RUNNER_PAT }}
+          config-file: pools/e2e/ix-runners.toml

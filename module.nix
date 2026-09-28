@@ -123,6 +123,21 @@ in
       description = "Toolchain packages on the job's PATH, on top of the base userland.";
     };
 
+    warmStorePaths = mkOption {
+      type = types.listOf types.package;
+      default = [ pkgs.stdenv ];
+      defaultText = lib.literalExpression "[ pkgs.stdenv ]";
+      example = lib.literalExpression "[ pkgs.stdenv pkgs.rustc pkgs.cargo ]";
+      description = ''
+        Store paths baked into the runner image without going on PATH.
+        A cold boot is the first job of every lineage and of every config
+        rev, and it has no seed store to inherit: whatever `nix build`
+        needs and the image lacks is downloaded inside that job. The
+        default makes a plain `stdenv.mkDerivation` build with zero
+        substitution; add the build inputs your jobs' derivations share.
+      '';
+    };
+
     jobEnvironment = mkOption {
       type = types.attrsOf types.str;
       default = { };
@@ -361,7 +376,24 @@ in
     # the unit (see issue #1), never from here.
     environment.systemPackages = baseUserland ++ cfg.extraPackages;
 
+    # In the image closure, so the Nix store a cold boot starts from
+    # already holds them. The nixpkgs flake source is there too: mkRunner
+    # builds through nixpkgs.lib.nixosSystem, which pins the `nixpkgs`
+    # registry entry to it, so `nix build nixpkgs#foo` fetches no tarball.
+    system.extraDependencies = cfg.warmStorePaths;
+
     nix.settings = {
+      # A missing narinfo is cached for an hour by default, and that cache
+      # rides the seed snapshot into every fork of the lineage; a path the
+      # binary cache gains a minute later would stay invisible for the hour.
+      narinfo-cache-negative-ttl = lib.mkDefault 60;
+      # Keep build inputs of live outputs through GC: the seed store is the
+      # warmth, and a collected build input is a re-download in the next
+      # fork's job.
+      keep-outputs = lib.mkDefault true;
+      # A dead substituter should cost seconds per path, not libcurl's
+      # 300 s default connect wait (nix's own default, 0, defers to it).
+      connect-timeout = lib.mkDefault 5;
       experimental-features = [
         "nix-command"
         "flakes"
