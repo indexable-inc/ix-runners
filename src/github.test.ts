@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { HttpError, trustedRunProvenance } from "./github.ts"
+import { cleanupBranchesFromEventPayload, HttpError, trustedRunProvenance } from "./github.ts"
 import { clean } from "./report.ts"
 
 describe("run provenance gates seed candidacy", () => {
@@ -44,6 +44,28 @@ describe("the 422 busy classification", () => {
   test("the secret-tainted body never rides the message", () => {
     const error = new HttpError(422, "token ghs_secret123 leaked here", "/actions/runners/1")
     expect(error.message).not.toContain("ghs_secret123")
+  })
+})
+
+describe("branch lifecycle cleanup events", () => {
+  test("closed pull requests identify their head branch", () => {
+    expect(
+      cleanupBranchesFromEventPayload("pull_request", {
+        action: "closed",
+        pull_request: { head: { ref: "feature/cache-gc" } },
+      }),
+    ).toEqual(["feature/cache-gc"])
+  })
+
+  test("deleted pushes identify their deleted branch", () => {
+    expect(
+      cleanupBranchesFromEventPayload("push", { deleted: true, ref: "feature/cache-gc" }),
+    ).toEqual(["feature/cache-gc"])
+  })
+
+  test("unrelated events fail closed", () => {
+    expect(cleanupBranchesFromEventPayload("push", { deleted: false, ref: "main" })).toEqual([])
+    expect(cleanupBranchesFromEventPayload("pull_request", { action: "opened" })).toEqual([])
   })
 })
 

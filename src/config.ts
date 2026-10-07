@@ -32,6 +32,9 @@ export interface Config {
   readonly idleGraceSeconds: number
   /** Cold template boots admitted per tick: the bad-template-rev throttle. */
   readonly maxColdBoots: number
+  /** Seconds between cold seed rebuilds. The old seed remains until a new
+   * default-branch promotion replaces it; zero disables this maintenance. */
+  readonly seedRebuildIntervalSeconds?: number
   /** Seconds a young machine's silence proves nothing. */
   readonly warmGraceSeconds: number
   /** Only a scheduled tick may retire capacity. */
@@ -61,6 +64,7 @@ const SPEC_KEYS: Record<string, "string" | "int" | "regions"> = {
   "min-warm": "int",
   "idle-grace-seconds": "int",
   "max-cold-boots": "int",
+  "seed-rebuild-interval-seconds": "int",
 }
 
 export const DEFAULT_SPEC_PATH = ".github/ix-runners.toml"
@@ -221,6 +225,7 @@ function fromSpec(spec: Record<string, unknown>): Config {
     minWarm: int("min-warm", 0),
     idleGraceSeconds: int("idle-grace-seconds", 900),
     maxColdBoots: int("max-cold-boots", 4),
+    seedRebuildIntervalSeconds: int("seed-rebuild-interval-seconds", 7 * 24 * 60 * 60),
     warmGraceSeconds: 300,
     mayScaleDown: tickMode === "scheduled",
     templateRepo: actionRepo || repo,

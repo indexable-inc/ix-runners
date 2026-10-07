@@ -200,6 +200,7 @@ export class GitHub {
           // be named after the default branch); the run's provenance must
           // vouch too, or fork code seeds the machines trusted jobs fork from.
           onDefaultBranch: job.head_branch === defaultBranch && trustedRun,
+          headBranch: job.head_branch,
         })
       }
       let truncated = false
@@ -228,7 +229,12 @@ export class GitHub {
         const run = runs[index]!
         for (const job of jobs) collectFinished(job, run.trusted)
       }
-      return { demanded, finished, truncated }
+      return {
+        demanded,
+        finished,
+        truncated,
+        cleanupBranches: await this.cleanupBranchesFromEvent(),
+      }
     } catch (error) {
       const status = error instanceof HttpError ? error.status : undefined
       const hint =
@@ -241,6 +247,27 @@ export class GitHub {
       )
       return null
     }
+  }
+
+  /**
+   * A closed pull request or deleted branch is a destructive signal. The
+   * workflow event payload is local to the hosted control job, so parsing it
+   * here keeps the older Action implementation stateless while still making
+   * the next reconcile delete every runner whose completed evidence names the
+   * branch. Unknown payloads fail closed and produce no cleanup request.
+   */
+  private async cleanupBranchesFromEvent(): Promise<string[]> {
+    const path = process.env.GITHUB_EVENT_PATH
+    if (!path) return []
+    try {
+      return cleanupBranchesFromEventPayload(
+        process.env.GITHUB_EVENT_NAME ?? "",
+        JSON.parse(await Bun.file(path).text()),
+      )
+    } catch (error) {
+      logWarning(`could not parse ${path} for branch cleanup (${clean(error)})`)
+    }
+    return []
   }
 
   /** The repository's default branch: only jobs on it may promote a seed. */
@@ -323,6 +350,26 @@ export class GitHub {
     }
     return jobs
   }
+}
+
+/** Pure event decoding keeps branch cleanup fail-closed and testable without
+ * constructing a credentialed GitHub client or touching the filesystem. */
+export function cleanupBranchesFromEventPayload(eventName: string, event: unknown): string[] {
+  if (typeof event !== "object" || event === null) return []
+  const payload = event as {
+    ref?: unknown
+    deleted?: unknown
+    action?: unknown
+    pull_request?: { head?: { ref?: unknown } }
+  }
+  if (eventName === "push" && payload.deleted === true && typeof payload.ref === "string") {
+    return payload.ref ? [payload.ref] : []
+  }
+  const branch = payload.pull_request?.head?.ref
+  if (eventName === "pull_request" && payload.action === "closed" && typeof branch === "string") {
+    return branch ? [branch] : []
+  }
+  return []
 }
 
 /** One run from the runs listing, reduced to what the queue scan needs. */

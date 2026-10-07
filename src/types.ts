@@ -38,6 +38,8 @@ export interface FinishedJob {
   readonly succeeded: boolean
   /** Ran on the repository's default branch (the only promotions allowed). */
   readonly onDefaultBranch: boolean
+  /** The branch/ref that owned the job, for close/delete cleanup. */
+  readonly headBranch?: string | undefined
 }
 
 /** What the GitHub queue scan learned. `null` at the World level means the
@@ -47,6 +49,8 @@ export interface QueueObservation {
   readonly finished: readonly FinishedJob[]
   /** More active runs than the scan reads: demand is a floor, not a count. */
   readonly truncated: boolean
+  /** A branch or PR close event asks the reconcile to remove its runners. */
+  readonly cleanupBranches?: readonly string[]
 }
 
 /** A seed holder machine together with its restorable snapshot, if any. */

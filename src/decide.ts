@@ -85,6 +85,29 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
     currentHolders.set(parsed.lineage, holder)
   }
 
+  // A scheduled maintenance tick periodically bypasses the current snapshot
+  // for the next demanded runner. The holder stays in place until that cold
+  // runner passes the normal green default-branch promotion path, so a failed
+  // rebuild never destroys the last known-good seed. This is intentionally
+  // demand-driven in the legacy Action: unlike ix-hosted, it has no durable
+  // warmup ledger from which to rerun an idle workflow.
+  const coldRebuildLineages = new Set<string>()
+  const rebuildIntervalMs = (config.seedRebuildIntervalSeconds ?? 0) * 1000
+  if (config.mayScaleDown && rebuildIntervalMs > 0) {
+    for (const [lineage, holder] of currentHolders) {
+      const snapshotAt = world.seeds.get(holder.id)?.snapshotAt
+      if (snapshotAt !== undefined && nowMs - snapshotAt >= rebuildIntervalMs) {
+        coldRebuildLineages.add(lineage)
+      }
+    }
+  }
+  if (coldRebuildLineages.size > 0) {
+    notes.push({
+      level: "info",
+      text: `scheduled cold seed rebuild requested for ${coldRebuildLineages.size} lineage(s)`,
+    })
+  }
+
   // A failed machine still owns its NAME. Promotion renames the winner into
   // the holder name, so a failed incumbent must be handed over as the
   // machine to move aside - its id-keyed delete above still lands - or the
@@ -155,6 +178,12 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   // idempotent is that promotion RENAMES the winner out of the runner
   // namespace, so surviving evidence stops matching any machine.
   const runnerByName = new Map(runners.map((machine) => [machine.name, machine]))
+  const cleanupBranches = new Set(queue.cleanupBranches ?? [])
+  const cleanupRunners = new Set(
+    queue.finished
+      .filter((job) => job.headBranch !== undefined && cleanupBranches.has(job.headBranch))
+      .map((job) => job.runnerName),
+  )
   const promoted = new Set<string>() // machine ids leaving the runner pool
   const winners = new Map<string, { machine: MachineRow; completedAt: number }>()
   const notedOffBranch = new Set<string>()
@@ -257,13 +286,33 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   // arrives (cancelled run, evicted scan window) falls to the idle-grace
   // backstop below instead.
   const finishedEvidence = new Set(queue.finished.map((job) => job.runnerName))
+  for (const runner of cleanupRunners) finishedEvidence.add(runner)
   const deleted = new Set<string>()
   for (const machine of runners) {
     if (promoted.has(machine.id)) continue
-    if ((registrationsByName.get(machine.name) ?? []).length > 0) continue
+    const registrations = registrationsByName.get(machine.name) ?? []
+    if (registrations.length > 0) {
+      // A finished job can race the runner's self-deregistration. Remove an
+      // idle registration immediately; a busy registration remains protected
+      // by GitHub's 422 lock and is retried on the next tick.
+      if (finishedEvidence.has(machine.name) && registrations.every((r) => !r.busy)) {
+        steps.push({
+          do: "retire",
+          machine,
+          registrationIds: registrations.map((registration) => registration.id),
+          why: cleanupRunners.has(machine.name) ? "branch or pull request closed" : "job finished",
+        })
+        deleted.add(machine.id)
+      }
+      continue
+    }
     if (nowMs - machine.createdAt < config.warmGraceSeconds * 1000) continue
     if (finishedEvidence.has(machine.name)) {
-      steps.push({ do: "delete", machine, why: "job finished" })
+      steps.push({
+        do: "delete",
+        machine,
+        why: cleanupRunners.has(machine.name) ? "branch or pull request closed" : "job finished",
+      })
       deleted.add(machine.id)
     } else if (nowMs - machine.createdAt >= config.idleGraceSeconds * 1000) {
       // Evidence loss must never be silent: if this machine's job was green
@@ -384,7 +433,7 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
       }
       let source: { snapshot: string } | { template: string }
       let seedHolder: MachineRow | undefined
-      if (seed?.snapshotId !== undefined) {
+      if (seed?.snapshotId !== undefined && !coldRebuildLineages.has(lineage)) {
         source = { snapshot: seed.snapshotId }
         seedHolder = holder
       } else {

@@ -94,6 +94,7 @@ nothing it writes can ever reach another job or the seed.
    headroom = 1            # idle standbys beyond queued demand, per lineage
    min-warm = 0            # standbys per known lineage even with no demand
    idle-grace-seconds = 900
+   seed-rebuild-interval-seconds = 604800  # weekly cold seed refresh
    ```
 
 5. Add the workflow below, merge, and put `runs-on: [self-hosted, ix]` in
@@ -106,6 +107,12 @@ nothing it writes can ever reach another job or the seed.
 name: ix runners
 
 on:
+  pull_request:
+    types: [closed]
+  push:
+    # Deleted-branch pushes carry `deleted: true`; the action uses that event
+    # to close the branch's outstanding jobs and remove their runner VMs.
+    branches: [main, '**']
   schedule:
     # The steady tick: promotion, retirement, cleanup. Best effort - GitHub
     # drops scheduled runs under load, and a missed tick costs latency,

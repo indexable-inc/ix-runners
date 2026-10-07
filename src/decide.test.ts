@@ -606,6 +606,34 @@ describe("min-warm", () => {
   })
 })
 
+test("a finished runner with an idle registration is retired immediately", () => {
+  const runner = machine(`p-run-${LINEAGE}-finished`, { createdAt: NOW - 1_000_000 })
+  const reg = registration(runner.name, { online: true, busy: false })
+  const plan = steps(world({ machines: [runner], registrations: [reg], queue: {
+    demanded: [],
+    finished: [finished(runner.name)],
+    truncated: false,
+  } }))
+  const retire = only(plan, "retire")
+  expect(retire).toHaveLength(1)
+  expect(retire[0]!.why).toBe("job finished")
+})
+
+test("a scheduled stale seed rebuild cold-boots demand while retaining the old holder", () => {
+  const holder = machine(HOLDER, { status: "stopped" })
+  const plan = steps(
+    world({
+      machines: [holder],
+      seeds: new Map([[holder.id, { holder, snapshotId: "old", snapshotAt: NOW - 120_000 }]]),
+      queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false },
+    }),
+    { ...config, seedRebuildIntervalSeconds: 60 },
+  )
+  expect(only(plan, "delete")).toHaveLength(0)
+  expect(only(plan, "spawn").length).toBeGreaterThan(0)
+  expect(only(plan, "spawn").every((step) => "template" in step.source)).toBe(true)
+})
+
 test("a rev roll deletes every old holder", () => {
   const stale = machine(`p-seed-${LINEAGE}-bbbbbbbb`, { status: "stopped" })
   const staleRetiring = machine(`p-seed-${LINEAGE}-bbbbbbbb-retiring`, { status: "stopped" })
