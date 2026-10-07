@@ -112,7 +112,7 @@ describe("pool mode config", () => {
     expect(config.pool).toBe("baml")
     expect(config.flakeDir).toBe("pools/baml")
     expect(config.templateAttr).toBe("ci-runner")
-    expect(config.regions).toEqual(["us-west-1", "us-east-1"])
+    expect(config.regions).toEqual(["us-west-1"])
     expect(config.maxRunners).toBe(32)
     expect(config.templateRepo).toBe("indexable-inc/ix-runners")
     expect(config.templateRev).toBe(ACTION_REV)

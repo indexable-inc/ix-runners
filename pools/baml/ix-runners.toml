@@ -19,11 +19,11 @@ flake-dir = "pools/baml"
 # The nixosConfigurations attribute the flake exposes.  (default: ci-runner)
 template-attr = "ci-runner"
 
-# ix regions, a lineage homes by hash modulo the list - roughly an even
-# split. Two regions so one region's bad day costs half the lineages, not
-# all of them. A lineage lives in ONE region for its whole life (seed and
+# ix regions. The public API currently serves this pool in us-west-1; keep
+# the list explicit so every lineage is placed in the region where the API
+# accepts creates. A lineage lives in ONE region for its whole life (seed and
 # forks together), so there is never a cross-region restore.
-regions = ["us-west-1", "us-east-1"]
+regions = ["us-west-1"]
 
 # Global cap on concurrently existing runner machines. 32 matches the v1
 # pool's concurrent-job budget: one full baml wave fits without queueing on
