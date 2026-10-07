@@ -11,8 +11,16 @@ const zlib = require("node:zlib");
 const platformKey = `${process.platform}-${process.arch}`;
 const compressed = path.join(__dirname, `../native/ix_sdk-${platformKey}.node.gz`);
 const native = path.join(__dirname, `../native/ix_sdk-${platformKey}.node`);
+const compressedCrypto = path.join(__dirname, "../native/libaws_lc_0_41_0_crypto.so.gz");
+const crypto = path.join(__dirname, "../native/libaws_lc_0_41_0_crypto.so");
 if (!fs.existsSync(compressed)) {
   throw new Error(`@indexable/sdk: unsupported platform ${platformKey}`);
+}
+// Linux's public SDK addon links the vendored aws-lc symbols through a small
+// sibling shared object. Keeping it beside the addon lets its $ORIGIN RUNPATH
+// resolve without relying on a runner-wide library installation.
+if (process.platform === "linux" && !fs.existsSync(crypto)) {
+  fs.writeFileSync(crypto, zlib.gunzipSync(fs.readFileSync(compressedCrypto)), { mode: 0o755 });
 }
 if (!fs.existsSync(native)) {
   fs.writeFileSync(native, zlib.gunzipSync(fs.readFileSync(compressed)), { mode: 0o755 });
