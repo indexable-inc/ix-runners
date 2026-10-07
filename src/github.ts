@@ -179,6 +179,9 @@ export class GitHub {
     try {
       const demanded: DemandedJob[] = []
       const finished: FinishedJob[] = []
+      const cleanupBranches = await this.cleanupBranchesFromEvent()
+      const cleanupBranchSet = new Set(cleanupBranches)
+      const cleanupRunnerNames = new Set<string>()
       // Shared by both loops: a completed job is promotion/deletion evidence
       // wherever it is seen. Jobs of still-active runs MUST feed this too: a
       // long multi-job run finishes (and deregisters) its early jobs many
@@ -213,6 +216,15 @@ export class GitHub {
         for (const [index, jobs] of jobLists.entries()) {
           const run = runs[index]!
           for (const job of jobs) {
+            if (
+              job.runner_name &&
+              job.head_branch !== undefined &&
+              cleanupBranchSet.has(job.head_branch)
+            ) {
+              // A close/delete delivery can race the job's completed webhook.
+              // Carry the runner name directly so this tick can retire it.
+              cleanupRunnerNames.add(job.runner_name)
+            }
             if (job.status === "completed") {
               collectFinished(job, run.trusted)
               continue
@@ -227,13 +239,23 @@ export class GitHub {
       const jobLists = await mapLimit(runs, JOB_READ_CONCURRENCY, (run) => this.runJobs(run.id))
       for (const [index, jobs] of jobLists.entries()) {
         const run = runs[index]!
-        for (const job of jobs) collectFinished(job, run.trusted)
+        for (const job of jobs) {
+          if (
+            job.runner_name &&
+            job.head_branch !== undefined &&
+            cleanupBranchSet.has(job.head_branch)
+          ) {
+            cleanupRunnerNames.add(job.runner_name)
+          }
+          collectFinished(job, run.trusted)
+        }
       }
       return {
         demanded,
         finished,
         truncated,
-        cleanupBranches: await this.cleanupBranchesFromEvent(),
+        cleanupBranches,
+        cleanupRunnerNames: [...cleanupRunnerNames],
       }
     } catch (error) {
       const status = error instanceof HttpError ? error.status : undefined

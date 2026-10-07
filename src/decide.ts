@@ -180,9 +180,12 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   const runnerByName = new Map(runners.map((machine) => [machine.name, machine]))
   const cleanupBranches = new Set(queue.cleanupBranches ?? [])
   const cleanupRunners = new Set(
-    queue.finished
-      .filter((job) => job.headBranch !== undefined && cleanupBranches.has(job.headBranch))
-      .map((job) => job.runnerName),
+    [
+      ...(queue.cleanupRunnerNames ?? []),
+      ...queue.finished
+        .filter((job) => job.headBranch !== undefined && cleanupBranches.has(job.headBranch))
+        .map((job) => job.runnerName),
+    ],
   )
   const promoted = new Set<string>() // machine ids leaving the runner pool
   const winners = new Map<string, { machine: MachineRow; completedAt: number }>()

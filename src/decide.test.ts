@@ -619,6 +619,26 @@ test("a finished runner with an idle registration is retired immediately", () =>
   expect(retire[0]!.why).toBe("job finished")
 })
 
+test("a runner named by a branch-close event is retired before completion evidence arrives", () => {
+  const runner = machine(`p-run-${LINEAGE}-closed`, { createdAt: NOW - 1_000_000 })
+  const reg = registration(runner.name, { online: true, busy: false })
+  const plan = steps(
+    world({
+      machines: [runner],
+      registrations: [reg],
+      queue: {
+        demanded: [],
+        finished: [],
+        truncated: false,
+        cleanupBranches: ["feature/cache-gc"],
+        cleanupRunnerNames: [runner.name],
+      },
+    }),
+  )
+  expect(only(plan, "retire")).toHaveLength(1)
+  expect(only(plan, "retire")[0]!.why).toBe("branch or pull request closed")
+})
+
 test("a scheduled stale seed rebuild cold-boots demand while retaining the old holder", () => {
   const holder = machine(HOLDER, { status: "stopped" })
   const plan = steps(

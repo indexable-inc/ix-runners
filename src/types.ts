@@ -51,6 +51,8 @@ export interface QueueObservation {
   readonly truncated: boolean
   /** A branch or PR close event asks the reconcile to remove its runners. */
   readonly cleanupBranches?: readonly string[]
+  /** Runner names still active when a close/delete event arrived. */
+  readonly cleanupRunnerNames?: readonly string[]
 }
 
 /** A seed holder machine together with its restorable snapshot, if any. */
