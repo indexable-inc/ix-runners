@@ -1,0 +1,10 @@
+{
+  "name": "@indexable/sdk-generated",
+  "type": "commonjs",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": { "default": "./index.js", "types": "./index.d.ts" },
+    "./schemas": "./schemas.ts"
+  }
+}

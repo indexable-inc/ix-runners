@@ -1,0 +1,17 @@
+{
+  "name": "@indexable/sdk",
+  "version": "0.7.4",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "main": "./dist/node.js",
+  "types": "./src/node.ts",
+  "exports": {
+    ".": { "types": "./src/node.ts", "default": "./dist/node.js" },
+    "./node": { "types": "./src/node.ts", "default": "./dist/node.js" },
+    "./schemas": { "types": "./generated/schemas.ts", "default": "./generated/schemas.ts" },
+    "./package.json": "./package.json"
+  },
+  "files": ["src", "generated", "dist", "native"],
+  "peerDependencies": { "zod": "^4" },
+  "peerDependenciesMeta": { "zod": { "optional": true } }
+}
