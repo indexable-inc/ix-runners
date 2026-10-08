@@ -47,13 +47,13 @@ inputs:
   pool:
     description: >
       Name of a pool this repository ships under pools/<name>/ (its
-      ix-runners.toml spec, runner policy, and template flake). The pool's
-      whole definition then travels with the action: cold-boot templates
-      pin THIS repository at the action's own commit, so seeds re-key -
-      and the fleet re-seeds - exactly when the `uses:` pin changes, and a
-      merge in your repository never can. Requires the action to be pinned
-      by full commit sha. Ignored when config-file is set; your repository
-      then needs no checkout step at all.
+      ix-runners.toml spec, which names the runner OCI image). The pool's
+      whole definition then travels with the action: the spec comes from the
+      action's own commit, so seeds re-key - and the fleet re-seeds - exactly
+      when the `uses:` pin moves to a commit naming a new image, and a
+      merge in your repository never can. Pin the action by full commit
+      sha. Ignored when config-file is set; your repository then needs no
+      checkout step at all.
     default: ""
 
   config-file:
@@ -90,12 +90,6 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_CONFIG_FILE: ${{ inputs.config-file }}
         INPUT_POOL: ${{ inputs.pool }}
-        # The ref this action was invoked at (the sha in `uses:` when pinned
-        # by commit) and the repository it lives in. Forwarded to the
-        # reconcile only in `pool` mode, where the templates must pin the
-        # action's own repo at this exact rev.
-        ACTION_REF: ${{ github.action_ref }}
-        ACTION_REPO: ${{ github.action_repository }}
       # --frozen-lockfile: install exactly the hash-pinned dependency set in
       # bun.lock, never whatever the registry resolves to today.
       run: |
@@ -107,11 +101,10 @@ runs:
           # workspace checkout, as it always has.
           export IX_POOL_SPEC="$INPUT_CONFIG_FILE"
         elif [ -n "$INPUT_POOL" ]; then
-          # A pool this repository ships: spec and template come from the
-          # action's own checkout, and the re-seed trigger is the pin.
+          # A pool this repository ships: the spec (and the image it names)
+          # comes from the action's own checkout, and the re-seed trigger
+          # is the pin.
           export IX_POOL_SPEC="$GITHUB_ACTION_PATH/pools/$INPUT_POOL/ix-runners.toml"
-          export IX_RUNNERS_ACTION_REV="$ACTION_REF"
-          export IX_RUNNERS_ACTION_REPO="$ACTION_REPO"
         else
           export IX_POOL_SPEC=".github/ix-runners.toml"
         fi

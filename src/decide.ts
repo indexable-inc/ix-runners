@@ -125,7 +125,7 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
     if (parsed?.kind !== "seed") continue
     if (parsed.rev !== rev8) {
       // The runner config rolled: this lineage restarts from the new
-      // template, and a seed descended from the old config must not leak
+      // image, and a seed descended from the old config must not leak
       // into it. Deleting the holder deletes its snapshot with it.
       steps.push({ do: "delete", machine: holder, why: `rev rolled to ${rev8}` })
       continue
@@ -434,7 +434,7 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
         })
         break
       }
-      let source: { snapshot: string } | { template: string }
+      let source: { snapshot: string } | { image: string }
       let seedHolder: MachineRow | undefined
       if (seed?.snapshotId !== undefined && !coldRebuildLineages.has(lineage)) {
         source = { snapshot: seed.snapshotId }
@@ -448,7 +448,7 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
           break
         }
         coldBudget -= 1
-        source = { template: templateRef(config, world.rev) }
+        source = { image: config.image }
       }
       budget -= 1
       steps.push({
@@ -490,13 +490,4 @@ export function decide(config: Config, world: World, nowMs: number): Plan {
   }
 
   return { steps, notes }
-}
-
-/** The sha-pinned flake reference a cold boot builds. Pinned by rev so the
- * platform's template cache is keyed by exactly the config that produced it.
- * templateRepo, not repo: in pool mode the template lives in the ACTION's
- * repository, while every GitHub call stays on the customer's. */
-function templateRef(config: Config, rev: string): string {
-  const dir = config.flakeDir ? `?dir=${config.flakeDir}` : ""
-  return `github:${config.templateRepo}/${rev}${dir}#${config.templateAttr}`
 }

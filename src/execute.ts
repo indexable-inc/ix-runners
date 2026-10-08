@@ -77,7 +77,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
         return `deleted (${step.why})`
       }
       case "stop": {
-        const holder = ix.machines().connect(step.machine.id)
+        const holder = ix.machines.connect(step.machine.id)
         try {
           await holder.stop()
         } finally {
@@ -95,7 +95,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
   async function spawn(step: Step & { do: "spawn" }): Promise<string> {
     let machine: Machine
     try {
-      machine = await ix.machines().create({
+      machine = await ix.machines.create({
         name: step.name,
         region: step.region,
         ...step.source,
@@ -159,7 +159,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
    * finish. The old holder is never deleted here: that happens next tick,
    * once this machine's snapshot is listed as ready. */
   async function promote(step: Step & { do: "promote" }): Promise<string> {
-    const winner = ix.machines().connect(step.winner.id)
+    const winner = ix.machines.connect(step.winner.id)
     try {
       const snapshotId =
         (await reusableSnapshot(step.winner.id, step.completedAtSec * 1000)) ??
@@ -171,7 +171,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
         // cleanup has not run yet; it is strictly staler than what it would
         // be replaced by, so it goes first.
         await destroyByName(`${step.oldHolder.name}-retiring`)
-        const oldHolder = ix.machines().connect(step.oldHolder.id)
+        const oldHolder = ix.machines.connect(step.oldHolder.id)
         try {
           await oldHolder.rename(`${step.oldHolder.name}-retiring`)
         } finally {
@@ -207,7 +207,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
     )
     try {
       await destroyByName(`${dead.holder.name}-retiring`)
-      const holder = ix.machines().connect(dead.holder.id)
+      const holder = ix.machines.connect(dead.holder.id)
       try {
         await holder.rename(`${dead.holder.name}-retiring`)
       } finally {
@@ -252,7 +252,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
     evidenceFloorMs: number,
   ): Promise<string | undefined> {
     try {
-      const usable = (await ix.snapshots().list(machineId))
+      const usable = (await ix.snapshots.list(machineId))
         .filter((snapshot) => snapshot.createdAt >= evidenceFloorMs)
         .filter(
           (snapshot) =>
@@ -281,7 +281,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
   }
 
   async function destroy(machineId: string): Promise<void> {
-    const handle = ix.machines().connect(machineId)
+    const handle = ix.machines.connect(machineId)
     try {
       await handle.delete()
     } catch (error) {
@@ -295,7 +295,7 @@ export async function execute(ix: Client, gh: GitHub, plan: Plan): Promise<Outco
   async function destroyByName(name: string): Promise<void> {
     let id: string
     try {
-      id = (await ix.machines().get(name)).id
+      id = (await ix.machines.get(name)).id
     } catch (error) {
       if (error instanceof NotFound) return
       throw error

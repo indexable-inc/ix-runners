@@ -51,10 +51,10 @@ const world = await observe(ix, gh, config).catch((error) => {
   process.exit(1)
 })
 
-// The rev this tick derived came from the checkout, and only the default
-// branch may steer the fleet: a workflow_dispatch from a feature branch
-// would roll every holder to a branch rev and let branch state seed the
-// templates. Observation is read-only, so refusing here has cost nothing.
+// The pool spec (and so the image) came from the checkout, and only the
+// default branch may steer the fleet: a workflow_dispatch from a feature
+// branch would roll every holder to a branch's image and let branch state
+// seed the runners. Observation is read-only, so refusing here has cost nothing.
 const ref = process.env.GITHUB_REF_NAME
 if (ref && ref !== world.defaultBranch) {
   logError(
@@ -71,7 +71,7 @@ for (const note of plan.notes) {
   else console.log(note.text)
 }
 console.log(
-  `pool ${config.pool} @ ${world.rev.slice(0, 8)}: ${world.machines.length} machine(s),` +
+  `pool ${config.pool} @ ${config.image} (${world.rev.slice(0, 8)}): ${world.machines.length} machine(s),` +
     ` ${world.registrations.length} registration(s),` +
     ` ${world.queue === null ? "queue unreadable" : `${world.queue.demanded.length} demanded job(s)`},` +
     ` ${plan.steps.length} step(s)`,

@@ -27,5 +27,5 @@ Rules:
   from the people who own the platform.
 - A workaround is acceptable only when the ix fix is decided and in
   flight, the workaround's comment names that fix, and deleting the
-  workaround is part of the fix's definition of done. platform.nix's
-  gai.conf IPv4 preference is the model: "remove once v6 delivery lands."
+  workaround is part of the fix's definition of done. a comment of the form
+  "remove once v6 delivery lands" is the model.

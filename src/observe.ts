@@ -20,7 +20,7 @@ export async function observe(ix: Client, gh: GitHub, config: Config): Promise<W
     resolveRev(config),
     gh.defaultBranch(),
     listCompletely(
-      () => ix.machines().list(),
+      () => ix.machines.list(),
       // Only rows whose NAME parses as this pool's are this pool's: the
       // name codec is the sole membership test, so a human's unrelated
       // machines and other pools on the same account are invisible rather
@@ -76,7 +76,7 @@ export async function observe(ix: Client, gh: GitHub, config: Config): Promise<W
     holders.map(async (holder) => {
       let snapshots
       try {
-        snapshots = await ix.snapshots().list(holder.id)
+        snapshots = await ix.snapshots.list(holder.id)
       } catch (error) {
         if (error instanceof NotFound) {
           gone.add(holder.id)

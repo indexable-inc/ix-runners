@@ -94,8 +94,7 @@ describe("observe survives rows the listing already lied about", () => {
   const config = {
     repo: "acme/app",
     pool: "p",
-    templateAttr: "ci-runner",
-    flakeDir: "",
+    image: "ix/runner:2026-10-08",
     regions: ["us-west-1"],
     runnerLabel: "ix",
     maxRunners: 16,
@@ -105,9 +104,6 @@ describe("observe survives rows the listing already lied about", () => {
     maxColdBoots: 4,
     warmGraceSeconds: 300,
     mayScaleDown: true,
-    templateRepo: "acme/app",
-    // A pinned rev keeps resolveRev off git entirely.
-    templateRev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   } satisfies Config
 
   const gh = {
@@ -125,12 +121,12 @@ describe("observe survives rows the listing already lied about", () => {
     }
     const runner = { id: "r1", name: "p-run-00000000-x1", status: "running", createdAt: 2 }
     const ix = {
-      machines: () => ({ list: async () => [holder, runner] }),
-      snapshots: () => ({
+      machines: { list: async () => [holder, runner] },
+      snapshots: {
         list: async () => {
           throw new NotFound("machine not found")
         },
-      }),
+      },
     } as unknown as Client
     const world = await observe(ix, gh, config)
     expect(world.machines.map((m) => m.id)).toEqual(["r1"])
@@ -145,12 +141,12 @@ describe("observe survives rows the listing already lied about", () => {
       createdAt: 1,
     }
     const ix = {
-      machines: () => ({ list: async () => [holder] }),
-      snapshots: () => ({
+      machines: { list: async () => [holder] },
+      snapshots: {
         list: async () => {
           throw new Error("transport outage")
         },
-      }),
+      },
     } as unknown as Client
     await expect(observe(ix, gh, config)).rejects.toThrow("transport outage")
   })

@@ -6,18 +6,14 @@
 
 import { logError } from "./report.ts"
 
-/** Paths whose last-touching commit defines the runner-config rev. With
- * `flake-dir` set, the runner config IS that directory and only it rolls
- * the fleet. */
-const CONFIG_PATHS = ["nix/", "flake.nix", "flake.lock"]
-
 export interface Config {
   readonly repo: string
   readonly pool: string
-  /** Flake attribute the cold-boot template comes from. */
-  readonly templateAttr: string
-  /** Subflake directory, "" for the repo flake. */
-  readonly flakeDir: string
+  /** OCI image every runner boots from when its lineage has no seed:
+   * `registry/repo:tag` or `registry/repo@sha256:...`, such as
+   * `ix/runner:2026-10-08`. Tags are versions and never move, so the
+   * reference itself names the runner config; `latest` is refused. */
+  readonly image: string
   /** Regions, in spec order; a lineage homes by hash modulo the list. */
   readonly regions: readonly string[]
   /** Marker label that opts a job into this pool. */
@@ -30,7 +26,7 @@ export interface Config {
   readonly minWarm: number
   /** Seconds an idle standby survives past min-warm before retirement. */
   readonly idleGraceSeconds: number
-  /** Cold template boots admitted per tick: the bad-template-rev throttle. */
+  /** Cold image boots admitted per tick: the bad-image throttle. */
   readonly maxColdBoots: number
   /** Seconds between cold seed rebuilds. The old seed remains until a new
    * default-branch promotion replaces it; zero disables this maintenance. */
@@ -39,23 +35,11 @@ export interface Config {
   readonly warmGraceSeconds: number
   /** Only a scheduled tick may retire capacity. */
   readonly mayScaleDown: boolean
-  /** Where the cold-boot template builds from. Equal to `repo` (the
-   * customer repository) normally; the ACTION's own repository in pool
-   * mode, where the pool ships under pools/<name> in this repo. Kept apart
-   * from `repo` because everything GitHub-side - runners, queue, JIT
-   * credentials - stays on the customer repository either way. */
-  readonly templateRepo: string
-  /** The exact commit templates pin in pool mode, "" to derive the rev from
-   * the customer checkout's git history instead. Always a full 40-hex sha
-   * when set: the platform's template cache is keyed by exact rev, and a
-   * mutable ref re-resolves. */
-  readonly templateRev: string
 }
 
 const SPEC_KEYS: Record<string, "string" | "int" | "regions"> = {
   "pool-name": "string",
-  "template-attr": "string",
-  "flake-dir": "string",
+  image: "string",
   region: "string",
   regions: "regions",
   "runner-label": "string",
@@ -156,54 +140,16 @@ function fromSpec(spec: Record<string, unknown>): Config {
     process.exit(1)
   }
 
-  let flakeDir = text("flake-dir", "").trim().replace(/^\.\//, "").replace(/\/+$/, "")
-  if (flakeDir === ".") flakeDir = ""
-  if (flakeDir.startsWith("/") || flakeDir.split("/").includes("..")) {
-    logError(`flake-dir '${flakeDir}' must be a directory inside the repository`)
+  const image = text("image", "").trim()
+  const imageProblem = imageReferenceProblem(image)
+  if (imageProblem) {
+    logError(`the pool spec's \`image\` ${imageProblem}`)
     process.exit(1)
   }
 
   const repo = process.env.GITHUB_REPOSITORY
   if (!repo) {
     logError("GITHUB_REPOSITORY is required")
-    process.exit(1)
-  }
-
-  // -- pool mode -------------------------------------------------------------
-  // Set by the action when the pool is one THIS repository ships (the
-  // `pool:` input): the spec came from the action's own checkout, so the
-  // templates must build from the action's repository at the action's own
-  // pinned commit - not from the customer repo, whose history says nothing
-  // about this pool. The rev-roll law is unchanged in shape: seeds key on
-  // this rev, so bumping the `uses:` pin is what re-seeds the fleet, and a
-  // customer merge never can.
-  const actionRev = (process.env.IX_RUNNERS_ACTION_REV ?? "").trim()
-  const actionRepo = (process.env.IX_RUNNERS_ACTION_REPO ?? "").trim()
-  if (!actionRev !== !actionRepo) {
-    logError(
-      "IX_RUNNERS_ACTION_REV and IX_RUNNERS_ACTION_REPO must be set together" +
-        ` (the action sets both under its \`pool\` input); got rev='${actionRev}',` +
-        ` repo='${actionRepo}'`,
-    )
-    process.exit(1)
-  }
-  if (actionRev && !/^[0-9a-f]{40}$/.test(actionRev)) {
-    logError(
-      `the action ref '${actionRev}' is not a full commit sha. To use the` +
-        " `pool:` input, pin the action by commit" +
-        " (uses: indexable-inc/ix-runners@<40-hex sha>): seeds and the" +
-        " template cache key on that exact rev, and a tag or branch both" +
-        " re-resolves and defeats the action's own pin-by-commit posture.",
-    )
-    process.exit(1)
-  }
-  if (actionRev && !flakeDir) {
-    // A shipped pool always lives in a subflake; this repo's root flake
-    // defines the mechanism, not a bootable machine.
-    logError(
-      "the pool spec came from the action's own checkout but sets no" +
-        ' flake-dir; a shipped pool must name its subflake (flake-dir = "pools/<name>")',
-    )
     process.exit(1)
   }
 
@@ -216,8 +162,7 @@ function fromSpec(spec: Record<string, unknown>): Config {
   return {
     repo,
     pool: text("pool-name", repo.split("/")[1]!.toLowerCase()),
-    templateAttr: text("template-attr", "ci-runner"),
-    flakeDir,
+    image,
     regions,
     runnerLabel: text("runner-label", "ix"),
     maxRunners: int("max-runners", 16),
@@ -228,48 +173,33 @@ function fromSpec(spec: Record<string, unknown>): Config {
     seedRebuildIntervalSeconds: int("seed-rebuild-interval-seconds", 7 * 24 * 60 * 60),
     warmGraceSeconds: 300,
     mayScaleDown: tickMode === "scheduled",
-    templateRepo: actionRepo || repo,
-    templateRev: actionRev,
   }
 }
 
-/** The rev this tick converges toward. In pool mode it IS the action's
- * pinned commit - the customer checkout's git history (which may not even
- * exist under `pool:`) is never consulted. */
+/** Why `image` cannot be a runner image reference, or "" when it can.
+ * A tag names a version and never moves, so a mutable one (`latest`, or no
+ * tag at all) would let the image change under a standing seed. */
+export function imageReferenceProblem(image: string): string {
+  if (!image) {
+    return 'is required (for example image = "ix/runner:2026-10-08")'
+  }
+  if (/\s/.test(image)) return `'${image}' contains whitespace`
+  const [, digest] = image.split("@")
+  if (digest !== undefined) {
+    return /^sha256:[0-9a-f]{64}$/.test(digest) ? "" : `'${image}' has a malformed digest`
+  }
+  const tag = image.slice(image.lastIndexOf("/") + 1).split(":")[1]
+  if (!tag) return `'${image}' has no tag; name a version tag or a @sha256 digest`
+  if (tag === "latest") return `'${image}' uses the mutable tag latest; name a version tag`
+  return ""
+}
+
+/** The identity every seed and holder name keys on: a hash of the image
+ * reference. A new tag re-keys the fleet (every seed of the old image reads as
+ * stale and is deleted, each lineage re-seeds from its next green run); the
+ * customer repository's history never can. */
 export async function resolveRev(config: Config): Promise<string> {
-  if (config.templateRev) return config.templateRev
-  return desiredRev(config.flakeDir)
-}
-
-/** Last commit touching the runner config - NOT GITHUB_SHA: unrelated merges
- * must not roll the fleet, and the template cache is keyed by exact rev. */
-export async function desiredRev(flakeDir: string): Promise<string> {
-  const shallow = await git("rev-parse", "--is-shallow-repository")
-  if (shallow === "true") {
-    // A shallow checkout's grafted boundary commit diffs against the empty
-    // tree, so `git log -- <paths>` names HEAD for EVERY commit and the
-    // whole fleet rolls on every push - silently.
-    logError(
-      "the checkout is shallow, so the runner-config rev cannot be derived." +
-        " Check out with fetch-depth: 0.",
-    )
-    process.exit(1)
-  }
-  const paths = flakeDir ? [flakeDir] : CONFIG_PATHS
-  const rev = await git("log", "-1", "--format=%H", "--", ...paths)
-  if (!/^[0-9a-f]{40}$/.test(rev)) {
-    logError(`no commit touches the runner config (${paths.join(", ")})`)
-    process.exit(1)
-  }
-  return rev
-}
-
-async function git(...args: string[]): Promise<string> {
-  const proc = Bun.spawn(["git", ...args], { stdout: "pipe", stderr: "pipe" })
-  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
-  if (code !== 0) {
-    logError(`git ${args.join(" ")} failed (${code})`)
-    process.exit(1)
-  }
-  return out.trim()
+  const bytes = new TextEncoder().encode(config.image)
+  const digest = await crypto.subtle.digest("SHA-256", bytes)
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")
 }

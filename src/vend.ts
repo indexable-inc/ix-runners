@@ -79,7 +79,7 @@ async function vend(ix: Client): Promise<string> {
     process.exit(1)
   }
   mask(jwt)
-  const vended = await ix.ci().githubRunnerToken(jwt)
+  const vended = await ix.ci.githubRunnerToken(jwt)
   mask(vended.token)
   return vended.token
 }

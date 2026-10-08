@@ -66,7 +66,8 @@ export interface Seed {
 
 /** Everything one tick observed, before any decision is taken. */
 export interface World {
-  /** The runner-config rev every lineage is supposed to descend from. */
+  /** The runner-config identity every lineage is supposed to descend from:
+   * the hash of the pool's image reference (see `resolveRev`). */
   readonly rev: string
   /** The repository's default branch: the only ref allowed to steer. */
   readonly defaultBranch: string
@@ -85,8 +86,9 @@ export type Step =
       readonly do: "spawn"
       readonly name: string
       readonly labels: Labels
-      /** Restore the lineage's seed, or cold-boot the pinned template. */
-      readonly source: { readonly snapshot: string } | { readonly template: string }
+      /** Restore the lineage's seed, or cold-boot the pool's OCI image
+       * (`ix/runner:<tag>`). */
+      readonly source: { readonly snapshot: string } | { readonly image: string }
       /** The holder whose snapshot `source` restores, when it does. The
        * executor retires it in place if the platform refuses the snapshot
        * as not restorable - the only channel back to a stateless next tick

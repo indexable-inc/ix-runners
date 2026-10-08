@@ -1,5 +1,7 @@
 # ix-runners
 
+> **Generated repository. Do not edit here.** This repository is a projection of `satellites/ix-runners` in the private ix monorepo; a bot overwrites it on every ix main push, so direct changes are lost. To propose a change, open an issue; pull requests here are closed automatically.
+
 Ephemeral fork-per-job GitHub Actions runners on [ix](https://ix.dev) VMs.
 
 ## Maintenance mode
@@ -38,7 +40,7 @@ Why it looks this way: [docs/design.md](./docs/design.md).
 flowchart LR
     Q[job queued<br/>runs-on: self-hosted, ix] -->|reconcile tick| S{seed for this<br/>label set?}
     S -->|yes| F[fork the seed<br/>boots in seconds, caches warm]
-    S -->|no, first time| C[cold boot from<br/>your flake's ci-runner]
+    S -->|no, first time| C[cold boot from<br/>the pool's OCI image]
     F --> R[machine runs its ONE job<br/>on a single-job JIT credential]
     C --> R
     R -->|green, on the default branch| P[snapshot the machine:<br/>it becomes the new seed]
@@ -62,31 +64,21 @@ nothing it writes can ever reach another job or the seed.
    permissions have no `administration` scope, so it structurally cannot
    mint runner credentials.
 
-2. Wire the runner template into your `flake.nix`:
+2. Write `.github/ix-runners.toml` and name the runner image, the one key
+   without a default:
 
-   ```nix
-   inputs.nixpkgs-ci.url = "github:NixOS/nixpkgs/nixos-unstable";
-   inputs.ix-runners.url = "github:indexable-inc/ix-runners/<rev>";
-
-   # in outputs:
-   nixosConfigurations.ci-runner = ix-runners.lib.mkRunner {
-     nixpkgs = nixpkgs-ci;                # keep it fresh: GitHub deprecates
-     modules = [ ./nix/ci-runner.nix ];   # old runner versions aggressively
-   };
+   ```toml
+   image = "ix/runner:2026-10-08"   # a version tag of the default runner image
    ```
 
-3. Write your policy in `nix/ci-runner.nix`: the packages your jobs expect
-   on PATH and any job environment.
+   `ix/runner` (git, curl, ca-certificates and the GitHub Actions runner,
+   built for linux/amd64 and linux/arm64) is published by the ix repository's
+   weekly image job. Tags are versions and never move; `latest` is refused.
+   For a different toolchain, build your own image from it and name that
+   reference here (a private registry takes a stored secret).
 
-   ```nix
-   { pkgs, ... }:
-   {
-     services.ix-runner.extraPackages = [ pkgs.docker pkgs.protobuf ];
-   }
-   ```
-
-4. Optionally add `.github/ix-runners.toml`. Every key has a working
-   default; the file exists for the dials:
+3. Optionally set the dials in the same file. Every other key has a working
+   default:
 
    ```toml
    region = "us-west-1"
@@ -97,7 +89,7 @@ nothing it writes can ever reach another job or the seed.
    seed-rebuild-interval-seconds = 604800  # weekly cold seed refresh
    ```
 
-5. Add the workflow below, merge, and put `runs-on: [self-hosted, ix]` in
+4. Add the workflow below, merge, and put `runs-on: [self-hosted, ix]` in
    the workflows you want on the fleet. The `ix` marker label is what opts
    a job in; every distinct label set you use becomes its own seed lineage.
 
@@ -149,11 +141,6 @@ jobs:
       # $GITHUB_ENV.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The runner-config rev is the last commit touching nix/ (or your
-          # flake-dir), so the history has to be here. Under a shallow
-          # checkout every commit looks like a config change and the fleet
-          # would roll on every push; the reconcile detects this and refuses.
-          fetch-depth: 0
           persist-credentials: false
 
       - uses: indexable-inc/ix-runners@<rev>
@@ -165,25 +152,23 @@ jobs:
 ### Pool mode: pools shipped in this repository
 
 A pool ix maintains for you lives under [`pools/`](./pools) in this repo -
-spec (`ix-runners.toml`), runner policy, and template flake - and your
+its spec (`ix-runners.toml`, which names the runner image) - and your
 repository carries only the workflow. Pass `pool: <name>` instead of
 `config-file`:
 
 ```yaml
-      - uses: indexable-inc/ix-runners@<sha>   # full commit sha, required
+      - uses: indexable-inc/ix-runners@<sha>   # pin by full commit sha
         with:
           ix-token: ${{ secrets.IX_TOKEN }}
           runner-pat: ${{ secrets.RUNNER_PAT }}
           pool: baml
 ```
 
-In pool mode the cold-boot template pins THIS repository at the action's
-own commit, and seeds key on that same rev - so bumping the `uses:` sha is
-what re-seeds the fleet (the ordinary config-change law, with the pin as
-the config), and a merge in your repository never can. The reconcile reads
-nothing from your working tree: drop the checkout step (and with it the
-`fetch-depth: 0` requirement) from the workflow above, and the `push`
-trigger stops mattering - `schedule`, `workflow_dispatch` and
+In pool mode the spec comes from the action's own commit, and seeds key on
+the image reference in it - so bumping the `uses:` sha to one that names a
+new image tag is what re-seeds the fleet, and a merge in your repository
+never can. The reconcile reads nothing from your working tree: drop the
+checkout step from the workflow above, and the `push` trigger stops mattering - `schedule`, `workflow_dispatch` and
 `workflow_run` are enough.
 
 ## How it works
@@ -191,7 +176,7 @@ trigger stops mattering - `schedule`, `workflow_dispatch` and
 Warmth is copy-on-write. A lineage's *seed* is an immutable ix snapshot
 (disk and memory) of the machine that ran its last green default-branch
 job. Every runner is a fork of that snapshot: it boots in about a second
-with everything the green run left behind - the nix store, `$HOME`
+with everything the green run left behind - the toolchains, `$HOME`
 caches, compiled artifacts - already on disk, and its writes land in its
 own private copy-on-write layer. Nothing a job writes can reach the seed
 or any sibling fork; a fork's writes die with the fork. The seed only
@@ -203,20 +188,20 @@ starts where the last green run stopped.
 Each tick is level-based and stateless: it observes the machines, the
 runner registrations and the job queue fresh, decides from that snapshot
 alone, and converges. Every machine's role rides its NAME
-(`<pool>-run-<lineage>-<nonce>`, `<pool>-seed-<lineage>-<rev>`), so there
+(`<pool>-run-<lineage>-<nonce>`, `<pool>-seed-<lineage>-<image-hash>`), so there
 is no state store to disagree with reality.
 
 - Demanded job: a machine is spawned for it (plus `headroom`) - forked
-  from its lineage's seed, or booted cold from your flake when the lineage
+  from its lineage's seed, or booted cold from the pool's image when the lineage
   has none yet. Each machine gets its own single-job JIT credential,
   minted for it by name and written to it alone.
 - Green default-branch job: the machine that ran it is snapshotted and
   swapped in as its lineage's seed before being stopped. Only
   default-branch successes promote - PR state never enters a seed.
 - Finished runner (its one-job registration is gone): deleted.
-- Config change under `nix/`/`flake.nix`/`flake.lock` (or your
-  `flake-dir`): every seed of the old rev reads as absent and is deleted;
-  each lineage re-seeds from its next green run on the new template.
+- A new `image` reference in the spec: every seed of the old image reads
+  as absent and is deleted; each lineage re-seeds from its next green run
+  on the new image.
 - Idle standby past `idle-grace-seconds`: deregistered and deleted -
   GitHub refuses (422) to deregister a runner that is mid-job, and that
   refusal is the one lock in the system.
@@ -255,22 +240,16 @@ happened.
 
 ## What differs from ubuntu-latest
 
-The runner VM is NixOS, tuned for parity where it is cheap and honest
-where it is not:
+The runner VM boots the OCI image the spec names (`ix/runner`: Debian-based,
+  the GitHub Actions runner preinstalled):
 
-- Foreign dynamically linked binaries (rustup/mise toolchains, prebuilt
-  node, playwright browsers) run via nix-ld + envfs with a generous
-  library set; a missing library fails at load time - file an issue,
-  additions are one line.
-- No sudo: the job user cannot elevate. Install into `$HOME` or ship the
-  package in your nix policy instead.
-- `$HOME` (/home/runner) is the warmth: whatever a green default-branch
+- Tooling is whatever the image carries: anything a job expects "to just be
+  there" (Go, docker, protoc) must be in your own image built from
+  `ix/runner`, or installed by the job.
+- `$HOME` is the warmth: whatever a green default-branch
   run leaves there is what the next fork of that lineage boots with
   (copy-on-write, so ten concurrent forks share the seed's bytes and
   none can dirty another).
-- Preinstalled tooling comes from your nix policy, not from a hosted
-  image: anything a job expects "to just be there" (Go, docker, protoc)
-  must be listed there.
 - `token-source: ix` deletes the PAT entirely: the reconcile trades its
   OIDC identity (`permissions: id-token: write`) for a repo-scoped App
   installation token minted by ix. The repository comes from the OIDC

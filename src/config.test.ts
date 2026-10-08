@@ -1,22 +1,12 @@
-/** The config seam pool mode rides: where the template repo and rev come
- * from, and the refusals that keep a mutable or half-set pin out of the
- * fleet. Exit paths are tested by mocking process.exit to throw; the
- * resolveRev bypass is tested the hard way - in a directory where any git
- * consultation would kill the run. */
+/** The config seam the image rides: the `image` key, the refusals that keep a
+ * mutable or missing reference out of the fleet, and the identity seeds key
+ * on. Exit paths are tested by mocking process.exit to throw. */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Config } from "./config.ts"
-import { loadConfig, resolveRev } from "./config.ts"
+import { imageReferenceProblem, loadConfig, resolveRev } from "./config.ts"
 
-const ACTION_REV = "4751cbbab884173b3a3bcee7c19808e89a18bb37"
-const POOL_MODE = {
-  FLAKE_DIR: "pools/baml",
-  IX_RUNNERS_ACTION_REV: ACTION_REV,
-  IX_RUNNERS_ACTION_REPO: "indexable-inc/ix-runners",
-}
+const IMAGE = "ix/runner:2026-10-08"
 
 /** Every env key the config reads; managed as a set so one test's leftovers
  * cannot leak into the next. */
@@ -25,12 +15,10 @@ const MANAGED = [
   "GITHUB_EVENT_NAME",
   "TICK_MODE",
   "IX_POOL_SPEC",
-  "FLAKE_DIR",
+  "IMAGE",
   "REGION",
   "REGIONS",
   "POOL_NAME",
-  "IX_RUNNERS_ACTION_REV",
-  "IX_RUNNERS_ACTION_REPO",
 ] as const
 
 const saved = new Map<string, string | undefined>()
@@ -64,72 +52,46 @@ async function refusal(env: Record<string, string>): Promise<void> {
   }
 }
 
-describe("pool mode config", () => {
-  test("without the action env, templates stay on the customer repo", async () => {
-    setEnv({})
+describe("image config", () => {
+  test("the image comes from the spec and nothing else", async () => {
+    setEnv({ IMAGE })
     const config = await loadConfig()
-    expect(config.templateRepo).toBe("example/baml")
-    expect(config.templateRev).toBe("")
-  })
-
-  test("the action env pins the template repo and rev", async () => {
-    setEnv(POOL_MODE)
-    const config = await loadConfig()
-    expect(config.templateRepo).toBe("indexable-inc/ix-runners")
-    expect(config.templateRev).toBe(ACTION_REV)
+    expect(config.image).toBe(IMAGE)
     // GitHub-side identity is still the customer repository.
     expect(config.repo).toBe("example/baml")
   })
 
-  test("a mutable action ref is refused", async () => {
-    // Seeds and the template cache key on the exact rev; a tag or branch
-    // re-resolves. Uppercase hex is not what GitHub emits either.
-    for (const ref of ["main", "v2", "4751cbb", ACTION_REV.toUpperCase()]) {
-      await refusal({ ...POOL_MODE, IX_RUNNERS_ACTION_REV: ref })
+  test("a missing, untagged or mutable image is refused", async () => {
+    await refusal({})
+    for (const image of ["ix/runner", "ix/runner:latest", "ix/runner@sha256:abc", "ix/runner :1"]) {
+      await refusal({ IMAGE: image })
     }
   })
 
-  test("the action env pair must arrive together", async () => {
-    await refusal({ FLAKE_DIR: "pools/baml", IX_RUNNERS_ACTION_REV: ACTION_REV })
-    await refusal({ FLAKE_DIR: "pools/baml", IX_RUNNERS_ACTION_REPO: "indexable-inc/ix-runners" })
-  })
-
-  test("pool mode requires a subflake", async () => {
-    // This repo's root flake defines the mechanism, not a bootable machine.
-    await refusal({ ...POOL_MODE, FLAKE_DIR: "" })
+  test("tags and full digests are accepted", () => {
+    expect(imageReferenceProblem(IMAGE)).toBe("")
+    expect(imageReferenceProblem("registry.ix.dev:443/ix/runner:2026-10-08")).toBe("")
+    expect(imageReferenceProblem(`ix/runner@sha256:${"a".repeat(64)}`)).toBe("")
   })
 
   test("the shipped baml spec loads through the real code path", async () => {
     // pools/baml/ix-runners.toml is exactly what `pool: baml` resolves to;
     // loading it here keeps the shipped file inside the spec vocabulary -
     // an unknown key there would take down every tick of the pool at once.
-    setEnv({
-      ...POOL_MODE,
-      FLAKE_DIR: "", // the file carries flake-dir; env must not shadow it
-      IX_POOL_SPEC: join(import.meta.dir, "..", "pools", "baml", "ix-runners.toml"),
-    })
+    setEnv({ IX_POOL_SPEC: join(import.meta.dir, "..", "pools", "baml", "ix-runners.toml") })
     const config = await loadConfig()
     expect(config.pool).toBe("baml")
-    expect(config.flakeDir).toBe("pools/baml")
-    expect(config.templateAttr).toBe("ci-runner")
+    expect(config.image).toMatch(/^ix\/runner:\d{4}-\d{2}-\d{2}$/)
     expect(config.regions).toEqual(["us-west-1"])
     expect(config.maxRunners).toBe(32)
-    expect(config.templateRepo).toBe("indexable-inc/ix-runners")
-    expect(config.templateRev).toBe(ACTION_REV)
   })
 
-  test("resolveRev never consults git in pool mode", async () => {
-    // Run in a directory that is NOT a git repository, with process.exit
-    // unmocked: if the bypass is broken, desiredRev's git call fails and
-    // exits this whole test run - a hard failure, not a soft assert.
-    setEnv(POOL_MODE)
-    const config: Config = { ...(await loadConfig()) }
-    const before = process.cwd()
-    process.chdir(mkdtempSync(join(tmpdir(), "ix-runners-nogit-")))
-    try {
-      expect(await resolveRev(config)).toBe(ACTION_REV)
-    } finally {
-      process.chdir(before)
-    }
+  test("the seed identity is a pure function of the image reference", async () => {
+    setEnv({ IMAGE })
+    const config = await loadConfig()
+    const rev = await resolveRev(config)
+    expect(rev).toMatch(/^[0-9a-f]{64}$/)
+    expect(await resolveRev({ ...config })).toBe(rev)
+    expect(await resolveRev({ ...config, image: "ix/runner:2026-10-14" })).not.toBe(rev)
   })
 })

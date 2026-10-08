@@ -45,6 +45,7 @@ function fakeIx(options: {
   deleteFails?: boolean
 }) {
   const calls: string[] = []
+  const createArgs: Record<string, unknown>[] = []
   const handle = (id: string) => ({
     snapshot: async () => {
       calls.push(`snapshot:${id}`)
@@ -74,9 +75,10 @@ function fakeIx(options: {
     id: () => id,
   })
   const ix = {
-    machines: () => ({
+    machines: {
       connect: (id: string) => handle(id),
-      create: async () => {
+      create: async (args: Record<string, unknown>) => {
+        createArgs.push(args)
         calls.push("create:new")
         if (options.createFails) throw options.createFails
         return handle("new")
@@ -86,14 +88,14 @@ function fakeIx(options: {
         calls.push(`get:${name}`)
         throw new NotFound()
       },
-    }),
-    snapshots: () => ({
+    },
+    snapshots: {
       list: async (machineId: string) => {
         calls.push(`list:${machineId}`)
         if (options.listFails) throw new Error("listing outage")
         return options.snapshots ?? []
       },
-    }),
+    },
   } as unknown as Client
   const gh = {
     mintJitConfig: async () => {
@@ -101,7 +103,7 @@ function fakeIx(options: {
       return "jit-blob"
     },
   } as unknown as GitHub
-  return { ix, gh, calls }
+  return { ix, gh, calls, createArgs }
 }
 
 /** The winner's green job completed ten minutes ago: snapshots the tests
@@ -227,12 +229,21 @@ describe("spawn handle ownership", () => {
         do: "spawn",
         name: "p-run-aaaaaaaa-x9",
         labels: ["ix"],
-        source: { template: "github:acme/app/rev#ci-runner" },
+        source: { image: "ix/runner:2026-10-08" },
         region: "us-west-1",
       },
     ],
     notes: [],
   }
+
+  test("a cold spawn creates the machine from an image reference, never a template", async () => {
+    const { ix, gh, createArgs } = fakeIx({})
+    await execute(ix, gh, spawnPlan)
+    expect(createArgs).toEqual([
+      { name: "p-run-aaaaaaaa-x9", region: "us-west-1", image: "ix/runner:2026-10-08" },
+    ])
+    expect("template" in createArgs[0]!).toBe(false)
+  })
 
   test("a failed mint DELETES the half-spawned machine explicitly, then closes the handle", async () => {
     const { ix, gh, calls } = fakeIx({ jitFails: true })
@@ -307,14 +318,14 @@ describe("dead-seed fallback", () => {
   })
 
   test("an InvalidArgument on a COLD boot retires nothing (there is no seed)", async () => {
-    const { ix, gh, calls } = fakeIx({ createFails: new InvalidArgument("bad template ref") })
+    const { ix, gh, calls } = fakeIx({ createFails: new InvalidArgument("bad image ref") })
     const plan: Plan = {
       steps: [
         {
           do: "spawn",
           name: "p-run-aaaaaaaa-x1",
           labels: ["ix"],
-          source: { template: "github:acme/app/rev#ci-runner" },
+          source: { image: "ix/runner:2026-10-08" },
           region: "us-west-1",
         },
       ],

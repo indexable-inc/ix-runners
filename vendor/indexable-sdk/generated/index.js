@@ -32,11 +32,14 @@ function normalizeArg(value) {
  *
  * The variants are the **stable error codes** from
  * `docs/sdk-design/STANDARDS.md` section 5, not a mirror of the SDK's internal
- * enum. That is deliberate: `ix-sdk-wire` freezes 35 fine-grained boundary
+ * enum. That is deliberate: `ix-sdk-wire` freezes fine-grained boundary
  * kinds, which are the right granularity for a numeric wire code and the
- * wrong granularity for `except`. Users catch the eight-or-so conditions
- * they can actually act on; the precise frozen code is preserved in the
- * message so a support ticket still identifies the exact condition.
+ * wrong granularity for `except`. Users catch the conditions they can
+ * actually act on; the precise frozen code is preserved in the message so a
+ * support ticket still identifies the exact condition. The image failures
+ * are the exception: each has its own class, because a typo in a reference,
+ * a missing credential and an unreachable registry each call for a
+ * different fix.
  *
  * unibind carries only variant identity and `Display` text across the
  * boundary -- no structured fields -- so the variant name IS the code. In
@@ -141,6 +144,101 @@ class Internal extends IxError {
     this.name = "Internal";
   }
 }
+/**
+ * The image reference does not parse as an OCI reference. Not
+ * retryable: the same reference fails the same way.
+ */
+class ImageInvalid extends IxError {
+  constructor(message) {
+    super(message, "ImageInvalid");
+    this.name = "ImageInvalid";
+  }
+}
+/**
+ * The registry has no manifest for that reference: the repository or
+ * the tag does not exist, or is not visible without credentials the
+ * registry will confirm.
+ */
+class ImageNotFound extends IxError {
+  constructor(message) {
+    super(message, "ImageNotFound");
+    this.name = "ImageNotFound";
+  }
+}
+/**
+ * The registry refused the credentials, or `registry_secret` is
+ * missing or bound to a different registry host.
+ */
+class ImageAuth extends IxError {
+  constructor(message) {
+    super(message, "ImageAuth");
+    this.name = "ImageAuth";
+  }
+}
+/**
+ * The image publishes no manifest for the requested `arch`. The message
+ * lists the architectures it does publish.
+ */
+class ImageNotAvailableForArch extends IxError {
+  constructor(message) {
+    super(message, "ImageNotAvailableForArch");
+    this.name = "ImageNotAvailableForArch";
+  }
+}
+/**
+ * The image is over a platform limit (compressed size, unpacked size,
+ * layer count, manifest or config size, pull deadline). The message
+ * names which limit and by how much.
+ */
+class ImageTooLarge extends IxError {
+  constructor(message) {
+    super(message, "ImageTooLarge");
+    this.name = "ImageTooLarge";
+  }
+}
+/**
+ * The registry could not be reached after the platform's retries.
+ * Retryable.
+ */
+class RegistryUnavailable extends IxError {
+  constructor(message) {
+    super(message, "RegistryUnavailable");
+    this.name = "RegistryUnavailable";
+  }
+}
+/**
+ * The platform cannot serve this registry in this build. Not a typo in
+ * the reference: the same reference works once the platform can reach
+ * that registry.
+ */
+class ImageUnsupported extends IxError {
+  constructor(message) {
+    super(message, "ImageUnsupported");
+    this.name = "ImageUnsupported";
+  }
+}
+/**
+ * A restore, fork or snapshot create asked for another architecture
+ * than the state was captured on. There is no cross-architecture
+ * translation; create from an image instead.
+ */
+class ImageArchMismatch extends IxError {
+  constructor(message) {
+    super(message, "ImageArchMismatch");
+    this.name = "ImageArchMismatch";
+  }
+}
+/**
+ * A machine created with an explicit `cpu` class was restored on a host
+ * of another class. Machines without `cpu` restore on any host of their
+ * architecture.
+ */
+class CpuClassMismatch extends IxError {
+  constructor(message) {
+    super(message, "CpuClassMismatch");
+    this.name = "CpuClassMismatch";
+  }
+}
 
 // Rust `<enum>` and `<variant>` names as spelled inside rejection reasons.
 const errorVariants = {
@@ -156,6 +254,15 @@ const errorVariants = {
     Cancelled: (message) => new Cancelled(message),
     CommandFailed: (message) => new CommandFailed(message),
     Internal: (message) => new Internal(message),
+    ImageInvalid: (message) => new ImageInvalid(message),
+    ImageNotFound: (message) => new ImageNotFound(message),
+    ImageAuth: (message) => new ImageAuth(message),
+    ImageNotAvailableForArch: (message) => new ImageNotAvailableForArch(message),
+    ImageTooLarge: (message) => new ImageTooLarge(message),
+    RegistryUnavailable: (message) => new RegistryUnavailable(message),
+    ImageUnsupported: (message) => new ImageUnsupported(message),
+    ImageArchMismatch: (message) => new ImageArchMismatch(message),
+    CpuClassMismatch: (message) => new CpuClassMismatch(message),
   },
 };
 
@@ -236,8 +343,10 @@ const nativeHandle = Symbol("unibind.nativeHandle");
 /**
  * The ix API client.
  *
- * Credential resolution is the same in every language (P9): the explicit
- * argument wins, then `IX_TOKEN`, then `~/.config/ix/config.toml`.
+ * Credential resolution is the same in every language (P9) and in the CLI:
+ * the explicit argument wins, then `IX_TOKEN`, then the login `ix login`
+ * stored in `~/.config/ix/config.toml`. A person signs in once with
+ * `ix login`; `IX_TOKEN` is for CI and servers.
  */
 class Client {
   #handle;
@@ -277,36 +386,36 @@ class Client {
   }
 
   /** The `keys` namespace. */
-  keys(...args) {
+  get keys() {
     try {
-      return new Keys(nativeHandle, this.#handle.keys(...args.map(normalizeArg)));
+      return new Keys(nativeHandle, this.#handle.keys());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
-  /** The `vms` namespace. */
-  machines(...args) {
+  /** The `machines` namespace. */
+  get machines() {
     try {
-      return new Machines(nativeHandle, this.#handle.machines(...args.map(normalizeArg)));
+      return new Machines(nativeHandle, this.#handle.machines());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `snapshots` namespace. */
-  snapshots(...args) {
+  get snapshots() {
     try {
-      return new Snapshots(nativeHandle, this.#handle.snapshots(...args.map(normalizeArg)));
+      return new Snapshots(nativeHandle, this.#handle.snapshots());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `usage` namespace. */
-  usage(...args) {
+  get usage() {
     try {
-      return new Usage(nativeHandle, this.#handle.usage(...args.map(normalizeArg)));
+      return new Usage(nativeHandle, this.#handle.usage());
     } catch (error) {
       throw decodeError(error);
     }
@@ -329,11 +438,11 @@ class Client {
 
   /**
    * The `secrets` namespace: the ACCOUNT's secret store. One machine's own
-   * copies are `machines().connect(id).secrets()`.
+   * copies are `machines.connect(id).secrets`.
    */
-  secrets(...args) {
+  get secrets() {
     try {
-      return new Secrets(nativeHandle, this.#handle.secrets(...args.map(normalizeArg)));
+      return new Secrets(nativeHandle, this.#handle.secrets());
     } catch (error) {
       throw decodeError(error);
     }
@@ -343,72 +452,63 @@ class Client {
    * The `ci` namespace: credentials for runner pools that run CI on ix
    * machines.
    */
-  ci(...args) {
+  get ci() {
     try {
-      return new Ci(nativeHandle, this.#handle.ci(...args.map(normalizeArg)));
+      return new Ci(nativeHandle, this.#handle.ci());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `credits` namespace: model spend paid in ix credits. */
-  credits(...args) {
+  get credits() {
     try {
-      return new Credits(nativeHandle, this.#handle.credits(...args.map(normalizeArg)));
+      return new Credits(nativeHandle, this.#handle.credits());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `groups` namespace: private networks between machines. */
-  groups(...args) {
+  get groups() {
     try {
-      return new Groups(nativeHandle, this.#handle.groups(...args.map(normalizeArg)));
+      return new Groups(nativeHandle, this.#handle.groups());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `previews` namespace: disposable copies of a deployment. */
-  previews(...args) {
+  get previews() {
     try {
-      return new Previews(nativeHandle, this.#handle.previews(...args.map(normalizeArg)));
+      return new Previews(nativeHandle, this.#handle.previews());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `volumes` namespace: persistent disks and their snapshots. */
-  volumes(...args) {
+  get volumes() {
     try {
-      return new Volumes(nativeHandle, this.#handle.volumes(...args.map(normalizeArg)));
+      return new Volumes(nativeHandle, this.#handle.volumes());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `observability` namespace: traces and logs, correlated by id. */
-  observability(...args) {
+  get observability() {
     try {
-      return new Observability(nativeHandle, this.#handle.observability(...args.map(normalizeArg)));
+      return new Observability(nativeHandle, this.#handle.observability());
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /** The `regions` namespace. */
-  regions(...args) {
+  get regions() {
     try {
-      return new Regions(nativeHandle, this.#handle.regions(...args.map(normalizeArg)));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /** The `templates` namespace. */
-  templates(...args) {
-    try {
-      return new Templates(nativeHandle, this.#handle.templates(...args.map(normalizeArg)));
+      return new Regions(nativeHandle, this.#handle.regions());
     } catch (error) {
       throw decodeError(error);
     }
@@ -419,7 +519,7 @@ class Client {
  * API keys: one capped credential per user or per agent, over the
  * account's single balance.
  *
- * Reached as `client.keys()`, never constructed directly.
+ * Reached as `client.keys`, never constructed directly.
  */
 class Keys {
   #handle;
@@ -592,7 +692,7 @@ class Keys {
 /**
  * Spend ix credits directly.
  *
- * Reached as `client.credits()`, never constructed directly. The calling key
+ * Reached as `client.credits`, never constructed directly. The calling key
  * is charged against its own spend cap, so a key minted with the scope
  * `credits:burn,unburn` and a cap can spend up to its cap and nothing else.
  */
@@ -657,7 +757,7 @@ class Credits {
  * The `vms` namespace: the account's machines as data.
  *
  * Records come back from `list`/`get`; `connect` is how you get a
- * {@link Machine} that can act on one. Reached as `client.machines()`.
+ * {@link Machine} that can act on one. Reached as `client.machines`.
  */
 class Machines {
   #handle;
@@ -745,9 +845,9 @@ class Machines {
   }
 
   /** The `migrations` namespace: moving a running machine between nodes. */
-  migrations(...args) {
+  get migrations() {
     try {
-      return new Migrations(nativeHandle, this.#handle.migrations(...args.map(normalizeArg)));
+      return new Migrations(nativeHandle, this.#handle.migrations());
     } catch (error) {
       throw decodeError(error);
     }
@@ -763,7 +863,7 @@ class Machines {
    * The boot wait happens on the server beside the guest, so readiness
    * arrives one round trip after the guest reaches it rather than one
    * poll period plus one round trip. Nothing here polls and there is
-   * no interval to tune. A template create is ONE request end to end;
+   * no interval to tune. An image create is ONE request end to end;
    * a snapshot restore is two, because `vm.restore` has no readiness
    * budget of its own and the wait is a second held call.
    *
@@ -774,40 +874,39 @@ class Machines {
    * deduplicating -- see the field for what counts as a parameter.
    *
    * One verb for every shape `ix new` accepts. The target is chosen by
-   * the `template` and `snapshot` fields in `options`:
+   * the `image` and `snapshot` fields in `options`:
    *
-   * - neither: the platform base template, what a bare `ix new` boots;
-   * - `template` with a cached-template reference (`ix/base:latest`):
-   *   boot that template;
-   * - `template` with a sha-pinned flake reference
-   *   (`github:owner/repo/<rev>#config`): boot that template, BUILDING it
-   *   first when the region has no cached image for its rev yet. The
-   *   first create runs the full pipeline -- boot a machine from the base
-   *   image, `nix build` in-guest, publish the cache image, activate --
-   *   and every later create of the same rev boots warm from the cache.
-   *   Builds are single-flight region-wide: a create that finds another
-   *   caller's build of the same rev in flight watches its log and then
-   *   boots its own machine from the finished cache. The reference must
-   *   be PINNED to a full commit rev; resolving a branch needs forge
-   *   credentials, which is `ix new`'s job on a machine a person is
-   *   sitting at -- a CI caller pins the rev it just pushed. Building
-   *   refuses `idempotency_key` (the build itself is the dedupe);
+   * - neither: the platform default image (`ix/debian:12`), what a bare
+   *   `ix new` boots;
+   * - `image`: boot that OCI image reference (`ix/debian:12`,
+   *   `ghcr.io/owner/repo:1.2`, `registry/repo@sha256:...`). The control
+   *   plane resolves the reference to a per-architecture manifest digest
+   *   once, at create, and `machine.info().imageDigest` reads it back.
+   *   `arch` and `registry_secret` apply here: the first picks the
+   *   architecture (absent takes the architecture of the cheapest node with
+   *   capacity, and `machine.info().arch` reads the answer back), the second
+   *   names an account secret holding registry credentials for a private
+   *   image. `entrypoint` and `command` override the image's ENTRYPOINT and
+   *   CMD (absent keeps the image's, an empty list clears it);
    * - `snapshot`: warm-restore that snapshot into a NEW machine, leaving the
    *   captured one untouched.
    *
    * Two optional fields rather than one tagged target because the
    * boundary carries no data enums, and because the alternative -- one
    * string classified by shape, as the CLI must do -- would boot an
-   * template named after a UUID for anyone who passed a snapshot id in the
-   * wrong slot. The flake shape shares the `template` field because a
-   * flake reference IS a template source, and the two shapes cannot
-   * collide (a flake ref is detected by scheme or `#`, which no cached
-   * template name carries).
+   * image named after a UUID for anyone who passed a snapshot id in the
+   * wrong slot.
    *
-   * A snapshot restore inherits the captured machine's template, ports,
+   * A snapshot restore inherits the captured machine's image, ports,
    * networking and secrets, so `env`, `ipv4`, `secret_env`,
-   * `secret_files` and `groups` are REFUSED with it rather than
-   * silently ignored. `name` and `region` apply to every target.
+   * `secret_files`, `groups`, `arch`, `registry_secret`, `entrypoint` and
+   * `command` are REFUSED
+   * with it rather than silently ignored. `name` and `region` apply to
+   * every target.
+   *
+   * `lifetime` and `ttl` decide what releasing the returned handle does:
+   * an ephemeral machine is deleted then (and by the platform at its
+   * deadline regardless), a persistent one is left running.
    *
    * # Errors
    *
@@ -835,11 +934,9 @@ class Machines {
    * is only how the outcome arrives. Iterate to the terminal frame and
    * read {@link MachineProgress.machineId} to get the machine -- a frame,
    * not a return value, because a boundary stream yields one item type.
-   * A template-building create (a pinned flake reference in `template`)
-   * streams its build here too: `phase` frames for the pipeline's coarse
-   * steps and `output` frames carrying the live in-guest build log,
-   * which is the stream to reach for when a first boot takes as long as
-   * a `nix build` does.
+   * A first boot of an image the platform has not seen yet resolves,
+   * pulls and unpacks it first; those steps stream here as frames, which
+   * is the stream to reach for when a cold create takes a while.
    * That frame also carries `deduplicated` and `readiness`, which is
    * where the two questions {@link Machines.create} answers by raising get
    * answered here instead: a budget that ran out ends the stream with a
@@ -911,10 +1008,10 @@ class Machines {
  * the id string.
  *
  * Scoped: `await using` in TypeScript and `async with` in Python delete a
- * machine this handle booted, and release without deleting one it adopted
- * through {@link Machine.attach}. Bind it with a plain `const` or `=` when the
- * machine is meant to outlive the program -- that is what the two spellings
- * are for, and it is the only thing that decides.
+ * machine only when this handle created it with an ephemeral lifetime. A
+ * persistent machine is released, never deleted, and so is one adopted
+ * through {@link Machine.attach} or `connect`. `lifetime` is the statement of
+ * intent; the scope form only says when the handle is released.
  */
 class Machine {
   #handle;
@@ -928,57 +1025,32 @@ class Machine {
   }
 
   /**
-   * Boot a machine from a template.
+   * Create a machine and return a handle onto it.
    *
    * The short way in: no client to build, no namespace to walk. The
    * credential comes from the environment the way
    * `Client::new(None, None)` resolves it, so `IX_TOKEN` or
-   * `ix login` is enough.
+   * `ix login` is enough. Takes exactly what `machines.create` takes,
+   * `image`, `snapshot`, `arch`, `cpu`, `registry_secret`, `entrypoint`,
+   * `command` and `lifetime` included; `Machine.create({})` boots a
+   * persistent machine from the platform default image (`ix/debian:12`),
+   * and `Machine.create({ image: "ubuntu:24.04" })` boots any OCI image.
    *
-   * `template` is what `ix new` accepts: a template name from
-   * `ix templates ls`, or a flake reference such as
-   * `github:owner/repo#config`, whose first boot builds the
-   * configuration and caches it as a bootable template per region.
-   *
-   * Not an OCI image reference. Booting one directly was a user
-   * surface before templates replaced it (ix#9399), and passing one
-   * here fails with `NotFound`; `ix image` is admin plumbing now.
-   *
-   * This handle owns the machine it booted, so releasing the handle
-   * deletes it.
+   * Releasing the handle deletes the machine only when it was created
+   * ephemeral; see {@link Machine.close}.
    *
    * # Errors
    *
-   * {@link Unauthorized} when no credential resolves,
-   * {@link NotFound} when nothing matches `template`, and
-   * whatever {@link Machines.create} raises for the request itself.
+   * {@link Unauthorized} when no credential resolves, the typed
+   * image errors ({@link ImageInvalid}, {@link ImageNotFound},
+   * {@link ImageAuth}, {@link ImageNotAvailableForArch},
+   * {@link ImageTooLarge}, {@link RegistryUnavailable}) when the
+   * reference cannot be resolved or pulled, and whatever
+   * {@link Machines.create} raises for the request itself.
    */
-  static async template(...args) {
+  static async create(...args) {
     try {
-      return new Machine(nativeHandle, await native.Machine.template(...args.map(normalizeArg)));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Boot a machine on the NixOS base image.
-   *
-   * The platform's own image rather than an OCI one, which is what
-   * `switch` builds onto: the machine converges on a NixOS
-   * configuration instead of running an image's entrypoint.
-   *
-   * Owns what it boots, exactly as {@link Machine.template} does, and
-   * waits for the machine to answer before returning unless
-   * `options.ready_wait_ms` says otherwise.
-   *
-   * # Errors
-   *
-   * As {@link Machine.template}, minus the template argument.
-   */
-  static async nixos(...args) {
-    try {
-      return new Machine(nativeHandle, await native.Machine.nixos(...args.map(normalizeArg)));
+      return new Machine(nativeHandle, await native.Machine.create(...args.map(normalizeArg)));
     } catch (error) {
       throw decodeError(error);
     }
@@ -1048,7 +1120,7 @@ class Machine {
    * same shape -- which is why it is recorded here.
    *
    * `false` for a keyless create, and for a handle from `attach`,
-   * `connect` or `snapshots().restore()`, which created nothing.
+   * `connect` or `snapshots.restore()`, which created nothing.
    */
   deduplicated(...args) {
     try {
@@ -1069,12 +1141,41 @@ class Machine {
    * broken.
    *
    * `NotRequested` for a handle from `attach`, `connect` or
-   * `snapshots().restore()`: no wait happened, so this says nothing
+   * `snapshots.restore()`: no wait happened, so this says nothing
    * about the machine. Use `wait_ready` to ask about one of those.
    */
   readiness(...args) {
     try {
       return this.#handle.readiness(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * The lifetime this handle created the machine with: `persistent` or
+   * `ephemeral` (a TTL machine is ephemeral; read {@link Machine.ttl}).
+   *
+   * Absent for a handle from `attach` or `connect`: the platform does not
+   * report a machine's lifetime back yet, so an adopted handle cannot
+   * know it.
+   */
+  get lifetime() {
+    try {
+      return this.#handle.lifetime();
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * The deadline this handle created an ephemeral machine with, as a
+   * duration string (`"1h"` for the ephemeral default, `"20m"` for an
+   * explicit one). Absent for a persistent or adopted handle.
+   */
+  get ttl() {
+    try {
+      return this.#handle.ttl();
     } catch (error) {
       throw decodeError(error);
     }
@@ -1181,75 +1282,45 @@ class Machine {
   }
 
   /**
-   * Run a command to completion and collect its output.
+   * Run a command and return its {@link Process} at once.
+   *
+   * Synchronous: the command starts now, and the process is awaitable for
+   * its {@link ExecResult} and readable live through `stdout`, `stderr`,
+   * `output` and `text`. A non-zero exit is a result, not an error, unless
+   * `options.check`, which raises {@link CommandFailed} from the
+   * await instead.
+   *
+   * Errors opening the session (no connect token, an unreachable guest)
+   * surface from the first await or iteration, never from this call.
+   * Releasing the process kills the command; use {@link Machine.spawn} for one
+   * that must outlive its handle.
    *
    * # Errors
    *
-   * A non-zero exit is NOT an error -- it is {@link ExecResult.exitCode}.
-   * {@link Unavailable} means the command could not be run at all.
+   * {@link InvalidArgument} for a negative `options.max_buffer`, and
+   * {@link Internal} when the SDK cannot start its exec runtime.
    */
-  async exec(...args) {
+  exec(...args) {
     try {
-      return await this.#handle.exec(...args.map(normalizeArg));
+      return new Process(nativeHandle, this.#handle.exec(...args.map(normalizeArg)));
     } catch (error) {
       throw decodeError(error);
     }
   }
 
   /**
-   * Run a command and raise when it exits non-zero.
+   * Run a shell script and return its {@link Process} at once.
    *
-   * The Rust SDK owns the exit-status check, so Python and TypeScript
-   * receive the same captured output and {@link CommandFailed}.
-   */
-  async execChecked(...args) {
-    try {
-      return await this.#handle.execChecked(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Run a shell script to completion and collect its output.
-   *
-   * Sugar for `exec(["bash", "-c", script])`, which is what a caller
-   * writes nine times in ten.
+   * Sugar for `exec(["bash", "-c", script], options)`, which is what a
+   * caller writes nine times in ten.
    *
    * # Errors
    *
    * As {@link Machine.exec}.
    */
-  async shell(...args) {
+  shell(...args) {
     try {
-      return await this.#handle.shell(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /** Run a Bash script and raise when it exits non-zero. */
-  async shellChecked(...args) {
-    try {
-      return await this.#handle.shellChecked(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Run a command, streaming its output as it is produced.
-   *
-   * The last item carries the exit code; see {@link ExecChunk}.
-   *
-   * # Errors
-   *
-   * {@link Unavailable} when the session cannot be opened. Once
-   * the stream is running, a transport failure ends it.
-   */
-  async execStream(...args) {
-    try {
-      return wrapStream(await this.#handle.execStream(...args.map(normalizeArg)));
+      return new Process(nativeHandle, this.#handle.shell(...args.map(normalizeArg)));
     } catch (error) {
       throw decodeError(error);
     }
@@ -1436,7 +1507,7 @@ class Machine {
    * 2026-09-04) this returns once the snapshot is durable and `ready`, so
    * `wait_snapshot_ready` returns at once. An older block-backed machine
    * still returns before its snapshot is restorable; poll
-   * `client.snapshots().list(machine_id)` for `status == "ready"` there.
+   * `client.snapshots.list(machine_id)` for `status == "ready"` there.
    *
    * Returns the snapshot id together with the machine as it stood at
    * capture, rather than the id alone: both are UUIDs, and a caller
@@ -1469,6 +1540,30 @@ class Machine {
   async waitSnapshotReady(...args) {
     try {
       return await this.#handle.waitSnapshotReady(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * Copy this machine into a new one: snapshot, wait until the snapshot
+   * is restorable, restore.
+   *
+   * The original keeps running. The copy is a machine this call created,
+   * so it is the returned handle's to release; it is persistent, because a
+   * restore carries no lease (an ephemeral `options.lifetime` or a `ttl` is
+   * refused before any snapshot is taken).
+   *
+   * # Errors
+   *
+   * {@link InvalidArgument} for an ephemeral lifetime or a `ttl`,
+   * {@link Conflict} when a capture is already in flight, and
+   * {@link Unavailable} when the snapshot is still capturing after
+   * five minutes or the copy did not finish booting.
+   */
+  async fork(...args) {
+    try {
+      return new Machine(nativeHandle, await this.#handle.fork(...args.map(normalizeArg)));
     } catch (error) {
       throw decodeError(error);
     }
@@ -1677,15 +1772,15 @@ class Machine {
 
   /**
    * This machine's OWN secrets, as distinct from the account store at
-   * `client.secrets()`.
+   * `client.secrets`.
    *
    * Writing here touches this machine and nothing else, and does not become
    * the account value -- so a value set this way is gone the next time
    * the machine is rebuilt from its image.
    */
-  secrets(...args) {
+  get secrets() {
     try {
-      return new MachineSecrets(nativeHandle, this.#handle.secrets(...args.map(normalizeArg)));
+      return new MachineSecrets(nativeHandle, this.#handle.secrets());
     } catch (error) {
       throw decodeError(error);
     }
@@ -1717,63 +1812,6 @@ class Machine {
   async forwardPort(...args) {
     try {
       return new PortForward(nativeHandle, await this.#handle.forwardPort(...args.map(normalizeArg)));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Build a source tree into a system and activate it on this machine.
-   *
-   * The machine builds its own next system: the tree at `source` is uploaded
-   * to content-addressed storage, and the platform drives `nix build`
-   * and `switch-to-configuration` inside the guest. Returns the
-   * `/nix/store` path now running.
-   *
-   * `configuration` names which `nixosConfigurations` entry to build,
-   * the way `nixos-rebuild --flake .#web` does, and defaults to this
-   * machine's own name the way `nixos-rebuild` defaults to the
-   * hostname. A full attribute path still passes through untouched, so
-   * a caller building a sibling of `toplevel` keeps that. `workdir` is
-   * where inside the tree it is evaluated, defaulting to the root.
-   *
-   * This is the only switch shape the generated SDKs carry. The two
-   * others in the Rust SDK build with a local `nix` first, which an SDK
-   * consumer's machine is not assumed to have.
-   *
-   * Minutes, not seconds, on a cold build; {@link Machine.switchStream} is
-   * the same call with the build log.
-   *
-   * # Errors
-   *
-   * {@link InvalidArgument} for a `source` that is not a readable
-   * directory or a `workdir` that escapes it, and
-   * {@link Internal} when the build or the activation fails.
-   */
-  async switch(...args) {
-    try {
-      return await this.#handle.switch(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Build and activate a system on this machine, streaming the build log.
-   *
-   * Same arguments and same rules as {@link Machine.switch}. The terminal
-   * frame carries {@link SwitchProgress.system} on success and
-   * {@link SwitchProgress.error} on failure; abandoning the iterator
-   * cancels the switch.
-   *
-   * # Errors
-   *
-   * Argument errors are raised before the stream opens; everything
-   * after that arrives as the terminal frame.
-   */
-  async switchStream(...args) {
-    try {
-      return wrapStream(await this.#handle.switchStream(...args.map(normalizeArg)));
     } catch (error) {
       throw decodeError(error);
     }
@@ -2010,19 +2048,24 @@ class Machine {
   }
 
   /**
-   * Release the handle, deleting the machine if this handle booted it.
+   * Release the handle, deleting the machine only if this handle created
+   * it ephemeral.
    *
-   * What `await using` and `async with` call at scope exit. A handle
-   * from a factory ({@link Machine.template}, {@link Machine.nixos},
-   * {@link Machines.create}) owns its machine and deletes it; one from
-   * {@link Machine.attach} adopted a machine somebody else owns and only drops
-   * the connection. Deleting a machine the caller did not create is the
-   * one thing a scope exit must never do.
+   * What `await using` and `async with` call at scope exit. A machine this
+   * handle created with `lifetime: "ephemeral"` (or a `ttl`) is deleted.
+   * A persistent machine is released and keeps running, whoever created
+   * it, and so is one adopted through {@link Machine.attach} or `connect`. This
+   * changed on 2026-10-07: scope exit used to delete every machine the
+   * handle created, and a persistent machine lost at scope exit was the
+   * one surprising data loss in the SDK.
+   *
+   * The deadline of an ephemeral machine is the guarantee; this is the
+   * fast path. A process that dies before releasing leaks at most one TTL.
    *
    * Idempotent: a machine already gone is the outcome this was asked
    * for, so {@link NotFound} is swallowed rather than raised out of
    * a scope exit that is often already unwinding from another error.
-   * Call {@link Machine.delete} to delete regardless of ownership.
+   * Call {@link Machine.delete} to delete regardless.
    *
    * # Errors
    *
@@ -2043,9 +2086,226 @@ class Machine {
 }
 
 /**
+ * A running command on a machine.
+ *
+ * Returned at once by {@link Machine.exec}; the command is already starting.
+ * Await it for the {@link ExecResult} (`await process`, the same as
+ * `await process.wait()`), or read it live:
+ *
+ * - `stdout`, `stderr`: byte chunks of one stream;
+ * - `output`: both streams merged, each chunk tagged with its stream and
+ *   arrival time;
+ * - `text` (Python `lines`): the merged output as text lines.
+ *
+ * Each stream can be opened once, and replays everything the command wrote
+ * before it was opened. An open stream that is not read eventually stalls
+ * the command, like a full pipe: read `stdout` and `stderr` concurrently, or
+ * read `output`. Open streams right after `exec`: once the result buffer
+ * (`maxBuffer`) has dropped a stream's bytes, that stream can no longer
+ * replay from the start and opening it raises `InvalidArgument`.
+ *
+ * Releasing the process kills the command (the guest sends `SIGTERM`, waits
+ * a grace window, then `SIGKILL`s its process group). `machine.spawn` is the
+ * verb for a command that must outlive its handle.
+ */
+class Process {
+  #handle;
+  #awaited;
+
+  /** Instances come from the exported functions returning this type. */
+  constructor(...args) {
+    if (args[0] !== nativeHandle) {
+      throw new TypeError("Process instances come from the exported functions that return them");
+    }
+    this.#handle = args[1];
+  }
+
+  /**
+   * Wait for the command to end and return what it produced.
+   *
+   * # Errors
+   *
+   * {@link CommandFailed} for a non-zero exit when the exec passed
+   * `check`, naming the command and exit code in its message (an error
+   * carries no fields at this boundary; await without `check` to read the
+   * output of a failing command). {@link Unavailable}
+   * when the session could not be opened or the connection dropped: never
+   * an exit code. {@link Cancelled} after {@link Process.kill}, because a
+   * killed command reports no exit status.
+   */
+  async wait(...args) {
+    try {
+      return await this.#handle.wait(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * The command's stdout as byte chunks, from the start.
+   *
+   * # Errors
+   *
+   * {@link InvalidArgument} when stdout is already open, or when its
+   * start was dropped from the result buffer before this call.
+   */
+  get stdout() {
+    try {
+      return wrapStream(this.#handle.stdout());
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * The command's stderr as byte chunks, from the start.
+   *
+   * # Errors
+   *
+   * As {@link Process.stdout}.
+   */
+  get stderr() {
+    try {
+      return wrapStream(this.#handle.stderr());
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * Both streams merged in arrival order, from the start.
+   *
+   * # Errors
+   *
+   * {@link InvalidArgument} when the merged stream (or `text`, which
+   * reads it) is already open, or when either stream's start was dropped
+   * from the result buffer before this call.
+   */
+  get output() {
+    try {
+      return wrapStream(this.#handle.output());
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * The merged output as text lines, each stream split on its own.
+   *
+   * A method, not a property, in every language; Python spells it
+   * `lines()`. It reads the merged stream, so it and `output` share one
+   * reader.
+   *
+   * # Errors
+   *
+   * As {@link Process.output}.
+   */
+  text(...args) {
+    try {
+      return wrapStream(this.#handle.text(...args.map(normalizeArg)));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * The command's stdin.
+   *
+   * # Errors
+   *
+   * {@link InvalidArgument} when the exec did not pass `stdin: true`,
+   * so the command reads `/dev/null` and there is nothing to write to.
+   */
+  get stdin() {
+    try {
+      return new ProcessStdin(nativeHandle, this.#handle.stdin());
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * Kill the command: close its session so the guest sends `SIGTERM`,
+   * waits a grace window, then `SIGKILL`s its process group. Resolves once
+   * the session is closed. Killing a finished process does nothing.
+   */
+  async kill(...args) {
+    try {
+      return await this.#handle.kill(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /** `await` support: settles with `wait()`, run once however often this is awaited. */
+  then(onFulfilled, onRejected) {
+    if (this.#awaited === undefined) {
+      this.#awaited = this.wait();
+    }
+    return this.#awaited.then(onFulfilled, onRejected);
+  }
+}
+
+/** A running command's stdin. */
+class ProcessStdin {
+  #handle;
+
+  /** Instances come from the exported functions returning this type. */
+  constructor(...args) {
+    if (args[0] !== nativeHandle) {
+      throw new TypeError("ProcessStdin instances come from the exported functions that return them");
+    }
+    this.#handle = args[1];
+  }
+
+  /**
+   * Write bytes to the command's stdin.
+   *
+   * # Errors
+   *
+   * {@link Conflict} after {@link ProcessStdin.close} or once the command has
+   * ended; {@link Unavailable} when the session never opened.
+   */
+  async write(...args) {
+    try {
+      return await this.#handle.write(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * Write text to the command's stdin, as UTF-8. Nothing is appended.
+   *
+   * # Errors
+   *
+   * As {@link ProcessStdin.write}.
+   */
+  async writeText(...args) {
+    try {
+      return await this.#handle.writeText(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+
+  /**
+   * Close the command's stdin, so a command reading to EOF finishes.
+   * Closing twice is fine.
+   */
+  async close(...args) {
+    try {
+      return await this.#handle.close(...args.map(normalizeArg));
+    } catch (error) {
+      throw decodeError(error);
+    }
+  }
+}
+
+/**
  * The `snapshots` namespace.
  *
- * Reached as `client.snapshots()`. Capturing one is a machine action and lives
+ * Reached as `client.snapshots`. Capturing one is a machine action and lives
  * on {@link Machine.snapshot}; listing and restoring are account-level and
  * live here.
  */
@@ -2102,7 +2362,7 @@ class Snapshots {
    * {@link Snapshots.restore} does the same work and returns a handle;
    * this reports the phases and delivers the finished machine as the
    * terminal frame's {@link MachineProgress.machine}. Reach for
-   * `client.machines().connect(frame.machine.id)` to act on it, since
+   * `client.machines.connect(frame.machine.id)` to act on it, since
    * a handle cannot ride inside a stream item.
    *
    * The stream always ends in a `finished` frame with exactly one of
@@ -2144,7 +2404,7 @@ class Usage {
    * {@link PermissionDenied} when the credential has no billing
    * account, or is a narrowed key: the account's money is read only by the
    * account root or a dashboard session, and a narrowed key reads its own
-   * spend with `keys().selfInspect()`. A missing account is not a zero
+   * spend with `keys.selfInspect()`. A missing account is not a zero
    * balance and does not read as one.
    */
   async summary(...args) {
@@ -2559,7 +2819,7 @@ class UdpForward {
 /**
  * The account's secret store: values a machine is built with.
  *
- * Reached as `client.secrets()`. Write-only toward clients: nothing here
+ * Reached as `client.secrets`. Write-only toward clients: nothing here
  * reads a value back.
  */
 class Secrets {
@@ -2614,7 +2874,7 @@ class Secrets {
    *
    * machines that already have a copy keep it: taking a credential out from
    * under a running workload is a worse default than leaving it. Use
-   * the machine's own `secrets().delete(..)` to remove that copy.
+   * the machine's own `secrets.delete(..)` to remove that copy.
    *
    * # Errors
    *
@@ -2630,7 +2890,7 @@ class Secrets {
 }
 
 /**
- * One machine's own secrets, reached as `machines().connect(id).secrets()`.
+ * One machine's own secrets, reached as `machines.connect(id).secrets`.
  *
  * Scoped to that machine. A value set here does not become the account value.
  */
@@ -2695,7 +2955,7 @@ class MachineSecrets {
 /**
  * The `groups` namespace: private east-west networks between machines.
  *
- * Reached as `client.groups()`. Members are named by machine name rather than
+ * Reached as `client.groups`. Members are named by machine name rather than
  * id, because a group is a human-scale object: its slug and DNS labels
  * are things people type.
  */
@@ -2814,7 +3074,7 @@ class Groups {
 /**
  * The `previews` namespace: disposable copies of a deployment.
  *
- * Reached as `client.previews()`.
+ * Reached as `client.previews`.
  */
 class Previews {
   #handle;
@@ -2916,7 +3176,7 @@ class Previews {
 /**
  * The `volumes` namespace: persistent disks and their snapshots.
  *
- * Reached as `client.volumes()`. Reads only: a volume's lifetime belongs
+ * Reached as `client.volumes`. Reads only: a volume's lifetime belongs
  * to the machine that needs it, so there is no create or delete here to
  * desynchronize the two.
  */
@@ -2982,7 +3242,7 @@ class Volumes {
 /**
  * The `observability` namespace: traces and logs, correlated by id.
  *
- * Reached as `client.observability()`. Every verb hangs off a correlation
+ * Reached as `client.observability`. Every verb hangs off a correlation
  * id -- trace, request or operation -- because that is what makes a
  * distributed failure legible: the same id joins the API call, the
  * orchestrator's work and the node's journal. The trace id printed in an
@@ -3053,7 +3313,7 @@ class Observability {
 /**
  * The `migrations` namespace: moving a running machine between nodes.
  *
- * Reached as `client.machines().migrations()`. A migration is a process the
+ * Reached as `client.machines.migrations`. A migration is a process the
  * platform runs, not a call that blocks: `start` returns immediately and
  * `get` follows it, which is why this is a namespace with three verbs
  * rather than one long-running method.
@@ -3239,132 +3499,7 @@ class PortForward {
   }
 }
 
-/**
- * A region's template cache: what `ix templates ls` shows.
- *
- * There is deliberately no `create` verb here. A template compiles on
- * first boot, so "adding" one IS `machines().create` with `template` set
- * to a sha-pinned flake reference (`github:owner/repo/<rev>#config`);
- * this namespace manages the cache those boots produce.
- *
- * Reached as `client.templates()`, never constructed directly.
- */
-class Templates {
-  #handle;
-
-  /** Instances come from the exported functions returning this type. */
-  constructor(...args) {
-    if (args[0] !== nativeHandle) {
-      throw new TypeError("Templates instances come from the exported functions that return them");
-    }
-    this.#handle = args[1];
-  }
-
-  /**
-   * The template cache rows visible to the caller, in one region.
-   *
-   * `region` follows the same ladder as `machines().create`: the argument,
-   * then `IX_REGION`, then `us-west-1`.
-   *
-   * # Errors
-   *
-   * {@link InvalidArgument} when the region slug is malformed, and
-   * {@link Unauthorized} when the credential cannot read
-   * templates.
-   */
-  async list(...args) {
-    try {
-      return await this.#handle.list(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Evict one cache row (`ix templates rm`): by row id, or by a
-   * reference matched against `pinned_ref` and `source_ref`.
-   *
-   * A reference matching several rows is refused with the candidate
-   * ids, so the caller can name one. `force` evicts a row that is
-   * still `building`; without it that is refused. Shared platform
-   * rows (the base template) are never evictable.
-   *
-   * # Errors
-   *
-   * {@link NotFound} when nothing matches,
-   * {@link InvalidArgument} when the reference is ambiguous, and
-   * {@link Conflict} when the row is still building and `force`
-   * was not passed.
-   */
-  async remove(...args) {
-    try {
-      return await this.#handle.remove(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Pin one cache row warm for you (`ix templates warm`): the
-   * region's prewarm sweep stages a pinned row, so a machine created
-   * from it boots without the cold materialization.
-   *
-   * Addressed like {@link Templates.remove} -- by row id, by template name, or
-   * by a reference matched against `pinned_ref` and `source_ref` --
-   * and a reference matching several rows is refused with the
-   * candidate ids. Shared rows are pinnable: a public template belongs
-   * to nobody, and the region stages it once however many callers pin
-   * it. A pin holds staged capacity for as long as you hold it, so the
-   * number of pins one caller may hold is capped and {@link Templates.unwarm}
-   * is how room is made. Tagged rows are refused: their image is
-   * repointed by whoever pushes it, so a pin would follow an image the
-   * caller does not control.
-   *
-   * # Errors
-   *
-   * {@link NotFound} when nothing matches,
-   * {@link InvalidArgument} when the reference is ambiguous, when
-   * the row is tagged, or when the caller already holds the maximum
-   * number of pins, and {@link Unauthorized} when the credential
-   * cannot edit templates.
-   */
-  async warm(...args) {
-    try {
-      return await this.#handle.warm(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-
-  /**
-   * Remove YOUR warm pin from one cache row (`ix templates unwarm`),
-   * freeing the capacity it held. Anyone else's pin on the row stays,
-   * and the row stays cached; the next machine created from it
-   * materializes cold again once no pin is left.
-   *
-   * Addressed like {@link Templates.warm}. Never capped, because releasing
-   * only ever shrinks the caller's set of pins, and releasing a pin
-   * the caller does not hold is the requested end state rather than an
-   * error.
-   *
-   * # Errors
-   *
-   * {@link NotFound} when nothing matches,
-   * {@link InvalidArgument} when the reference is ambiguous or
-   * the row is tagged -- tagged rows are refused in either direction
-   * -- and {@link Unauthorized} when the credential cannot edit
-   * templates.
-   */
-  async unwarm(...args) {
-    try {
-      return await this.#handle.unwarm(...args.map(normalizeArg));
-    } catch (error) {
-      throw decodeError(error);
-    }
-  }
-}
-
-/** CI runner-pool credentials, reached as `client.ci()`. */
+/** CI runner-pool credentials, reached as `client.ci`. */
 class Ci {
   #handle;
 
@@ -3415,11 +3550,22 @@ module.exports.Unavailable = Unavailable;
 module.exports.Cancelled = Cancelled;
 module.exports.CommandFailed = CommandFailed;
 module.exports.Internal = Internal;
+module.exports.ImageInvalid = ImageInvalid;
+module.exports.ImageNotFound = ImageNotFound;
+module.exports.ImageAuth = ImageAuth;
+module.exports.ImageNotAvailableForArch = ImageNotAvailableForArch;
+module.exports.ImageTooLarge = ImageTooLarge;
+module.exports.RegistryUnavailable = RegistryUnavailable;
+module.exports.ImageUnsupported = ImageUnsupported;
+module.exports.ImageArchMismatch = ImageArchMismatch;
+module.exports.CpuClassMismatch = CpuClassMismatch;
 module.exports.Client = Client;
 module.exports.Keys = Keys;
 module.exports.Credits = Credits;
 module.exports.Machines = Machines;
 module.exports.Machine = Machine;
+module.exports.Process = Process;
+module.exports.ProcessStdin = ProcessStdin;
 module.exports.Snapshots = Snapshots;
 module.exports.Usage = Usage;
 module.exports.ShellSession = ShellSession;
@@ -3434,5 +3580,4 @@ module.exports.Observability = Observability;
 module.exports.Migrations = Migrations;
 module.exports.Regions = Regions;
 module.exports.PortForward = PortForward;
-module.exports.Templates = Templates;
 module.exports.Ci = Ci;

@@ -14,18 +14,6 @@ const native = path.join(__dirname, `../native/ix_sdk-${platformKey}.node`);
 if (!fs.existsSync(compressed)) {
   throw new Error(`@indexable/sdk: unsupported platform ${platformKey}`);
 }
-// Linux's public SDK addon links the vendored aws-lc symbols through a small
-// set of sibling shared objects. Keeping them beside the addon lets its
-// $ORIGIN RUNPATH resolve without relying on runner-wide installations.
-if (process.platform === "linux") {
-  for (const name of ["libaws_lc_0_41_0_crypto.so", "libblake3.so"]) {
-    const compressedSidecar = path.join(__dirname, `../native/${name}.gz`);
-    const sidecar = path.join(__dirname, `../native/${name}`);
-    if (!fs.existsSync(sidecar)) {
-      fs.writeFileSync(sidecar, zlib.gunzipSync(fs.readFileSync(compressedSidecar)), { mode: 0o755 });
-    }
-  }
-}
 if (!fs.existsSync(native)) {
   fs.writeFileSync(native, zlib.gunzipSync(fs.readFileSync(compressed)), { mode: 0o755 });
 }

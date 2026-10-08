@@ -59,10 +59,11 @@ promote: PR state never enters the seed lineage, which is both the cache
 poisoning story and the reason a seed is always a state the trunk actually
 reached.
 
-**Rev roll**: `<rev8>` in the holder name is the runner-config rev the
-lineage descends from. When the config rev changes, existing holders stop
+**Rev roll**: `<rev8>` in the holder name is a hash of the pool's runner
+image reference (`image` in the spec), the config the lineage descends from.
+When the image reference changes, existing holders stop
 matching, read as absent, and are GC'd; the next job of each lineage boots
-cold from the new template and re-establishes the seed. Encoding the rev
+cold from the new image and re-establishes the seed. Encoding the hash
 in the name keeps the check stateless and probe-free (the holder is
 stopped; there is no guest to ask).
 
@@ -83,7 +84,7 @@ Per lineage with queued demand:
             headroom pads live demand, min-warm floors quiet lineages -
             they deliberately do not stack)
     have = registered idle runners of that lineage
-    spawn(want - have): restore from seed, or cold-boot the template
+    spawn(want - have): restore from seed, or cold-boot the image
                         when no matching holder exists
 
 Spawning is: create the machine, mint a JIT runner config named after the
@@ -122,7 +123,7 @@ ticks, derived from GitHub's own job timestamps, never counted.
   every remote string. (v1's servable/label matching dissolved: labels now
   ride each JIT credential, so a runner *cannot* serve the wrong lineage.)
 - **Budgeted convergence**: creations per tick are capped and spent at
-  admission, so a bad template rev stalls loudly instead of thrashing.
+  admission, so a bad image tag stalls loudly instead of thrashing.
 
 ## What this costs, honestly
 

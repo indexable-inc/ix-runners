@@ -23,8 +23,7 @@ const HOLDER = seedName("p", LINEAGE, REV)
 const config: Config = {
   repo: "acme/app",
   pool: "p",
-  templateAttr: "ci-runner",
-  flakeDir: "",
+  image: "ix/runner:2026-10-08",
   regions: ["us-west-1"],
   runnerLabel: "ix",
   maxRunners: 16,
@@ -34,8 +33,6 @@ const config: Config = {
   maxColdBoots: 4,
   warmGraceSeconds: 300,
   mayScaleDown: true,
-  templateRepo: "acme/app",
-  templateRev: "",
 }
 
 let nextId = 0
@@ -80,37 +77,24 @@ describe("spawning", () => {
     expect(spawns).toHaveLength(2) // 1 queued + 1 headroom
     for (const spawn of spawns) {
       expect(spawn.labels).toEqual([...LABELS])
-      expect(spawn.source).toEqual({ template: `github:acme/app/${REV}#ci-runner` })
+      expect(spawn.source).toEqual({ image: "ix/runner:2026-10-08" })
       expect(spawn.region).toBe("us-west-1")
       expect(spawn.name).toMatch(new RegExp(`^p-run-${LINEAGE}-`))
     }
   })
 
-  test("pool mode cold-boots from the action's own repo at the action rev", () => {
-    // `pool:` mode: the template lives in the ACTION's repository, pinned
-    // at the action's own commit (which is also what world.rev carries,
-    // via resolveRev). The exact string is the seam: everything GitHub-side
-    // stays keyed on config.repo, only the flake ref moves.
-    const actionRev = "4751cbbab884173b3a3bcee7c19808e89a18bb37"
-    const pinned: Config = {
-      ...config,
-      flakeDir: "pools/baml",
-      templateRepo: "indexable-inc/ix-runners",
-      templateRev: actionRev,
-    }
+  test("a cold boot sources the pool's OCI image, never a flake reference", () => {
+    // The seam: `image` is the one boot input. Nothing GitHub-side moves
+    // with it, and no `template` key can reach the SDK.
     const plan = steps(
-      world({
-        rev: actionRev,
-        queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false },
-      }),
-      pinned,
+      world({ queue: { demanded: [{ labels: [...LABELS] }], finished: [], truncated: false } }),
+      { ...config, image: "ix/runner:2026-11-01" },
     )
-    for (const spawn of only(plan, "spawn")) {
-      expect(spawn.source).toEqual({
-        template: `github:indexable-inc/ix-runners/${actionRev}?dir=pools/baml#ci-runner`,
-      })
-    }
     expect(only(plan, "spawn").length).toBeGreaterThan(0)
+    for (const spawn of only(plan, "spawn")) {
+      expect(spawn.source).toEqual({ image: "ix/runner:2026-11-01" })
+      expect("template" in spawn.source).toBe(false)
+    }
   })
 
   test("a ready seed makes spawns restores, not cold boots", () => {
@@ -156,7 +140,7 @@ describe("spawning", () => {
     const spawns = only(plan, "spawn")
     expect(spawns.length).toBeGreaterThan(0)
     for (const spawn of spawns) {
-      expect(spawn.source).toEqual({ template: `github:acme/app/${REV}#ci-runner` })
+      expect(spawn.source).toEqual({ image: "ix/runner:2026-10-08" })
       expect(spawn.seedHolder).toBeUndefined()
     }
   })
@@ -651,7 +635,7 @@ test("a scheduled stale seed rebuild cold-boots demand while retaining the old h
   )
   expect(only(plan, "delete")).toHaveLength(0)
   expect(only(plan, "spawn").length).toBeGreaterThan(0)
-  expect(only(plan, "spawn").every((step) => "template" in step.source)).toBe(true)
+  expect(only(plan, "spawn").every((step) => "image" in step.source)).toBe(true)
 })
 
 test("a rev roll deletes every old holder", () => {

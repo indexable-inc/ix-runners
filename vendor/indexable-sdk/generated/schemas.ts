@@ -23,6 +23,9 @@
 import { Buffer } from "node:buffer";
 import { z } from "zod";
 
+export const Arch = z.enum(["x86_64", "arm64"]).describe("The CPU architecture of a machine.\n\nThe spellings are `uname -m` for x86 and the vendor-neutral `arm64`; there\nis no `aarch64` or `amd64` alias, so a typo fails instead of guessing. Each\nvalue is exactly one OCI platform (`x86_64` is `linux/amd64`, `arm64` is\n`linux/arm64`), which the platform resolves an image for.");
+export type Arch = z.infer<typeof Arch>;
+
 export const MachineStatus = z.enum(["running", "stopped", "failed", "unreachable"]).describe("What a machine's lifecycle is doing.\n\nFour states. There is no \"starting\": a machine that is coming up already\nreports `Running` and answers when it answers, which is what\n{@link CreateMachineOptions.readyWaitMs} decides.");
 export type MachineStatus = z.infer<typeof MachineStatus>;
 
@@ -34,6 +37,15 @@ export type SnapshotStatus = z.infer<typeof SnapshotStatus>;
 
 export const SnapshotWait = z.enum(["ready", "failed", "gone", "timed_out"]).describe("How a wait for a snapshot's capture ended.\n\nWider than {@link SnapshotStatus} because waiting has two outcomes that\nare not capture states: the snapshot can vanish, and the caller's\nbudget can run out while the capture is still going.");
 export type SnapshotWait = z.infer<typeof SnapshotWait>;
+
+export const OutputStream = z.enum(["stdout", "stderr"]).describe("Which of a command's output streams a chunk came from.");
+export type OutputStream = z.infer<typeof OutputStream>;
+
+export const Lifetime = z.enum(["persistent", "ephemeral"]).describe("How long a machine lives.\n\nThe named half of the lifetime option. A TTL rides the sibling `ttl`\nfield, because this boundary carries no data enum: the contract's\n`lifetime: \"persistent\" | \"ephemeral\" | { ttl }` cannot cross as one\nunion, so it is lowered to `lifetime` plus `ttl`\n(`docs/design/sdk-machines-api.md` section 2) and reassembled in sdk-core\nby `Lifetime::from_fields`.");
+export type Lifetime = z.infer<typeof Lifetime>;
+
+export const Cpu = z.enum(["epyc-5", "graviton-5"]).describe("A host CPU class to pin a machine to. Each class implies one `arch`.\n\nThe variants carry an underscore because the wire spelling is\n`kebab-case` of the Rust name and the public strings are `epyc-5` and\n`graviton-5`; `Epyc5` would spell `epyc5`.");
+export type Cpu = z.infer<typeof Cpu>;
 
 export const ReadinessState = z.enum(["not_requested", "ready", "not_ready"]).describe("How a create's readiness wait ended.\n\nThree outcomes and no catch-all, because \"nobody waited\" and \"we\nwaited and the guest is not up\" are different answers that a\n`ready: bool` renders identically -- and the one reading `false` on a\ncreate that never waited is exactly the one a caller acts on wrongly.");
 export type ReadinessState = z.infer<typeof ReadinessState>;
@@ -72,7 +84,10 @@ export const MachineInfo = z
   .object({
     id: z.string().describe("Stable id. Opaque: pass it back, never parse it."),
     name: z.string().describe("Caller-chosen name, unique within the account."),
-    image: z.string().describe("The image the machine booted from."),
+    imageReference: z.string().describe("The OCI reference the machine was created from, as the caller gave\nit (`ix/debian:12`). Empty for a machine created before images were\nresolved to digests."),
+    imageDigest: z.string().describe("The `sha256:<hex>` digest of the per-architecture manifest the machine\nruns.\nTags are for humans and this is what ran: re-creating from the same\ntag later can give a different digest. A restart, restore or fork\nkeeps it. Empty for a machine created before images were resolved to\ndigests."),
+    arch: Arch.nullable().optional().describe("The architecture the machine runs on, as recorded at create. Absent\nfor a machine created before the platform recorded it; never an\nassumed value."),
+    cpu: Cpu.nullable().optional().describe("The host CPU class the machine is pinned to. Absent for a baseline\nmachine (any host of its architecture), which is every machine created\nwithout `cpu`."),
     status: MachineStatus.describe("What the machine's lifecycle is doing."),
     ipv6: z.string().describe("The machine's IPv6 address, which is also its identity on the network."),
     ipv4: z.string().nullable().optional().describe("IPv4 address, when one is allocated."),
@@ -86,26 +101,18 @@ export const MachineInfo = z
     startedAt: z.number().int().nullable().optional().describe("When the machine last started, if it ever has."),
     stoppedAt: z.number().int().nullable().optional().describe("When the machine last stopped, if it ever has."),
   })
-  .describe("A machine, as the platform holds it.\n\nImmutable data: nothing here talks to the network. `client.machines()`\nreturns these; `client.machines().connect(id)` returns the {@link Machine} that\ncan act on one. Timestamps are Unix epoch milliseconds.");
+  .describe("A machine, as the platform holds it.\n\nImmutable data: nothing here talks to the network. `client.machines`\nreturns these; `client.machines.connect(id)` returns the {@link Machine} that\ncan act on one. Timestamps are Unix epoch milliseconds.");
 export type MachineInfo = z.infer<typeof MachineInfo>;
 
 export const ExecResult = z
   .object({
     exitCode: z.number().int().describe("The process's exit status. Zero is success.\n\n`i32`, deliberately: an exit status fits it everywhere ix runs,\nand the declared width should say so."),
-    stdout: z.string().describe("Everything the process wrote to stdout."),
-    stderr: z.string().describe("Everything the process wrote to stderr."),
+    stdout: z.string().describe("The first `maxBuffer` bytes the process wrote to stdout, decoded as\nUTF-8 with invalid sequences replaced. Read `process.stdout` for the\nexact bytes."),
+    stderr: z.string().describe("The first `maxBuffer` bytes the process wrote to stderr, decoded the\nsame way."),
+    truncated: z.boolean().describe("Whether either stream wrote more than `maxBuffer` (16 MiB each by\ndefault) and the rest was dropped from this result. The live streams\nare never capped."),
   })
-  .describe("What a finished command produced.");
+  .describe("What a finished command produced: what awaiting a {@link Process} returns.");
 export type ExecResult = z.infer<typeof ExecResult>;
-
-export const ExecChunk = z
-  .object({
-    stdout: z.instanceof(Buffer).describe("What the process wrote to stdout since the last frame."),
-    stderr: z.instanceof(Buffer).describe("What the process wrote to stderr since the last frame."),
-    exitCode: z.number().int().nullable().optional().describe("Set on the terminal frame only."),
-  })
-  .describe("One frame of a running command's output.\n\nThe stream's LAST item is the terminal frame: `stdout` and `stderr` are\nempty and `exit_code` is set. Every earlier item has output and no exit\ncode. That is how the exit status crosses a boundary where a stream\ncarries exactly one item type -- the alternative, dropping the status,\nwould make `exec_stream` unable to answer whether the command worked.\n\nOutput is BYTES, not text. A frame boundary is wherever the transport\nput it, so it can fall in the middle of a multi-byte character;\ndecoding each frame on its own would corrupt any non-ASCII output that\nhappened to straddle one, and would mangle a command that writes\nbinary. Decode across the whole stream, not per frame.\n{@link Machine.exec} returns text because it has the complete output.");
-export type ExecChunk = z.infer<typeof ExecChunk>;
 
 export const LogEntry = z
   .object({
@@ -246,15 +253,34 @@ export const DeleteResult = z
   .describe("The outcome of deleting one machine in `delete_many`.");
 export type DeleteResult = z.infer<typeof DeleteResult>;
 
+export const ExecOptions = z
+  .object({
+    cwd: z.string().nullable().optional().describe("Guest directory to run in. Absent is the guest's default."),
+    stdin: z.boolean().nullable().optional().describe("Open the command's stdin, so `process.stdin` can write to it and close\nit. Without it the command reads `/dev/null`."),
+    check: z.boolean().nullable().optional().describe("Raise {@link CommandFailed} from the await when the command exits\nnon-zero, instead of returning the exit code as a result."),
+    maxBuffer: z.number().int().nullable().optional().describe("How many bytes of each stream the awaited result keeps; 16 MiB when\nabsent. Past it the result sets `truncated`. The live streams are\nnever capped."),
+  })
+  .describe("Options for {@link Machine.exec} and {@link Machine.shell}.\n\nThere is no `env`: the exec session carries none. Export variables in a\n`shell` script, or create the machine with `env`.");
+export type ExecOptions = z.infer<typeof ExecOptions>;
+
+export const OutputChunk = z
+  .object({
+    stream: OutputStream.describe("Which stream wrote it."),
+    atMs: z.number().int().describe("Milliseconds since the process started, measured by the client as the\nchunk arrived. Arrival order, not a guest clock: when one guest write\ncarries both streams, stdout comes first."),
+    data: z.instanceof(Buffer).describe("The bytes, exactly as written. A chunk boundary can fall inside a\nmulti-byte character, so decode across chunks, or read `text`."),
+  })
+  .describe("One chunk of a command's merged output.");
+export type OutputChunk = z.infer<typeof OutputChunk>;
+
 export const MachineProgress = z
   .object({
     kind: z.string().describe("Event name, e.g. `PullingImage`, `StepStarted`, or `Finished` /\n`Failed` on the terminal frame."),
     message: z.string().describe("Human-readable message. Empty when the phase carries none."),
     finished: z.boolean().describe("Whether this is the terminal frame. Prefer this to comparing\n`kind`: it is a boolean the compiler can check, where a string\nsentinel is one typo away from a loop that never ends."),
-    machine: MachineInfo.nullable().optional().describe("Set on the terminal frame only: the finished machine.\n\nThe whole record, not just an id, so the common case needs no\nsecond call. `client.machines().connect(frame.machine.id)` gets a handle,\nwhich cannot ride in a stream item because objects are\nreturn-only at this boundary."),
+    machine: MachineInfo.nullable().optional().describe("Set on the terminal frame only: the finished machine.\n\nThe whole record, not just an id, so the common case needs no\nsecond call. `client.machines.connect(frame.machine.id)` gets a handle,\nwhich cannot ride in a stream item because objects are\nreturn-only at this boundary."),
     error: z.string().nullable().optional().describe("Set on the terminal frame only, and only when the operation\nfailed. Exactly one of `machine` and `error` is set there."),
     deduplicated: z.boolean().nullable().optional().describe("Set on a successful CREATE's terminal frame: whether the create\nreplayed an earlier one carrying the same `idempotencyKey`\ninstead of booting a new machine. Absent on start and restore\nframes, which have no key to replay."),
-    readiness: z.lazy(() => MachineReadiness).nullable().optional().describe("Set on a successful CREATE's terminal frame: how its wait for the\nguest to boot ended. Absent on start and restore frames.\n\nUnlike `machines().create()`, a stream does not raise when the\nbudget runs out -- the frames have already shown how far the boot\ngot, so the terminal frame reports `NotReady` and lets the caller\ndecide."),
+    readiness: z.lazy(() => MachineReadiness).nullable().optional().describe("Set on a successful CREATE's terminal frame: how its wait for the\nguest to boot ended. Absent on start and restore frames.\n\nUnlike `machines.create()`, a stream does not raise when the\nbudget runs out -- the frames have already shown how far the boot\ngot, so the terminal frame reports `NotReady` and lets the caller\ndecide."),
     stepId: z.number().int().nullable().optional().describe("The instrumented step this belongs to, for the `Step*` phases.\nCorrelates a `StepStarted` with its later `StepProgress` and\n`StepDone`, which matters once steps interleave."),
     machineId: z.string().nullable().optional().describe("The machine this phase is about, when it names one. Also set on the\nterminal frame, where it is `machine.id`."),
     node: z.string().nullable().optional().describe("`AllocatingVm`: physical node the machine was placed on."),
@@ -271,11 +297,8 @@ export const MachineProgress = z
     cacheReason: z.string().nullable().optional().describe("`IndexingRootfsManifest`: why the cache did or did not hit."),
     newChunks: z.number().int().nullable().optional().describe("`RegisteredRootfsChunks`: legacy per-chunk-ref count."),
     committedAt: z.number().int().nullable().optional().describe("`ServerVersion`: when the serving build was committed (Unix epoch\nseconds)."),
-    phase: z.string().nullable().optional().describe("`phase`: the coarse phase a template build entered, on a create whose\n`template` is a pinned flake reference: one of `creating_vm`,\n`starting_vm`, `ensuring_nix_daemon`, `building`, `publishing`,\n`activating` -- the same names a `switch` reports where the two\noverlap."),
-    stdout: z.string().nullable().optional().describe("`output`: build/activate output the guest wrote to stdout, on a\ntemplate-building create."),
-    stderr: z.string().nullable().optional().describe("`output`: build/activate output the guest wrote to stderr. Nix writes\nits progress here, so this is where a live build log is."),
   })
-  .describe("One step of a long-running machine operation, or its result.\n\nONE record for every such operation -- creating, starting, restoring.\nThey report the same events from the same source, so a second record\ncarrying the same meaning under different field names would be type\nsoup one level below the verb names.\n\nThe stream's LAST item is the terminal frame, marked by `finished`.\nExactly one of `machine` and `error` is set on it, and on no other item.\nSame idiom as {@link ExecChunk}, and for the same reason -- a stream\ncarries one item type, so the result has to ride in it. A separate\nawait would be a second thing to keep in sync with the first.\n\n`kind` is the wire's own event name and is the stable thing to branch\non. The optional fields are populated only by the phases that carry\nthem; read the ones you recognise. A phase newer than the SDK arrives\nas `Unknown`, with its wire index in `message`, rather than ending the\nstream.");
+  .describe("One step of a long-running machine operation, or its result.\n\nONE record for every such operation -- creating, starting, restoring.\nThey report the same events from the same source, so a second record\ncarrying the same meaning under different field names would be type\nsoup one level below the verb names.\n\nThe stream's LAST item is the terminal frame, marked by `finished`.\nExactly one of `machine` and `error` is set on it, and on no other item.\nA stream carries one item type, so the result has to ride in it. A\nseparate await would be a second thing to keep in sync with the first.\n\n`kind` is the wire's own event name and is the stable thing to branch\non. The optional fields are populated only by the phases that carry\nthem; read the ones you recognise. A phase newer than the SDK arrives\nas `Unknown`, with its wire index in `message`, rather than ending the\nstream.");
 export type MachineProgress = z.infer<typeof MachineProgress>;
 
 export const ShellInfo = z
@@ -391,7 +414,7 @@ export const BillingStatus = z
     autoRecharge: AutoRecharge.describe("Automatic refill settings."),
     limits: BillingLimits.describe("Bounds a `checkout` amount must fall inside."),
   })
-  .describe("The account's billing state: money, grace, and how it refills.\n\n`client.usage().summary()` is the money-only view of the same read.");
+  .describe("The account's billing state: money, grace, and how it refills.\n\n`client.usage.summary()` is the money-only view of the same read.");
 export type BillingStatus = z.infer<typeof BillingStatus>;
 
 export const UsageEvent = z
@@ -728,23 +751,39 @@ export const Region = z
   .describe("A region a machine can be placed in.");
 export type Region = z.infer<typeof Region>;
 
+export const ForkOptions = z
+  .object({
+    name: z.string().nullable().optional().describe("The copy's name. The platform generates one when absent."),
+    lifetime: Lifetime.nullable().optional().describe("The copy's lifetime. A fork restores a snapshot and `vm.restore` has no\nlease slot, so anything but persistent is refused with\n`InvalidArgument` (before any snapshot is taken) rather than creating a\npersistent copy the caller believes expires."),
+    ttl: z.string().nullable().optional().describe("The copy's TTL; refused for the same reason as `lifetime`."),
+  })
+  .describe("Options for `machine.fork()`.");
+export type ForkOptions = z.infer<typeof ForkOptions>;
+
 export const CreateMachineOptions = z
   .object({
-    template: z.string().nullable().optional().describe("Template reference to boot: a cached template (`ix/base:latest`) or\na sha-pinned flake reference (`github:owner/repo/<rev>#config`),\nwhich is built on first use and boots from the region's cache after\n-- see `machines().create` for the build semantics."),
+    image: z.string().nullable().optional().describe("OCI image reference to boot: `registry/repo:tag` or\n`registry/repo@sha256:...`, such as `ix/debian:12` or\n`ghcr.io/owner/repo:1.2`. The platform resolves it to a platform\nmanifest digest once, at create; `MachineInfo::image_digest` reads\nthe answer back."),
+    arch: Arch.nullable().optional().describe("The architecture to run on. Absent takes the architecture of the\ncheapest node with capacity, and `MachineInfo::arch` reads the answer\nback. An image with no manifest for it raises\n`ImageNotAvailableForArch`, listing the architectures it has. Refused\nwhen restoring a `snapshot`, which keeps the architecture it was\ncaptured on."),
+    registrySecret: z.string().nullable().optional().describe("Name of a stored secret (see `secrets`) holding the registry\ncredentials for a private `image`: basic auth or a registry token.\nThe platform reads it only to resolve and pull, never writes it to\nthe machine, and a secret bound to another registry host raises\n`ImageAuth`. Refused when restoring a `snapshot`."),
+    entrypoint: z.array(z.string()).nullable().optional().describe("Replace the image's ENTRYPOINT, as `docker run --entrypoint` does.\nAbsent keeps the image's own; an empty list clears it. Refused when\nrestoring a `snapshot`."),
+    command: z.array(z.string()).nullable().optional().describe("Replace the image's CMD, as the trailing arguments of `docker run`\ndo. Absent keeps the image's own; an empty list clears it. Refused\nwhen restoring a `snapshot`."),
     snapshot: z.string().nullable().optional().describe("Snapshot id to restore into a new machine."),
+    lifetime: Lifetime.nullable().optional().describe("How long the machine lives. Absent is `persistent`: it lives until\nsomeone deletes it.\n\n`ephemeral` puts a platform deadline on it (one hour, or `ttl`): the\ndeadline commits with the machine and the platform deletes it when\nthe deadline passes, even if this process is gone. Releasing the\nhandle that created an ephemeral machine (`await using`, `async with`,\n`close()`) deletes it at once; a persistent one is only released.\n\nRefused with `snapshot`, which has no lease slot: it would create a\npersistent machine."),
+    ttl: z.string().nullable().optional().describe("The ephemeral deadline: an integer and one unit, `s`, `m`, `h` or `d`\n(`\"30m\"`), from one minute to seven days. Out of range or malformed is\n`InvalidArgument`, never clamped. A `ttl` alone makes the machine\nephemeral; with `lifetime: persistent` it is refused."),
+    cpu: Cpu.nullable().optional().describe("Pin a host CPU class. Absent lets the scheduler pick any host of the\narchitecture (a baseline machine). A class that contradicts `arch` is\nrefused. A pinned machine sees its host's real CPU features and\nrestores only on the same class; `MachineInfo.cpu` reads it back."),
     name: z.string().nullable().optional().describe("Human-readable machine name. The platform generates one when absent."),
     region: z.string().nullable().optional().describe("Region slug. When absent, `IX_REGION` applies, then the platform\ndefault (`us-west-1`) -- the same ladder the CLI's `--region`\nflags resolve."),
-    env: z.record(z.string(), z.string()).nullable().optional().describe("Plaintext environment variables for the template command."),
+    env: z.record(z.string(), z.string()).nullable().optional().describe("Plaintext environment variables for the image command."),
     ipv4: z.boolean().nullable().optional().describe("Whether to allocate a public IPv4 address."),
     confidential: z.boolean().nullable().optional().describe("Launch as an AMD SEV-SNP confidential machine the host cannot read.\n\nAbsent takes the platform default. A confidential create only lands on\nan SNP-capable node; an unsatisfiable request is a typed error, never a\nsilent standard machine. Refused when restoring a `snapshot`, which\ninherits the captured machine's confidentiality."),
     secretEnv: z.record(z.string(), z.string()).nullable().optional().describe("Stored secret name to guest environment-variable name."),
     secretFiles: z.record(z.string(), z.string()).nullable().optional().describe("Stored secret name to guest file path."),
     groups: z.array(z.string()).nullable().optional().describe("East-west groups joined during creation."),
     cpuCores: z.number().int().nullable().optional().describe("How many vCPUs the machine boots with.\n\nAbsent takes the platform default, which is the ceiling: one machine\nsized for the largest thing anyone runs on it. Naming a smaller number\nis how a caller fits many machines on a node, because placement admits\nagainst the count asked for here rather than against the ceiling.\n\nThe count must be one of 2, 4, 8, 16, 32 or 64. Any other value, zero\nincluded, is refused with `invalid_argument` rather than rounded to a\nneighbouring size; `MachineInfo::cpu_cores` on the machine that comes\nback is what it booted with.\n\nThere is no memory option beside it, and that is not an oversight. A\nmachine boots on a fixed allocation and hotplugs the rest on demand, so\nits memory ceiling neither bills nor bounds what the guest uses; the\nvCPU count is the guest's real boot topology.\n\nRefused when restoring a `snapshot`, which rebuilds the captured\nmachine's own topology and has nothing to apply this to."),
-    idempotencyKey: z.string().nullable().optional().describe("Name this create, so a retry finds its machine instead of booting a\nsecond one.\n\nThe key is scoped to your account and names the *parameters*, not\nthe call. A second create carrying this key and the same\nparameters returns the original machine, whatever state it is in,\nand `machine.deduplicated()` is then true. That is what makes an\nordinary retry past an ambiguous failure safe: the failure where\nthe machine may or may not exist and finding out is the expensive\npart.\n\nThe same key with DIFFERENT parameters raises `Conflict` rather\nthan deduplicating. One name for two machines is a bug in the\ncaller, and silently returning either one would be the wrong one\nhalf the time. Everything you chose about the machine counts --\ntemplate, region, name, env, ipv4, secrets, groups, cpu_cores --\nwhile `ready_wait_ms` does not, so a retry with a shorter deadline\nis still the same request.\n\nA UUID per logical create is the shape to reach for. Refused above\n255 bytes, and refused outright with `snapshot`, because a restore\ncarries no key and accepting one would promise a dedupe that never\nhappens."),
-    readyWaitMs: z.number().int().nullable().optional().describe("How long to wait for the guest's own boot to finish, in\nmilliseconds. Absent means five minutes.\n\nThe wait happens on the server, beside the guest, and is part of\nthe create call rather than a second round trip: `create` is ONE\nrequest that returns when the machine is booted. There is no poll\ninterval here and nothing to tune.\n\nSet it to `0` to get the handle roughly 2.5 seconds sooner, and\nread the rest of this before you do. The machine is still started;\nonly the wait is skipped, and `machine.readiness()` then reports\n`NotReady` with `waitedMs: 0` -- which is the honest answer, since\nnothing has established that the guest is up.\n\nTwo tiers exist and they are far apart. Measured from us-west\nagainst the NixOS base, three runs each:\n\n- **answering**, ~1.35s: `exec`, `write_file`, `read_file` and\n`switch` all work. `exec` does not go through the node agent's\n`exec_vm`, so it never meets that path's boot-settle gate.\n- **booted**, ~3.9s: `systemctl is-system-running` reports\n`running`.\n\nThe default is the second one because the first hands back a\nmachine that is visibly mid-boot rather than merely unfinished. At\n1.9s a machine runs `systemctl is-system-running` and that command\nanswers `offline`; `hostname` answers `(none)` until ~2.9s, so\n`uname -a` prints `Linux (none)`. A caller has no way to tell that\nstate from a broken machine, and nothing in the returned handle\nsays which one it holds.\n\nSet it to `0` when you are booting many machines to wait on\ntogether, when you only want the id, or when you have measured\nyour own image and know the gap is safe for what you do next.\nEight machines wrote and read back both `/tmp` and `/root`\nimmediately after a create in that gap and the files survived the\nrest of the boot, which is encouraging and is not a proof: it is\neight runs on one image, against a race (ENG-5440, ix#7905) that\nwas real enough to put a gate on the exec path.\n\nRefused above nine minutes, which is the longest a single held\nreadiness call can run. Wait longer with `machine.wait_ready()`\nafter create returns."),
+    idempotencyKey: z.string().nullable().optional().describe("Name this create, so a retry finds its machine instead of booting a\nsecond one.\n\nThe key is scoped to your account and names the *parameters*, not\nthe call. A second create carrying this key and the same\nparameters returns the original machine, whatever state it is in,\nand `machine.deduplicated()` is then true. That is what makes an\nordinary retry past an ambiguous failure safe: the failure where\nthe machine may or may not exist and finding out is the expensive\npart.\n\nThe same key with DIFFERENT parameters raises `Conflict` rather\nthan deduplicating. One name for two machines is a bug in the\ncaller, and silently returning either one would be the wrong one\nhalf the time. Everything you chose about the machine counts --\nimage, region, name, env, ipv4, secrets, groups, cpu_cores --\nwhile `ready_wait_ms` does not, so a retry with a shorter deadline\nis still the same request.\n\nA UUID per logical create is the shape to reach for. Refused above\n255 bytes, and refused outright with `snapshot`, because a restore\ncarries no key and accepting one would promise a dedupe that never\nhappens."),
+    readyWaitMs: z.number().int().nullable().optional().describe("How long to wait for the guest's own boot to finish, in\nmilliseconds. Absent means five minutes.\n\nThe wait happens on the server, beside the guest, and is part of\nthe create call rather than a second round trip: `create` is ONE\nrequest that returns when the machine is booted. There is no poll\ninterval here and nothing to tune.\n\nSet it to `0` to get the handle roughly 2.5 seconds sooner, and\nread the rest of this before you do. The machine is still started;\nonly the wait is skipped, and `machine.readiness()` then reports\n`NotReady` with `waitedMs: 0` -- which is the honest answer, since\nnothing has established that the guest is up.\n\nTwo tiers exist and they are far apart. Measured from us-west\nagainst the default image, three runs each:\n\n- **answering**, ~1.35s: `exec`, `write_file` and `read_file` all\nwork. `exec` does not go through the node agent's\n`exec_vm`, so it never meets that path's boot-settle gate.\n- **booted**, ~3.9s: `systemctl is-system-running` reports\n`running`.\n\nThe default is the second one because the first hands back a\nmachine that is visibly mid-boot rather than merely unfinished. At\n1.9s a machine runs `systemctl is-system-running` and that command\nanswers `offline`; `hostname` answers `(none)` until ~2.9s, so\n`uname -a` prints `Linux (none)`. A caller has no way to tell that\nstate from a broken machine, and nothing in the returned handle\nsays which one it holds.\n\nSet it to `0` when you are booting many machines to wait on\ntogether, when you only want the id, or when you have measured\nyour own image and know the gap is safe for what you do next.\nEight machines wrote and read back both `/tmp` and `/root`\nimmediately after a create in that gap and the files survived the\nrest of the boot, which is encouraging and is not a proof: it is\neight runs on one image, against a race (ENG-5440, ix#7905) that\nwas real enough to put a gate on the exec path.\n\nRefused above nine minutes, which is the longest a single held\nreadiness call can run. Wait longer with `machine.wait_ready()`\nafter create returns."),
   })
-  .describe("Options for creating a machine.\n\nPython constructs this with keyword arguments; TypeScript passes an\nobject literal. Leaving both `template` and `snapshot` unset boots the\nplatform base template. Setting both is refused.\nThere is no port-publishing option here. `--l7-proxy-port` names an OSI\nlayer rather than anything a caller wants, and putting an HTTPS front\ndoor on one guest port is not a create-time property of a machine: it\nis a property of what the machine serves, which the machine's own\nconfiguration is the right place to declare. The CLI flag still exists\nand still works; the SDK is waiting for an ingress surface worth\ngenerating rather than mirroring that one (ENG-12356).");
+  .describe("Options for creating a machine.\n\nPython constructs this with keyword arguments; TypeScript passes an\nobject literal. Leaving both `image` and `snapshot` unset boots the\nplatform default image (`ix/debian:12`). Setting both is refused.\nThere is no port-publishing option here. `--l7-proxy-port` names an OSI\nlayer rather than anything a caller wants, and putting an HTTPS front\ndoor on one guest port is not a create-time property of a machine: it\nis a property of what the machine serves, which the machine's own\nconfiguration is the right place to declare. The CLI flag still exists\nand still works; the SDK is waiting for an ingress surface worth\ngenerating rather than mirroring that one (ENG-12356).");
 export type CreateMachineOptions = z.infer<typeof CreateMachineOptions>;
 
 export const StopOptions = z
@@ -770,20 +809,6 @@ export const MachineReadiness = z
   })
   .describe("How a create's readiness wait ended, with whichever detail the\noutcome carries.\n\nThe optional fields belong to one state each and are absent\notherwise: read `state` first. They are separate fields rather than a\npayload on the state because this boundary carries no data enums.");
 export type MachineReadiness = z.infer<typeof MachineReadiness>;
-
-export const SwitchProgress = z
-  .object({
-    kind: z.string().describe("Stable machine-readable event name: `uploading_source`,\n`source_progress`, `uploaded_source`, `phase`, `resolve_phase`,\n`output`, `graph`, `fetch_started`, `fetch_progress`,\n`fetch_finished`, and `finished` for the terminal frame."),
-    message: z.string().describe("One line of human-readable progress, ready to print."),
-    phase: z.string().nullable().optional().describe("The coarse phase the server is in, on a `phase` frame: one of\n`ensuring_nix_daemon`, `materializing`, `building`, `activating`,\n`building_on_builder`, `exporting_closure`, `fetching_closure`,\n`importing_closure`."),
-    stdout: z.string().describe("Build output the guest wrote to stdout, on an `output` frame."),
-    stderr: z.string().describe("Build output the guest wrote to stderr, on an `output` frame. Nix\nwrites its progress here, so this is where a live build log is."),
-    system: z.string().nullable().optional().describe("Set on the terminal frame when the switch succeeded: the\n`/nix/store` path of the system now running."),
-    error: z.string().nullable().optional().describe("Set on the terminal frame when the switch failed."),
-    finished: z.boolean().describe("True on the terminal frame only."),
-  })
-  .describe("One frame of a system switch in flight.\n\nTerminal-frame rules are {@link MachineProgress}'s, with `system` in place\nof `machine_id`.");
-export type SwitchProgress = z.infer<typeof SwitchProgress>;
 
 export const MachineMetrics = z
   .object({
@@ -879,23 +904,6 @@ export const RuntimeStatus = z
   })
   .describe("What the platform can see of a machine's live runtime, from its host.\n\nThis is the VMM's own view, not the database's: {@link MachineInfo.status} says\nwhat the machine is supposed to be, and this says what the process on the\nnode is actually doing. They disagree exactly when something is wrong,\nwhich is when this is worth reading.\n\nA FLATTENED view. The Rust SDK carries the full health tree\n(`vmm_runtime_types`: control, network, storage, virtio-mem, capture,\nand one entry per vCPU, each with its own issue enum); reproducing that\nacross the boundary would be eight more record types for a diagnostic\nsurface. {@link RuntimeStatus.issues} instead lists every subsystem fault that is\nactually present, which is what a caller does with the tree anyway.");
 export type RuntimeStatus = z.infer<typeof RuntimeStatus>;
-
-export const TemplateImage = z
-  .object({
-    id: z.string().describe("Stable id. Opaque: pass it back, never parse it."),
-    sourceRef: z.string().describe("The source reference as the caller gave it, e.g.\n`github:owner/repo`."),
-    pinnedRef: z.string().describe("The revision-pinned form the cache row is keyed by."),
-    attr: z.string().describe("The flake attribute built, e.g. `default`."),
-    state: z.string().describe("One of `building`, `ready`, `failed`, `unknown`."),
-    name: z.string().nullable().optional().describe("Platform name for shared rows (e.g. `base`), when the row has one."),
-    shared: z.boolean().describe("Whether the row is shared platform-wide rather than the caller's."),
-    warm: z.boolean().describe("Whether YOU hold a warm pin on this row: the prewarm sweep stages\na pinned row, so a machine created from it boots without the cold\nmaterialization. Someone else's pin on the same shared row reads\n`false` here - it is not yours to release, and it does not fill\nyour limit."),
-    failureReason: z.string().nullable().optional().describe("Why the build failed, when it did. Absent on a healthy row."),
-    createdAt: z.number().int().describe("When the row was created (Unix epoch milliseconds)."),
-    lastUsedAt: z.number().int().describe("When the template last booted a machine (Unix epoch milliseconds)."),
-  })
-  .describe("One compiled template in a region's cache.");
-export type TemplateImage = z.infer<typeof TemplateImage>;
 
 export const GithubRunnerToken = z
   .object({
