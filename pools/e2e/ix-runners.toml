@@ -1,0 +1,22 @@
+# The e2e pool: this repository's own end-to-end test fleet. Read by
+# .github/workflows/e2e.yml through the action's `config-file` input, so the
+# reconcile under test is this checkout's src/, not a published release.
+
+# Machines are ixr-e2e-run-<lineage>-<nonce> and ixr-e2e-seed-<lineage>-<rev> on the
+# IX_TOKEN account; nothing else there may use this prefix.
+pool-name = "ixr-e2e"
+
+# Cold boots pin github:indexable-inc/ix-runners/<rev>?dir=pools/e2e#ci-runner,
+# <rev> being the last commit that touched this directory.
+flake-dir = "pools/e2e"
+template-attr = "ci-runner"
+
+regions = ["us-west-1"]
+
+# One test job at a time needs one machine; two leaves room for a slow
+# delete from the previous run without the cap refusing the next spawn.
+max-runners = 2
+
+# No standbys: the test measures a spawn per job, the cost a customer's
+# first job of a lineage pays.
+headroom = 0

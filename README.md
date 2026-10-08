@@ -85,6 +85,13 @@ nothing it writes can ever reach another job or the seed.
    }
    ```
 
+   Nix jobs start warm even on a cold boot: `nixpkgs#foo` resolves to the
+   image's own nixpkgs with no tarball fetch (mkRunner pins the registry),
+   and `services.ix-runner.warmStorePaths` (default `[ pkgs.stdenv ]`) bakes
+   build inputs into the image without putting them on PATH. List the
+   inputs your derivations share there; the first job of every lineage and
+   every config rev then builds without substituting them.
+
 4. Optionally add `.github/ix-runners.toml`. Every key has a working
    default; the file exists for the dials:
 
@@ -226,6 +233,25 @@ is no state store to disagree with reality.
 Failures are per step: one machine's failure is logged as an Actions
 error and the run continues; the job summary carries a table of what
 happened.
+
+## End-to-end test
+
+[`.github/workflows/e2e.yml`](./.github/workflows/e2e.yml) runs the whole
+path against the live platform: this checkout's reconcile spawns an ix VM
+for a queued `runs-on: [self-hosted, ix, ixr-e2e]` job, the job runs
+`nix build ./pools/e2e#e2e-probe` (a C program compiled by the guest's
+stdenv), and `src/e2e-watch.ts` fails the run unless that job went green.
+It reports queued-to-runner and queued-to-first-step latency in the job
+summary, and with the repository variable `IX_E2E_START_BUDGET_S` set it
+also fails a green run that waited longer than the budget. A job no
+runner takes fails the run at the start deadline and cancels it, instead
+of sitting queued for a day.
+
+It runs on pushes to `main`, every six hours, and on dispatch from `main`
+(the reconcile refuses any other ref). It needs two repository secrets:
+`IX_TOKEN` (the ix account the e2e machines bill to) and `RUNNER_PAT`
+(fine-grained, Administration read/write on this repository); without them
+it skips.
 
 ## Security model
 
