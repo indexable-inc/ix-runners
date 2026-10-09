@@ -1510,15 +1510,6 @@ export interface CreateMachineOptions {
   readonly env?: Record<string, string> | null;
   /** Whether to allocate a public IPv4 address. */
   readonly ipv4?: boolean | null;
-  /**
-   * Launch as an AMD SEV-SNP confidential machine the host cannot read.
-   *
-   * Absent takes the platform default. A confidential create only lands on
-   * an SNP-capable node; an unsatisfiable request is a typed error, never a
-   * silent standard machine. Refused when restoring a `snapshot`, which
-   * inherits the captured machine's confidentiality.
-   */
-  readonly confidential?: boolean | null;
   /** Stored secret name to guest environment-variable name. */
   readonly secretEnv?: Record<string, string> | null;
   /** Stored secret name to guest file path. */

@@ -775,7 +775,6 @@ export const CreateMachineOptions = z
     region: z.string().nullable().optional().describe("Region slug. When absent, `IX_REGION` applies, then the platform\ndefault (`us-west-1`) -- the same ladder the CLI's `--region`\nflags resolve."),
     env: z.record(z.string(), z.string()).nullable().optional().describe("Plaintext environment variables for the image command."),
     ipv4: z.boolean().nullable().optional().describe("Whether to allocate a public IPv4 address."),
-    confidential: z.boolean().nullable().optional().describe("Launch as an AMD SEV-SNP confidential machine the host cannot read.\n\nAbsent takes the platform default. A confidential create only lands on\nan SNP-capable node; an unsatisfiable request is a typed error, never a\nsilent standard machine. Refused when restoring a `snapshot`, which\ninherits the captured machine's confidentiality."),
     secretEnv: z.record(z.string(), z.string()).nullable().optional().describe("Stored secret name to guest environment-variable name."),
     secretFiles: z.record(z.string(), z.string()).nullable().optional().describe("Stored secret name to guest file path."),
     groups: z.array(z.string()).nullable().optional().describe("East-west groups joined during creation."),
