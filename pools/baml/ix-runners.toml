@@ -9,8 +9,8 @@ pool-name = "baml"
 
 # The OCI image every cold-booted runner of this pool starts from: a
 # version tag of the platform's default runner image (registry.ix.dev,
-# published weekly by .github/workflows/publish-default-images.yml in the ix
-# repository). Tags never move, so the reference names the runner config;
+# published by hand with `buck2 run //scripts/ci:publish-default-images` in the ix
+# repository, docs/runbooks/publish-default-images.md). Tags never move, so the reference names the runner config;
 # seeds key on it, so bumping this tag re-seeds the fleet and a baml merge
 # never does. `latest` is refused. (required)
 image = "ix/runner:2026-10-08"
