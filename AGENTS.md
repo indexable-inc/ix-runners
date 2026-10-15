@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Fork-per-job GitHub Actions runners on ix VMs. Read README.md for the
 mechanism (seed/fork/promote lifecycle) and docs/design.md for why.
