@@ -125,6 +125,16 @@ ticks, derived from GitHub's own job timestamps, never counted.
 - **Budgeted convergence**: creations per tick are capped and spent at
   admission, so a bad image tag stalls loudly instead of thrashing.
 
+## Runner images newer than this Action
+
+The ix-hosted control plane's `ix/runner` images (from the 2026-10-16 entrypoint on) no
+longer power the machine off after its job: the entrypoint scrubs the guest (kills the
+job's processes, deletes its credentials), writes `/run/ix-runner/capture-ready` and waits
+for the next JIT config, and that control plane commits a seed only after reading the
+marker. This Action does not read the marker, so a pool here that moved to such an image
+could snapshot a runner before its scrub. Keep pools here on the image tag they run
+(`ix/runner:2026-10-08`), or move them to the control plane.
+
 ## What this costs, honestly
 
 - **Pickup latency on a cold lineage tick**: an on-demand spawn is an
