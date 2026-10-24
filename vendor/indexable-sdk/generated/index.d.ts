@@ -3885,7 +3885,7 @@ export declare class Migrations {
    * Start moving a machine onto another node.
    *
    * `target_node` pins the destination by hostname (e.g.
-   * `hil-compute-3`) and is admin-gated server-side; omitting it lets
+   * `node-3`) and is admin-gated server-side; omitting it lets
    * the scheduler pick. Returns as soon as the migration row exists --
    * the phase in the reply is the starting phase, so poll
    * {@link Migrations.get} to follow it.
