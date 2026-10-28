@@ -38,7 +38,7 @@ Why it looks this way: [docs/design.md](./docs/design.md).
 
 ```mermaid
 flowchart LR
-    Q[job queued<br/>runs-on: self-hosted, ix] -->|reconcile tick| S{seed for this<br/>label set?}
+    Q[job queued<br/>runs-on: ix] -->|reconcile tick| S{seed for this<br/>label set?}
     S -->|yes| F[fork the seed<br/>boots in seconds, caches warm]
     S -->|no, first time| C[cold boot from<br/>the pool's OCI image]
     F --> R[machine runs its ONE job<br/>on a single-job JIT credential]
@@ -89,7 +89,7 @@ nothing it writes can ever reach another job or the seed.
    seed-rebuild-interval-seconds = 604800  # weekly cold seed refresh
    ```
 
-4. Add the workflow below, merge, and put `runs-on: [self-hosted, ix]` in
+4. Add the workflow below, merge, and put `runs-on: ix` in
    the workflows you want on the fleet. The `ix` marker label is what opts
    a job in; every distinct label set you use becomes its own seed lineage.
 
